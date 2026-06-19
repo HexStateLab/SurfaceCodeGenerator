@@ -30,6 +30,16 @@ td.hl{color:#00d4aa}
 .preset{border:1px solid #333;background:#1a1a25;color:#888;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8em;margin:2px}
 .preset:hover{background:#222;color:#ccc}
 .preset.active{background:#00b4d8;color:#000;border-color:#00b4d8}
+
+/* New Matrix Expansion Styles */
+.clickable-row { cursor: pointer; transition: background 0.2s; }
+.clickable-row:hover { background: #1a1a25; }
+.matrix-view { display: none; background: #050508; }
+.matrix-view.open { display: table-row; }
+.matrix-container { display: flex; gap: 30px; overflow: auto; max-height: 400px; padding: 15px; border-left: 3px solid #00d4aa; }
+.matrix-grid { font-family: monospace; font-size: 14px; line-height: 1.1; letter-spacing: 6px; background: #111118; padding: 12px; border-radius: 4px; border: 1px solid #222; margin-top: 8px; }
+.mat-1 { color: #00d4aa; text-shadow: 0 0 4px #00d4aa88; font-weight: bold; }
+.mat-0 { color: #333; }
 </style>
 </head>
 <body>
@@ -78,6 +88,7 @@ td.hl{color:#00d4aa}
 
 <div class="panel" id="output" style="display:none">
 <h2>Generated Codes</h2>
+<div class="sub" style="margin-bottom: 8px;">Click any row below to reveal its full polynomial matrices.</div>
 <div id="codes"></div>
 </div>
 
@@ -109,6 +120,93 @@ function preset(d) {
   document.getElementById('r').value = '';
   document.getElementById('s').value = '';
   generate();
+}
+
+// GF(2) bivariate polynomial on Z_r x Z_s
+function bvPoly(r, s) {
+  this.r = r; this.s = s;
+  this.c = new Uint8Array(r * s); // coefficient at (i,j) = c[i*s + j]
+}
+bvPoly.prototype.set = function(i, j, v) { this.c[(i%this.r)*this.s + (j%this.s)] = v & 1; }
+bvPoly.prototype.get = function(i, j) { return this.c[(i%this.r)*this.s + (j%this.s)]; }
+bvPoly.prototype.wt = function() { let w=0; for(let i=0;i<this.r*this.s;i++)w+=this.c[i]; return w; }
+
+// Multiply two bivariate polys mod (x^r+1, y^s+1)
+bvPoly.prototype.mul = function(other) {
+  let res = new bvPoly(this.r, this.s);
+  for(let i=0;i<this.r;i++) for(let j=0;j<this.s;j++) {
+    if(!this.get(i,j)) continue;
+    for(let k=0;k<other.r;k++) for(let l=0;l<other.s;l++) {
+      if(!other.get(k,l)) continue;
+      let ni=(i+k)%this.r, nj=(j+l)%this.s;
+      res.set(ni, nj, res.get(ni,nj) ^ 1);
+    }
+  }
+  return res;
+}
+
+// Random bivariate poly not divisible by (x+1) in either variable
+function randBvPoly(r, s) {
+  let p = new bvPoly(r, s);
+  for(let i=0;i<r;i++) for(let j=0;j<s;j++) p.set(i,j, Math.random()<0.5 ? 1 : 0);
+  // Ensure odd parity in x (not divisible by x+1)
+  let px=0; for(let i=0;i<r;i++) for(let j=0;j<s;j++) px^=p.get(i,j);
+  if(!px) p.set(0,0, p.get(0,0)^1);
+  // Ensure odd parity in y
+  let py=0; for(let j=0;j<s;j++) for(let i=0;i<r;i++) py^=p.get(i,j);
+  if(!py) p.set(0,0, p.get(0,0)^1);
+  return p;
+}
+
+// Build g(x,y) = (x^2+1)(y^2+1)
+function gcdPoly(r, s) {
+  let g = new bvPoly(r, s);
+  g.set(0,0,1); g.set(2,0,1); g.set(0,2,1); g.set(2,2,1);
+  return g;
+}
+
+// Format polynomial as compact hex rows
+function polyToHex(p) {
+  if(p.r <= 6 && p.s <= 6) {
+    let rows = [];
+    for(let i=0;i<p.r;i++) {
+      let bin = '';
+      for(let j=0;j<p.s;j++) bin += p.get(i,j);
+      rows.push(parseInt(bin,2).toString(16).padStart(Math.ceil(p.s/4),'0'));
+    }
+    return rows.join(':');
+  }
+  // For larger, show first row + weight
+  let first = '';
+  for(let j=0;j<Math.min(p.s,16);j++) first += p.get(0,j);
+  return `[${p.r}x${p.s} wt=${p.wt()}] ${first}...`;
+}
+
+// NEW FUNCTION: Render full binary matrix HTML
+function renderMatrix(p) {
+  let h = '<div class="matrix-grid">';
+  for(let i=0; i<p.r; i++) {
+    h += '<div>';
+    for(let j=0; j<p.s; j++) {
+      h += p.get(i,j) ? '<span class="mat-1">1</span>' : '<span class="mat-0">0</span>';
+    }
+    h += '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+// Generate actual code for given parameters
+function genActual(r, s) {
+  let g = gcdPoly(r, s);
+  let pa = randBvPoly(r, s);
+  let pb = randBvPoly(r, s);
+  return {
+    a: g.mul(pa),
+    b: g.mul(pb),
+    wa: g.mul(pa).wt(),
+    wb: g.mul(pb).wt()
+  };
 }
 
 function generate() {
@@ -172,9 +270,26 @@ function generate() {
   // Sort by score: D*rate
   codes.sort((a,b) => (b.D*b.rate) - (a.D*a.rate));
   
+  // Deduplicate: keep best weight per (r,s)
+  let seen = {};
+  let uniq = [];
+  for(let c of codes) {
+    let key = `${c.r},${c.s}`;
+    if(!seen[key] || c.stab_wt < seen[key].stab_wt) {
+      seen[key] = c;
+    }
+  }
+  uniq = Object.values(seen).sort((a,b)=>(b.D*b.rate)-(a.D*a.rate));
+  
   // Limit display
   let max_show = r_in&&s_in ? 50 : 30;
-  codes = codes.slice(0, max_show);
+  codes = uniq.slice(0, max_show);
+  
+  // Add construction note
+  let noteDiv = document.getElementById('construction');
+  if(noteDiv) noteDiv.innerHTML = codes.length>0 
+    ? `<span class="dim">Actual code: a = template · p<sub>a</sub>(x,y) where p<sub>a</sub> random, not divisible by (x+1) or (y+1). Template = minimal-weight representative.</span>`
+    : '';
   
   // Output
   let out = document.getElementById('output');
@@ -186,18 +301,40 @@ function generate() {
   } else {
     let html = `<table>
       <tr><th>r</th><th>s</th><th>N</th><th>K</th><th>D</th><th>Rate</th><th>Wt</th><th>a(x,y)</th><th>b(x,y)</th></tr>`;
-    for(let c of codes) {
-      let axs = polyStr(c.ax), ays = polyStr(c.ay);
-      let bxs = polyStr(c.bx), bys = polyStr(c.by);
-      html += `<tr>
+      
+    for(let i=0; i<codes.length; i++) {
+      let c = codes[i];
+      let actual = genActual(c.r, c.s);
+      let ahex = polyToHex(actual.a);
+      let bhex = polyToHex(actual.b);
+      
+      // Main row (Clickable)
+      html += `<tr class="clickable-row" onclick="document.getElementById('mat-${i}').classList.toggle('open')" title="Click row to view full matrix">
         <td>${c.r}</td><td>${c.s}</td><td class="hl">${c.N}</td>
         <td>${c.K}</td><td class="hl">${c.D}</td>
         <td>${c.rate.toFixed(4)}</td>
-        <td>${c.stab_wt}</td>
-        <td><span class="dim">a<sub>x</sub>=</span>${axs} <span class="dim">a<sub>y</sub>=</span>${ays}</td>
-        <td><span class="dim">b<sub>x</sub>=</span>${bxs} <span class="dim">b<sub>y</sub>=</span>${bys}</td>
+        <td>${actual.wa + actual.wb}</td>
+        <td style="font-size:0.7em;max-width:200px;overflow:hidden">${ahex}</td>
+        <td style="font-size:0.7em;max-width:200px;overflow:hidden">${bhex}</td>
+      </tr>`;
+      
+      // Hidden Matrix Row
+      html += `<tr id="mat-${i}" class="matrix-view">
+        <td colspan="9">
+          <div class="matrix-container">
+            <div>
+              <div style="color:#888;">a(x,y) Matrix (${c.r}x${c.s})</div>
+              ${renderMatrix(actual.a)}
+            </div>
+            <div>
+              <div style="color:#888;">b(x,y) Matrix (${c.r}x${c.s})</div>
+              ${renderMatrix(actual.b)}
+            </div>
+          </div>
+        </td>
       </tr>`;
     }
+    
     html += `</table><div style="margin-top:8px;color:#666">${codes.length} codes · a(x,y)=a<sub>x</sub>(x)·a<sub>y</sub>(y) over Z<sub>r</sub>×Z<sub>s</sub></div>`;
     div.innerHTML = html;
     out.style.display = 'block';

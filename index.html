@@ -73,10 +73,17 @@ td.hl{color:#00d4aa}
     <option value="6">≤6</option>
     <option value="13">≤13</option>
   </select>
+  <label>Density %</label>
+  <input type="range" id="density" value="8" min="1" max="15" onchange="generate()" style="width:80px" title="Sparse fill % for pa,pb">
+  <span id="dval" style="color:#888;font-size:0.75em;width:24px">8%</span>
   <label>Stack Depth</label>
   <input type="number" id="depth" value="1" min="1" max="16" onchange="generate()" style="width:60px">
   <label>Exact D</label>
   <input type="checkbox" id="exactD" onchange="generate()">
+  <label>Force wt ≤</label>
+  <input type="number" id="forcewt" value="0" min="0" max="99" onchange="generate()" style="width:50px" title="0=disable, if >0 enumerate monomial pairs for wt-optimal K">
+  <label>Minimal</label>
+  <input type="checkbox" id="minimal" onchange="generate()" title="Monomial enumeration: try all x^i·y^j pairs for minimal-weight codes with max K">
   <button onclick="generate()">Generate</button>
 </div>
 <div class="row" style="gap:4px">
@@ -150,10 +157,10 @@ bvPoly.prototype.mul = function(other) {
 }
 
 // Sparse random bivariate poly — low weight keeps stabilizers light
-function randBvPoly(r, s) {
+function randBvPoly(r, s, density) {
   let p = new bvPoly(r, s);
-  let density = 0.08; // 8% fill → wt ~ r*s*0.08, keeps checks light
-  for(let i=0;i<r;i++) for(let j=0;j<s;j++) p.set(i,j, Math.random()<density ? 1 : 0);
+  let d = density || 0.08;
+  for(let i=0;i<r;i++) for(let j=0;j<s;j++) p.set(i,j, Math.random()<d ? 1 : 0);
   // Ensure odd parity in x (not divisible by x+1)
   let px=0; for(let i=0;i<r;i++) for(let j=0;j<s;j++) px^=p.get(i,j);
   if(!px) p.set(0,0, p.get(0,0)^1);
@@ -201,11 +208,36 @@ function renderMatrix(p) {
   return h;
 }
 
-// Generate actual code for given parameters
-function genActual(r, s) {
+// Generate actual code(s). If minimal, returns array of {a,b,wa,wb} for monomial pairs.
+function genActual(r, s, density, forceWt, minimal) {
   let g = gcdPoly(r, s);
-  let pa = randBvPoly(r, s);
-  let pb = randBvPoly(r, s);
+  // Monomial enumeration: try all x^i·y^j pairs for minimal-weight codes
+  if(minimal) {
+    let results = [];
+    for(let pi=0; pi<r*s; pi++) {
+      let pa = new bvPoly(r, s); pa.set(pi/s|0, pi%s, 1);
+      for(let qi=0; qi<r*s; qi++) {
+        let pb = new bvPoly(r, s); pb.set(qi/s|0, qi%s, 1);
+        let a = g.mul(pa), b = g.mul(pb);
+        let wa = a.wt(), wb = b.wt();
+        if(!forceWt || forceWt<=0 || wa+wb <= forceWt)
+          results.push({a, b, wa, wb, pai:pi, pbi:qi});
+      }
+    }
+    return results;
+  }
+  // Random sparse mode (with optional retry)
+  let d = density || 0.08;
+  for(let attempt=0; attempt<1000; attempt++) {
+    let pa = randBvPoly(r, s, d);
+    let pb = randBvPoly(r, s, d);
+    let a = g.mul(pa), b = g.mul(pb);
+    let wa = a.wt(), wb = b.wt();
+    if(!forceWt || forceWt<=0 || wa+wb <= forceWt)
+      return {a, b, wa, wb};
+  }
+  // Fallback
+  let pa = randBvPoly(r, s, d), pb = randBvPoly(r, s, d);
   let a = g.mul(pa), b = g.mul(pb);
   return {a, b, wa: a.wt(), wb: b.wt()};
 }
@@ -362,6 +394,10 @@ function generate() {
   let min_rate = parseFloat(document.getElementById('rate').value)||0;
   let depth = parseInt(document.getElementById('depth').value)||1;
   let max_wt = parseInt(document.getElementById('maxwt').value)||99;
+  let density = parseInt(document.getElementById('density').value)/100 || 0.08;
+  document.getElementById('dval').textContent = Math.round(density*100)+'%';
+  let forceWt = parseInt(document.getElementById('forcewt').value)||0;
+  let minimal = document.getElementById('minimal').checked;
   
   let codes = [];
   
@@ -394,21 +430,40 @@ function generate() {
       let rate = K/N;
       if(rate < min_rate) continue;
       
-      for(let ti=0;ti<T.length;ti++) {
-        for(let ui=0;ui<T.length;ui++) {
-          let wa = T[ti].wx * T[ti].wy;
-          let wb = T[ui].wx * T[ui].wy;
-          let sw = wa + wb;
-          if(sw > max_wt) continue;
-          
+      if(minimal) {
+        // Monomial enumeration: try all x^i·y^j pairs for minimal-weight codes
+        let acts = genActual(r, s, density, forceWt, minimal);
+        for(let ai=0; ai<acts.length; ai++) {
+          let act = acts[ai];
+          let res = computeActual({r,s}, act.a, act.b);
+          if(!res || res.K <= 0) continue;
+          if(res.D < D) continue;
+          let cK = res.K, cD = res.D, crate = cK/N;
+          if(crate < min_rate) continue;
           codes.push({
-            r,s,N,K:8,D:Dc,rate:8/N,  // K placeholder: 2·deg(g); actual K via rank below
-            stab_wt:sw, wa, wb,
-            ax:T[ti].xp, ay:T[ti].yp,
-            bx:T[ui].xp, by:T[ui].yp,
-            aname:T[ti].name, bname:T[ui].name,
-            depth:depth
+            r,s,N, K:cK, D:cD, rate:crate,
+            stab_wt:act.wa+act.wb, wa:act.wa, wb:act.wb,
+            ax:0, ay:0, bx:0, by:0,
+            aname:`x^${act.pai/s|0}y^${act.pai%s}`, bname:`x^${act.pbi/s|0}y^${act.pbi%s}`,
+            depth:depth, _a:act.a, _b:act.b
           });
+        }
+      } else {
+        for(let ti=0;ti<T.length;ti++) {
+          for(let ui=0;ui<T.length;ui++) {
+            let wa = T[ti].wx * T[ti].wy;
+            let wb = T[ui].wx * T[ui].wy;
+            let sw = wa + wb;
+            if(sw > max_wt) continue;
+            codes.push({
+              r,s,N,K:8,D:Dc,rate:8/N,
+              stab_wt:sw, wa, wb,
+              ax:T[ti].xp, ay:T[ti].yp,
+              bx:T[ui].xp, by:T[ui].yp,
+              aname:T[ti].name, bname:T[ui].name,
+              depth:depth
+            });
+          }
         }
       }
     }
@@ -433,15 +488,24 @@ function generate() {
   
   // Compute actual K and D from rank for each code
   let exactD = document.getElementById('exactD').checked;
-  let filtered = [], t0 = Date.now();
-  for(let c of uniq) {
+  let filtered = [];
+  if(minimal) {
+    // Minimal mode: K/D already computed during enumeration
+    for(let c of uniq) {
+      c.K_display = c.K * (c.depth||1);
+      c.rate_display = c.K_display / c.N;
+      if(!exactD || c.D >= D) filtered.push(c);
+    }
+  } else {
+    let t0 = Date.now();
+    for(let c of uniq) {
     if(Date.now()-t0 > 5000) { // timeout: keep remaining with formula values
       c.K_display = c.K * (c.depth||1);
       c.rate_display = c.K_display / c.N;
       filtered.push(c); continue;
     }
     try {
-      let act = genActual(c.r, c.s);
+      let act = genActual(c.r, c.s, density, forceWt, minimal);
       let res = computeActual(c, act.a, act.b);
       if(!res || res.K <= 0) {
         c.K_display = c.K * (c.depth||1);
@@ -458,6 +522,7 @@ function generate() {
       c.K_display = c.K * (c.depth||1);
       c.rate_display = c.K_display / c.N;
       filtered.push(c);
+    }
     }
   }
   if(filtered.length > 0) uniq = filtered;
@@ -488,7 +553,7 @@ function generate() {
       
     for(let i=0; i<codes.length; i++) {
       let c = codes[i];
-      let actual = c._a ? {a:c._a, b:c._b, wa:c._a.wt(), wb:c._b.wt()} : genActual(c.r, c.s);
+      let actual = c._a ? {a:c._a, b:c._b, wa:c._a.wt(), wb:c._b.wt()} : genActual(c.r, c.s, density, forceWt, minimal);
       let ahex = polyToHex(actual.a);
       let bhex = polyToHex(actual.b);
       let totalK = c.K_display || c.K;

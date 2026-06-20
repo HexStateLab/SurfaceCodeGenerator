@@ -62,6 +62,8 @@ td.hl{color:#00d4aa}
   <input type="number" id="r" value="" placeholder="auto" onchange="generate()">
   <label>Torus s</label>
   <input type="number" id="s" value="" placeholder="auto" onchange="generate()">
+  <label>N</label>
+  <input type="number" id="Nfilter" value="" placeholder="any" onchange="generate()" style="width:70px">
 </div>
 <div class="row">
   <label>Min Rate</label>
@@ -231,6 +233,27 @@ function generate() {
   let density = parseInt(document.getElementById('density').value)/100 || 0.08;
   document.getElementById('dval').textContent = Math.round(density*100)+'%';
   let minimal = document.getElementById('minimal').checked;
+  let Nfilter = parseInt(document.getElementById('Nfilter').value)||0;
+  
+  // Build (r,s) candidate list: either from ranges or directly from N filter
+  let pairs = [];
+  if(Nfilter && !r_in && !s_in) {
+    // Derive r,s from N = 2rs → rs = N/2, r=2mx, s=2my → mx*my = N/8
+    let n8 = Nfilter/8;
+    for(let mx=3; mx*mx<=n8; mx++) {
+      if(n8 % mx === 0) {
+        let my = n8/mx;
+        if(my >= 3) {
+          let Dc = Math.min(mx, my);
+          if(!D || Dc >= D) pairs.push({r:2*mx, s:2*my, Dc});
+          if(mx !== my && !D || Dc >= D) pairs.push({r:2*my, s:2*mx, Dc});
+        }
+      }
+    }
+    if(pairs.length === 0) {
+      // No exact r,s from N — fall through to empty codes
+    }
+  }
   
   let codes = [];
   
@@ -250,16 +273,23 @@ function generate() {
     s_start = (D||3); s_end = D*3+2;
   }
   
-  for(let mx=r_start;mx<=r_end;mx+=2) {
-    if(mx<3)continue;
-    let r = 2*mx;
-    for(let my=s_start;my<=s_end;my+=2) {
+  for(let pi=0; pi<(pairs.length>0?pairs.length:1); pi++) {
+    // Range start/end for iteration
+    let r_start2 = pairs.length>0 ? pairs[pi].r/2 : r_start;
+    let r_end2   = pairs.length>0 ? pairs[pi].r/2 : r_end;
+    let s_start2 = pairs.length>0 ? pairs[pi].s/2 : s_start;
+    let s_end2   = pairs.length>0 ? pairs[pi].s/2 : s_end;
+    for(let mx=r_start2; mx<=r_end2; mx++) {
+      if(mx<3)continue;
+      let r = 2*mx;
+    for(let my=s_start2; my<=s_end2; my++) {
       if(my<3)continue;
       let s = 2*my;
       let Dc = Math.min(mx, my);
       if(D && Dc < D) continue;
       
       let N = 2*r*s, Rs = r*s;
+      if(Nfilter && N !== Nfilter) continue;
       
       if(minimal) {
         // === ALGEBRAIC WEIGHT-8 ===
@@ -322,6 +352,7 @@ function generate() {
         }
       }
     }
+  }
   }
   
   // Sort by D*rate

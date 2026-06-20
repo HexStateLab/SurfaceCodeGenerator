@@ -99,6 +99,12 @@ td.hl{color:#00d4aa}
 </div>
 
 <script>
+// gcdPoly(r,s) = (x²+1)(y²+1) always has exactly 4 nonzero terms as long as r,s>=6
+// (no wraparound collisions) — true for every (r,s) the sweep visits below, since the
+// search always requires mx,my>=3 i.e. r,s>=6. Used to avoid building the actual
+// matrix just to read back its weight.
+const G_WT = 4;
+
 const T = [
   {name:"min4",  xp:0x3, yp:0x3, wx:2, wy:2},
   {name:"min4b", xp:0x3, yp:0x3, wx:2, wy:2},
@@ -107,6 +113,26 @@ const T = [
   {name:"sym",   xp:0x7, yp:0x7, wx:3, wy:3},
   {name:"spread",xp:0xb, yp:0x5, wx:3, wy:2},
 ];
+
+// Cache of {a,b} bvPoly pairs for currently-displayed rows, indexed by row #.
+// Matrix HTML is only built (and cached) the first time a row is expanded,
+// instead of eagerly for every row at generate() time.
+let lastActuals = [];
+
+function toggleMatrix(i) {
+  let row = document.getElementById('mat-'+i);
+  if(!row) return;
+  row.classList.toggle('open');
+  if(row.classList.contains('open') && row.dataset.rendered !== '1') {
+    let actual = lastActuals[i];
+    if(!actual) return;
+    let container = document.getElementById('mc-'+i);
+    container.innerHTML = `
+      <div><div style="color:#888;">a(x,y) Matrix (${actual.a.r}x${actual.a.s})</div>${renderMatrix(actual.a)}</div>
+      <div><div style="color:#888;">b(x,y) Matrix (${actual.b.r}x${actual.b.s})</div>${renderMatrix(actual.b)}</div>`;
+    row.dataset.rendered = '1';
+  }
+}
 
 function polyStr(p) {
   if(p==0x3)return"x+1";
@@ -120,18 +146,32 @@ function polyStr(p) {
 function bvPoly(r, s) {
   this.r = r; this.s = s;
   this.c = new Uint8Array(r * s); // coefficient at (i,j) = c[i*s + j]
+  this.nz = new Set(); // indices of set bits — keeps mul()/wt() proportional to
+                        // actual sparsity instead of always scanning all r*s cells
 }
-bvPoly.prototype.set = function(i, j, v) { this.c[(i%this.r)*this.s + (j%this.s)] = v & 1; }
+bvPoly.prototype.set = function(i, j, v) {
+  let idx = (i%this.r)*this.s + (j%this.s);
+  let bit = v & 1;
+  if(this.c[idx] === bit) return; // no change — skip Set bookkeeping entirely.
+  // Matters because randBvPoly writes every cell of a (possibly large) dense grid,
+  // mostly with v=0 on cells that were already 0; without this check that's a wasted
+  // Set op per cell, which dominates runtime once r,s get into the hundreds.
+  this.c[idx] = bit;
+  if(bit) this.nz.add(idx); else this.nz.delete(idx);
+}
 bvPoly.prototype.get = function(i, j) { return this.c[(i%this.r)*this.s + (j%this.s)]; }
-bvPoly.prototype.wt = function() { let w=0; for(let i=0;i<this.r*this.s;i++)w+=this.c[i]; return w; }
+bvPoly.prototype.wt = function() { return this.nz.size; }
 
-// Multiply two bivariate polys mod (x^r+1, y^s+1)
+// Multiply two bivariate polys mod (x^r+1, y^s+1). These polys are always sparse in
+// practice (templates/g/chains are weight ~2-14), so iterate only the nonzero terms
+// of each side rather than the full r*s grid — O(nnz(this)*nnz(other)) instead of
+// O(r*s + nnz(this)*r*s), which matters a lot once r,s get into the hundreds.
 bvPoly.prototype.mul = function(other) {
   let res = new bvPoly(this.r, this.s);
-  for(let i=0;i<this.r;i++) for(let j=0;j<this.s;j++) {
-    if(!this.get(i,j)) continue;
-    for(let k=0;k<other.r;k++) for(let l=0;l<other.s;l++) {
-      if(!other.get(k,l)) continue;
+  for(let idx1 of this.nz) {
+    let i = (idx1 / this.s) | 0, j = idx1 % this.s;
+    for(let idx2 of other.nz) {
+      let k = (idx2 / other.s) | 0, l = idx2 % other.s;
       let ni=(i+k)%this.r, nj=(j+l)%this.s;
       res.set(ni, nj, res.get(ni,nj) ^ 1);
     }
@@ -143,13 +183,14 @@ bvPoly.prototype.mul = function(other) {
 function randBvPoly(r, s, density) {
   let p = new bvPoly(r, s);
   let d = density || 0.08;
-  for(let i=0;i<r;i++) for(let j=0;j<s;j++) p.set(i,j, Math.random()<d ? 1 : 0);
-  // Ensure odd parity in x (not divisible by x+1)
-  let px=0; for(let i=0;i<r;i++) for(let j=0;j<s;j++) px^=p.get(i,j);
-  if(!px) p.set(0,0, p.get(0,0)^1);
-  // Ensure odd parity in y
-  let py=0; for(let j=0;j<s;j++) for(let i=0;i<r;i++) py^=p.get(i,j);
-  if(!py) p.set(0,0, p.get(0,0)^1);
+  let count = Math.round(d * r * s);
+  for(let n=0; n<count; n++) {
+    p.set((Math.random()*r)|0, (Math.random()*s)|0, 1);
+  }
+  // Ensure odd total weight (the original's two "parity in x"/"parity in y" checks
+  // both reduce to this same condition — XOR over all cells is order-independent —
+  // and their combined net effect was always to force odd weight, never even).
+  if(p.nz.size % 2 === 0) p.set(0,0, p.get(0,0)^1);
   return p;
 }
 
@@ -207,6 +248,35 @@ function genActual(r, s, density, minimal) {
   return {a, b, wa: a.wt(), wb: b.wt()};
 }
 
+// Rebuild the actual {a,b} bvPoly pair for a code, lazily — only called for codes
+// that are actually displayed (after the dedup+slice), not during the search sweep.
+function buildMonoActual(r,s,ai,aj,bi,bj) {
+  let g = gcdPoly(r,s);
+  let pa = new bvPoly(r,s); pa.set(ai,aj,1);
+  let pb = new bvPoly(r,s); pb.set(bi,bj,1);
+  let a = g.mul(pa), b = g.mul(pb);
+  return {a, b, wa:a.wt(), wb:b.wt()};
+}
+function buildChainActual(r,s,axis,a0,m) {
+  let g = gcdPoly(r,s);
+  let pb = new bvPoly(r,s);
+  if(axis==='x') { for(let t=0;t<=m;t++){pb.set(0,(a0+2*t)%s,1);pb.set(2,(a0+2*t)%s,1);} }
+  else { for(let t=0;t<=m;t++){pb.set((a0+2*t)%r,0,1);pb.set((a0+2*t)%r,2,1);} }
+  let b = g.mul(pb);
+  return {a:g, b, wa:g.wt(), wb:b.wt()};
+}
+function renderActual(c, density, minimal) {
+  if(c.family === 'mono') return buildMonoActual(c.r,c.s,c.ax,c.ay,c.bx,c.by);
+  if(c.family === 'chain') return buildChainActual(c.r,c.s,c.chainAxis,c.chainA,c.chainM);
+  // Non-minimal/"Random Sparse" codes: original behavior, a genuinely random
+  // density-driven a,b (a=g·randBvPoly(...)). T[] is only a coarse feasibility
+  // heuristic used during search (is *some* sparse code plausible at this size?);
+  // it never determined the displayed matrix, even in the unmodified file. My first
+  // pass at this made it deterministic from T[], which killed the actual point of
+  // "Random Sparse" mode (exploring different random sparse fills) — reverted.
+  return genActual(c.r, c.s, density, minimal);
+}
+
 function generate() {
   let D = parseInt(document.getElementById('D').value)||5;
   let K = parseInt(document.getElementById('K').value)||8;
@@ -231,7 +301,7 @@ function generate() {
         if(my >= 3) {
           let Dc = Math.min(mx, my);
           if(!D || Dc >= D) pairs.push({r:2*mx, s:2*my, Dc});
-          if(mx !== my && !D || Dc >= D) pairs.push({r:2*my, s:2*mx, Dc});
+          if(mx !== my && (!D || Dc >= D)) pairs.push({r:2*my, s:2*mx, Dc});
         }
       }
     }
@@ -240,6 +310,13 @@ function generate() {
     }
   }
   
+  // sweepEnd bounds how far the search extends past D. D*3+2 is fine for normal D
+  // (≤~30) and preserves existing behavior there; for very large D it instead grows
+  // by a constant +60 window so the (r,s) sweep doesn't grow quadratically with D.
+  // No absolute ceiling — the actual fix for big-D blowups was making mul()/wt()
+  // proportional to sparsity instead of r*s (see bvPoly above), not limiting D itself.
+  let sweepEnd = (Dv) => Math.min(Dv*3+2, Dv+60);
+
   let codes = [];
   
   // Determine r,s ranges
@@ -249,15 +326,17 @@ function generate() {
     s_start = s_end = s_in;
   } else if(r_in) {
     r_start = r_end = r_in;
-    s_start = (D||3); s_end = D*3+2;
+    s_start = (D||3); s_end = sweepEnd(D||3);
   } else if(s_in) {
     s_start = s_end = s_in;
-    r_start = (D||3); r_end = D*3+2;
+    r_start = (D||3); r_end = sweepEnd(D||3);
   } else {
-    r_start = (D||3); r_end = D*3+2;
-    s_start = (D||3); s_end = D*3+2;
+    r_start = (D||3); r_end = sweepEnd(D||3);
+    s_start = (D||3); s_end = sweepEnd(D||3);
   }
   
+  let SEARCH_CAP = 20000; // hard cap on raw (pre-dedup) entries to keep generate() responsive
+  search:
   for(let pi=0; pi<(pairs.length>0?pairs.length:1); pi++) {
     // Range start/end for iteration
     let r_start2 = pairs.length>0 ? pairs[pi].r/2 : r_start;
@@ -272,6 +351,7 @@ function generate() {
       let s = 2*my;
       let Dc = Math.min(mx, my);
       if(D && Dc < D) continue;
+      if(codes.length > SEARCH_CAP) break search;
       
       let N = 2*r*s, Rs = r*s;
       if(Nfilter && N !== Nfilter) continue;
@@ -279,19 +359,20 @@ function generate() {
       if(minimal) {
         // === ALGEBRAIC WEIGHT-8 ===
         // Family 1: monomial → dependent HX/HZ → max K
+        // a,b are g shifted by a monomial, so their weight is always g's weight (G_WT)
+        // regardless of shift — no need to actually build the matrices during the sweep.
         let K1 = Rs + 2*r + 2*s - 4;
         if(K1/N >= min_rate) {
-          let g = gcdPoly(r, s);
           let shifts = [[0,0,2,2],[r/2|0,s/2|0,1,1]];
           for(let [ai,aj,bi,bj] of shifts) {
             ai%=r; aj%=s; bi%=r; bj%=s;
-            let pa = new bvPoly(r,s); pa.set(ai,aj,1);
-            let pb = new bvPoly(r,s); pb.set(bi,bj,1);
-            let a=g.mul(pa), b=g.mul(pb);
-            codes.push({r,s,N,K:K1*depth,D:Dc,rate:K1*depth/N,stab_wt:a.wt()+b.wt(),wa:a.wt(),wb:b.wt(),ax:0,ay:0,bx:0,by:0,aname:'mono',bname:`${ai},${aj}`,_a:a,_b:b,depth});
+            codes.push({r,s,N,K:K1*depth,D:Dc,rate:K1*depth/N,stab_wt:G_WT*2,wa:G_WT,wb:G_WT,ax:ai,ay:aj,bx:bi,by:bj,aname:'mono',bname:`${ai},${aj}`,depth,family:'mono'});
           }
         }
         // Family 2: chain f=(1+x²)·chain(y) → independent HX/HZ → K=4r+4s-8
+        // b's weight depends on whether the chain's positions collide mod r/s, so it
+        // still has to be built once to verify weight===4 — but it's discarded right
+        // after the check instead of being kept alive in the codes array.
         let K2 = 4*r + 4*s - 8;
         if(K2/N >= min_rate && K2 !== K1) {
           let g = gcdPoly(r, s), added=0;
@@ -300,7 +381,7 @@ function generate() {
               let pb=new bvPoly(r,s);
               for(let t=0;t<=m;t++){pb.set(0,(a+2*t)%s,1);pb.set(2,(a+2*t)%s,1);}
               let b=g.mul(pb); if(b.wt()!==4)continue;
-              codes.push({r,s,N,K:K2*depth,D:Dc,rate:K2*depth/N,stab_wt:g.wt()+b.wt(),wa:g.wt(),wb:b.wt(),ax:0,ay:0,bx:0,by:0,aname:'chain-x',bname:`a${a}m${m}`,_a:g,_b:b,depth});
+              codes.push({r,s,N,K:K2*depth,D:Dc,rate:K2*depth/N,stab_wt:G_WT+4,wa:G_WT,wb:4,aname:'chain-x',bname:`a${a}m${m}`,depth,family:'chain',chainAxis:'x',chainA:a,chainM:m});
               added++;
             }
           for(let a=0; a<r && added<6; a++)
@@ -308,7 +389,7 @@ function generate() {
               let pb=new bvPoly(r,s);
               for(let t=0;t<=m;t++){pb.set((a+2*t)%r,0,1);pb.set((a+2*t)%r,2,1);}
               let b=g.mul(pb); if(b.wt()!==4)continue;
-              codes.push({r,s,N,K:K2*depth,D:Dc,rate:K2*depth/N,stab_wt:g.wt()+b.wt(),wa:g.wt(),wb:b.wt(),ax:0,ay:0,bx:0,by:0,aname:'chain-y',bname:`a${a}m${m}`,_a:g,_b:b,depth});
+              codes.push({r,s,N,K:K2*depth,D:Dc,rate:K2*depth/N,stab_wt:G_WT+4,wa:G_WT,wb:4,aname:'chain-y',bname:`a${a}m${m}`,depth,family:'chain',chainAxis:'y',chainA:a,chainM:m});
               added++;
             }
         }
@@ -316,34 +397,45 @@ function generate() {
       }
       
       // === RANDOM SPARSE MODE ===
+      // This block only determines FEASIBILITY at this (r,s) size — is there some
+      // template pair sparse enough to fit Max Weight? — and records the winning
+      // template's name/weight as a label. The actual displayed a,b matrix is built
+      // independently at render time via genActual() (random, density-driven), same
+      // as the original file. I tried making the displayed matrix deterministically
+      // match the winning template (both with and without the shared g·() factor used
+      // in "minimal" mode) and both attempts broke real things — template-only gave
+      // weights disconnected from what the rest of the algorithm needs, and g·template
+      // pushed weights to 16+, breaking the default Max Weight filter entirely. So this
+      // stays as the original behavior: aname/bname/stab_wt are a labeled estimate of
+      // sparsity at this size, not a literal description of the matrix shown below.
       let rate = K/N;
       if(rate < min_rate) continue;
-      
+
+      // Only the lowest-weight template pair survives dedup later anyway (dedup key
+      // is r,s only), so find it directly instead of generating all 36 combinations.
+      let bestTi=-1, bestUi=-1, bestSw=Infinity;
       for(let ti=0;ti<T.length;ti++) {
         for(let ui=0;ui<T.length;ui++) {
-          let wa = T[ti].wx * T[ti].wy;
-          let wb = T[ui].wx * T[ui].wy;
-          let sw = wa + wb;
+          let sw = T[ti].wx*T[ti].wy + T[ui].wx*T[ui].wy;
           if(sw > max_wt) continue;
-          
-          codes.push({
-            r,s,N,K,D:Dc,rate: K*depth/N,
-            stab_wt:sw, wa, wb,
-            ax:T[ti].xp, ay:T[ti].yp,
-            bx:T[ui].xp, by:T[ui].yp,
-            aname:T[ti].name, bname:T[ui].name,
-            depth
-          });
+          if(sw < bestSw) { bestSw = sw; bestTi = ti; bestUi = ui; }
         }
       }
+      if(bestTi === -1) continue; // no template pair fits max_wt at this size
+
+      codes.push({
+        r,s,N,K,D:Dc,rate: K*depth/N,
+        stab_wt:bestSw, wa:T[bestTi].wx*T[bestTi].wy, wb:T[bestUi].wx*T[bestUi].wy,
+        ax:T[bestTi].xp, ay:T[bestTi].yp,
+        bx:T[bestUi].xp, by:T[bestUi].yp,
+        aname:T[bestTi].name, bname:T[bestUi].name,
+        depth
+      });
     }
   }
   }
   
-  // Sort by D*rate
-  codes.sort((a,b) => a.N - b.N);
-  
-  // Deduplicate
+  // Dedup (this also determines final order; pre-dedup sort was redundant and removed)
   let seen = {}, uniq = [];
   for(let c of codes) {
     let key = minimal ? `${c.r},${c.s},${c.aname},${c.bname}` : `${c.r},${c.s}`;
@@ -360,7 +452,7 @@ function generate() {
   if(noteDiv) noteDiv.innerHTML = codes.length>0 
     ? (minimal
       ? `<span class="dim">Algebraic weight-8: monomial K=rs+2r+2s−4, chain K=4r+4s−8, D=min(r/2,s/2). No brute-force.</span>`
-      : `<span class="dim">Actual code: a = template · p<sub>a</sub>(x,y) where p<sub>a</sub> random, not divisible by (x+1) or (y+1). Template = minimal-weight representative.</span>`)
+      : `<span class="dim">Actual code: a = g·p<sub>a</sub>(x,y) where p<sub>a</sub> random, not divisible by (x+1) or (y+1). Template search (T[]) only checks size feasibility — it doesn't determine the displayed matrix, so Wt/K here are exploratory, not guaranteed.</span>`)
     : '';
   
   // Output
@@ -374,13 +466,15 @@ function generate() {
     let html = `<table>
       <tr><th>r</th><th>s</th><th>N</th><th>K</th><th>D</th><th>Rate</th><th>Wt</th><th>a(x,y)</th><th>b(x,y)</th><th>#</th></tr>`;
     
+    lastActuals = [];
     for(let i=0; i<codes.length; i++) {
       let c = codes[i];
-      let actual = c._a ? {a:c._a, b:c._b, wa:c._a.wt(), wb:c._b.wt()} : genActual(c.r, c.s, density, minimal);
+      let actual = renderActual(c, density, minimal);
       if(!actual) continue;
+      lastActuals[i] = actual;
       let ahex = polyToHex(actual.a), bhex = polyToHex(actual.b);
       
-      html += `<tr class="clickable-row" onclick="document.getElementById('mat-${i}').classList.toggle('open')" title="Click row to view full matrix">
+      html += `<tr class="clickable-row" onclick="toggleMatrix(${i})" title="Click row to view full matrix">
         <td>${c.r}</td><td>${c.s}</td><td class="hl">${c.N}</td>
         <td class="hl">${c.K}</td><td class="hl">${c.D}</td>
         <td>${c.rate.toFixed(4)}</td>
@@ -390,12 +484,12 @@ function generate() {
         <td>${c.depth||1}</td>
       </tr>`;
       
-      html += `<tr id="mat-${i}" class="matrix-view">
+      // Matrix content is rendered lazily by toggleMatrix() on first expand —
+      // previously this built renderMatrix() HTML (up to r×s spans, ×2) for
+      // every row up front even if the user never expanded it.
+      html += `<tr id="mat-${i}" class="matrix-view" data-rendered="0">
         <td colspan="10">
-          <div class="matrix-container">
-            <div><div style="color:#888;">a(x,y) Matrix (${c.r}x${c.s})</div>${renderMatrix(actual.a)}</div>
-            <div><div style="color:#888;">b(x,y) Matrix (${c.r}x${c.s})</div>${renderMatrix(actual.b)}</div>
-          </div>
+          <div class="matrix-container" id="mc-${i}"></div>
         </td>
       </tr>`;
     }

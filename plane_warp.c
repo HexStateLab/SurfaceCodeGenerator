@@ -15,6 +15,51 @@
 // Adaptive corner: run one pass of threshold decoder (>=3 of 4 checks fire)
 // to get a rough error estimate, then use its centroid. O(n), much tighter
 // than raw syndrome centroid for multi-cluster errors.
+// Adaptive corner: threshold-guided centroid. Fast O(n), no alternating iteration.
+// Use --fast flag to enable. Default: full 156D nullspace alternating optimization.
+static int g_fast = 0;
+void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
+    int n=r*s, sx=0, sy=0, count=0;
+    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+        int hits=0;
+        for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
+            hits += syn[((qi-di+r)%r)*s + ((qj-dj+s)%s)];
+        if(hits >= 3) { sx+=qi; sy+=qj; count++; }
+    }
+    if(count==0) {
+        for(int ci=0;ci<r;ci++) for(int cj=0;cj<s;cj++)
+            if(syn[ci*s+cj]) { sx+=ci; sy+=cj; count++; }
+    }
+    if(count==0) { *cx=0; *cy=0; return; }
+    *cx = (((sx + count/2) / count) & ~1) % r;
+    *cy = (((sy + count/2) / count) & ~1) % s;
+}
+
+// Fast solver: adaptive corner + 16 nullspace XOR. No alternating optimization.
+int solve_plane_fast(int r, int s, uint8_t *syn, uint8_t *out) {
+    int n=r*s, best_wt=n+1, acx, acy;
+    adaptive_corner(r,s,syn,&acx,&acy);
+    // Compute particular solution at adaptive corner with ns=0
+    uint8_t base[MAX_N]; memset(base,0,n);
+    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+        int rel_i=(qi-acx+r)%r, rel_j=(qj-acy+s)%s;
+        if(rel_i<2 && rel_j<2) continue;
+        int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
+        base[qi*s+qj] = syn[ck] ^ base[((qi-2+r)%r)*s+qj]
+                                 ^ base[qi*s+((qj-2+s)%s)]
+                                 ^ base[((qi-2+r)%r)*s+((qj-2+s)%s)];
+    }
+    // Enumerate 16 nullspace additions: each shifts the 2x2 corner at (acx,acy)
+    for(int ns=0; ns<16; ns++) {
+        uint8_t sol[MAX_N]; memcpy(sol,base,n);
+        for(int dqi=0;dqi<2;dqi++) for(int dqj=0;dqj<2;dqj++)
+            if(ns&(1<<(dqi*2+dqj))) sol[((acx+dqi)%r)*s+((acy+dqj)%s)]^=1;
+        int wt=0; for(int q=0;q<n;q++) wt+=sol[q];
+        if(wt<best_wt) {best_wt=wt; memcpy(out,sol,n);}
+    }
+    return best_wt<=n;
+}
+
 // ---- Full 156D nullspace decoder via alternating optimization ----
 // Nullspace decomposes as v(i,j) = f(j) ⊕ g(i) ⊕ h(i%2,j%2).
 // f: 2·s DOF (even/odd pattern per column), g: 2·r DOF (per row), h: 4 DOF (corner).
@@ -161,12 +206,13 @@ int decode_Z(int r, int s, uint8_t *err_z, uint8_t *dec_z) {
         for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
             syn[((qi+2-di+r)%r)*s + ((qj+2-dj+s)%s)] ^= 1;
     }
-    return solve_plane(r,s,syn,dec_z);
+    return (g_fast?solve_plane_fast:solve_plane)(r,s,syn,dec_z);
 }
 
 // ---- Test ----
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
+    g_fast=0;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--bench")) bench=1;
         else if(!strcmp(argv[i],"--seed")) seed=atoi(argv[++i]);
@@ -174,22 +220,23 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--trials")) trials=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--cluster")) mode=1;
         else if(!strcmp(argv[i],"--line")) mode=2;
+        else if(!strcmp(argv[i],"--fast")) g_fast=1;
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}
     }
     srand(seed);
     int n=r*s;
     
     printf("Plane-Warp Decoder — %dx%d Torus, n=%d\n",r,s,n);
-    printf("  Algorithm: full 156D nullspace via alternating optimization, O(n).\n");
+    printf("  Algorithm: %s\n", g_fast ? "adaptive corner, O(n)" : "full 156D nullspace, O(n)");
     
     if(bench) {
-        int weights[]={1,2,3,5,7,10,12,15,18,20};
+        int weights[]={1,2,3,5,7,10,12,15,18,20,25,30,40,50,75,100};
         const char *names[]={"i.i.d.","cluster","line"};
         for(int mi=0;mi<3;mi++) {
             if(mode && mi!=mode) continue;
             if(!mode) printf("\n=== %s noise ===\n",names[mi]);
             printf("%8s %8s %8s\n","Weight","OK/Trials","Rate");
-            for(int wi=0;wi<10;wi++) {
+            for(int wi=0;wi<16;wi++) {
                 int w=weights[wi], ok=0;
                 uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N];
                 for(int t=0;t<trials;t++) {
@@ -197,7 +244,7 @@ int main(int argc, char **argv) {
                     else if(mi==1) gen_cluster(r,s,err,w/3+1,3);
                     else gen_line(r,s,err,w/5+1,5);
                     syndrome_of(r,s,err,syn);
-                    solve_plane(r,s,syn,dec);
+                    (g_fast?solve_plane_fast:solve_plane)(r,s,syn,dec);
                     uint8_t diff[MAX_N];
                     for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
                     if(is_stabilizer(r,s,diff)) ok++;

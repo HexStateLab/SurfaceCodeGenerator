@@ -84,36 +84,93 @@ static void build_nullspace(int r, int s) {
     ns_ready=1;
 }
 
-// ---- Helpers: optimal 4-pattern per column/row (non-boundary qubits only) ----
-static int best_col_pat(int r, int s, uint8_t *p, int j, int px, int n) {
+// ---- Helpers: optimal 4-pattern per column/row (boundary-relative) ----
+// Boundary is the 2x2 block at (cx,cy). Protect those qubits.
+static int best_col_pat(int r, int s, uint8_t *p, int j, int px, int cx, int cy, int n) {
     int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
         int e0=pat&1, e1=(pat>>1)&1, wt=0;
-        for(int i=px;i<r;i+=2) if(!(i<2 && j<2) && (p[i*s+j]^e0)) wt++;
-        for(int i=px^1;i<r;i+=2) if(!(i<2 && j<2) && (p[i*s+j]^e1)) wt++;
+        for(int i=px;i<r;i+=2) {
+            int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt++;
+        }
+        for(int i=px^1;i<r;i+=2) {
+            int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt++;
+        }
         if(wt<best) {best=wt;best_pat=pat;}
     }
     return best_pat;
 }
-static int best_row_pat(int r, int s, uint8_t *p, int i, int py, int n) {
+static int best_row_pat(int r, int s, uint8_t *p, int i, int py, int cx, int cy, int n) {
     int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
         int e0=pat&1, e1=(pat>>1)&1, wt=0;
-        for(int j=py;j<s;j+=2) if(!(i<2 && j<2) && (p[i*s+j]^e0)) wt++;
-        for(int j=py^1;j<s;j+=2) if(!(i<2 && j<2) && (p[i*s+j]^e1)) wt++;
+        for(int j=py;j<s;j+=2) {
+            int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt++;
+        }
+        for(int j=py^1;j<s;j+=2) {
+            int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt++;
+        }
         if(wt<best) {best=wt;best_pat=pat;}
     }
     return best_pat;
 }
-static void apply_col(int r, int s, uint8_t *p, int j, int px, int pat) {
+static void apply_col(int r, int s, uint8_t *p, int j, int px, int cx, int cy, int pat) {
     int e0=pat&1, e1=(pat>>1)&1;
-    for(int i=px;i<r;i+=2) if(!(i<2 && j<2)) p[i*s+j]^=e0;
-    for(int i=px^1;i<r;i+=2) if(!(i<2 && j<2)) p[i*s+j]^=e1;
+    for(int i=px;i<r;i+=2) {
+        int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
+        if(!(ri<2 && rj<2)) p[i*s+j]^=e0;
+    }
+    for(int i=px^1;i<r;i+=2) {
+        int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
+        if(!(ri<2 && rj<2)) p[i*s+j]^=e1;
+    }
 }
-static void apply_row(int r, int s, uint8_t *p, int i, int py, int pat) {
+static void apply_row(int r, int s, uint8_t *p, int i, int py, int cx, int cy, int pat) {
     int e0=pat&1, e1=(pat>>1)&1;
-    for(int j=py;j<s;j+=2) if(!(i<2 && j<2)) p[i*s+j]^=e0;
-    for(int j=py^1;j<s;j+=2) if(!(i<2 && j<2)) p[i*s+j]^=e1;
+    for(int j=py;j<s;j+=2) {
+        int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
+        if(!(ri<2 && rj<2)) p[i*s+j]^=e0;
+    }
+    for(int j=py^1;j<s;j+=2) {
+        int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
+        if(!(ri<2 && rj<2)) p[i*s+j]^=e1;
+    }
+}
+
+// Free variants: no boundary protection, for refinement passes
+static int best_col_pat_free(int r, int s, uint8_t *p, int j, int px, int n) {
+    int best=n+1, best_pat=0;
+    for(int pat=0;pat<4;pat++) {
+        int e0=pat&1, e1=(pat>>1)&1, wt=0;
+        for(int i=px;i<r;i+=2) if(p[i*s+j]^e0) wt++;
+        for(int i=px^1;i<r;i+=2) if(p[i*s+j]^e1) wt++;
+        if(wt<best){best=wt;best_pat=pat;}
+    }
+    return best_pat;
+}
+static int best_row_pat_free(int r, int s, uint8_t *p, int i, int py, int n) {
+    int best=n+1, best_pat=0;
+    for(int pat=0;pat<4;pat++) {
+        int e0=pat&1, e1=(pat>>1)&1, wt=0;
+        for(int j=py;j<s;j+=2) if(p[i*s+j]^e0) wt++;
+        for(int j=py^1;j<s;j+=2) if(p[i*s+j]^e1) wt++;
+        if(wt<best){best=wt;best_pat=pat;}
+    }
+    return best_pat;
+}
+static void apply_col_free(int r, int s, uint8_t *p, int j, int px, int pat) {
+    int e0=pat&1, e1=(pat>>1)&1;
+    for(int i=px;i<r;i+=2) p[i*s+j]^=e0;
+    for(int i=px^1;i<r;i+=2) p[i*s+j]^=e1;
+}
+static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
+    int e0=pat&1, e1=(pat>>1)&1;
+    for(int j=py;j<s;j+=2) p[i*s+j]^=e0;
+    for(int j=py^1;j<s;j+=2) p[i*s+j]^=e1;
 }
 
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
@@ -130,24 +187,58 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
                                  ^ base[((qi-2+r)%r)*s+((qj-2+s)%s)];
     }
     
-    // Try all 16 corner (h) choices: shift by full nullspace vector, then alt opt
+    // First pass: projective from (0,0) corner
+    int cur_cx=0, cur_cy=0;
     for(int h=0; h<16; h++) {
         uint8_t work[MAX_N];
         for(int q=0;q<n;q++) work[q]=base[q]^nullspace[h][q];
         
-        // Alternating optimization on non-boundary qubits only
-        for(int it=0; it<3; it++) {
-            for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-                int pat=best_col_pat(r,s,work,j,px,n);
-                apply_col(r,s,work,j,px,pat);
-            }
-            for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-                int pat=best_row_pat(r,s,work,i,py,n);
-                apply_row(r,s,work,i,py,pat);
-            }
+        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+            int pat=best_col_pat(r,s,work,j,px,cur_cx,cur_cy,n);
+            apply_col(r,s,work,j,px,cur_cx,cur_cy,pat);
+        }
+        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+            int pat=best_row_pat(r,s,work,i,py,cur_cx,cur_cy,n);
+            apply_row(r,s,work,i,py,cur_cx,cur_cy,pat);
         }
         int wt=0; for(int q=0;q<n;q++) wt+=work[q];
         if(wt<best_wt) {best_wt=wt; memcpy(out,work,n);}
+    }
+    
+    // Iterative refinement: let projection modify boundary, re-derive, repeat.
+    // Each pass shifts the nullspace reference, escaping the single-pass minimum.
+    for(int refine=0; refine<4 && best_wt > n/10; refine++) {
+        uint8_t prev[MAX_N]; memcpy(prev,out,n);
+        // Re-derive particular from prev's boundary
+        uint8_t base2[MAX_N]; memset(base2,0,n);
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2 || qj<2) base2[qi*s+qj] = prev[qi*s+qj];
+        }
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2 || qj<2) continue;
+            int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
+            base2[qi*s+qj] = syn[ck] ^ base2[((qi-2+r)%r)*s+qj]
+                                     ^ base2[qi*s+((qj-2+s)%s)]
+                                     ^ base2[((qi-2+r)%r)*s+((qj-2+s)%s)];
+        }
+        // Project WITHOUT boundary protection — let boundary shift
+        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+            int pat=best_col_pat_free(r,s,base2,j,px,n);
+            apply_col_free(r,s,base2,j,px,pat);
+        }
+        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+            int pat=best_row_pat_free(r,s,base2,i,py,n);
+            apply_row_free(r,s,base2,i,py,pat);
+        }
+        int w2=0; for(int q=0;q<n;q++) w2+=base2[q];
+        // Verify syndrome: free pass must not break constraints
+        uint8_t vsyn[MAX_N]; memset(vsyn,0,n);
+        for(int q=0;q<n;q++) if(base2[q]) {
+            int qi=q/s, qj=q%s;
+            for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
+                vsyn[((qi-di+r)%r)*s+((qj-dj+s)%s)] ^= 1;
+        }
+        if(memcmp(vsyn,syn,n)==0 && w2<best_wt) {best_wt=w2; memcpy(out,base2,n);}
     }
     return best_wt<=n;
 }

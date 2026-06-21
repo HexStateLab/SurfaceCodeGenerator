@@ -8,9 +8,9 @@
 #include <string.h>
 #include <stdint.h>
 
-#define MAX_R 200
-#define MAX_S 200
-#define MAX_N (MAX_R*MAX_S*2)
+#define MAX_R 600
+#define MAX_S 600
+#define MAX_N (MAX_R*MAX_S)  // n = physical qubits, no 2x factor needed
 
 // Adaptive corner: run one pass of threshold decoder (>=3 of 4 checks fire)
 // to get a rough error estimate, then use its centroid. O(n), much tighter

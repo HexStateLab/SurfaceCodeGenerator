@@ -252,3 +252,52 @@ The decoder is agnostic to the polynomial — only the cut positions and nullspa
 ## License
 
 MIT
+
+# Composition information
+
+ Pick two odd numbers.
+
+Call them mx and my.
+
+Set r = 2·mx, s = 2·my. The code lives on a torus with r positions in the x-direction and s in the y-direction.
+
+Total qubits: N = 2·r·s = 8·mx·my.
+
+The stabilizers are HX = [A|B], HZ = [Bᵀ|Aᵀ] where A and B are rs × rs block-circulant matrices built from bivariate polynomials a(x,y) and b(x,y) over the ring GF(2)[x,y]/(xʳ+1, yˢ+1).
+
+The gcd structure in 2D is the product of the 1D structures:
+
+gcd_2d = (x+1)² · (y+1)²
+
+This has total degree 4 (2 from x, 2 from y). The formula for K is the same as 1D, applied to the total degree:
+
+K = 2 · deg(gcd_2d) = 2 · 4 = 8
+
+The nullspace generator is what's left after dividing out the gcd:
+
+h(x,y) = (xʳ+1)(yˢ+1) / ((x+1)²(y+1)²) = ((xʳ+1)/(x+1)²) · ((yˢ+1)/(y+1)²) = h_x(x) · h_y(y)
+
+Each factor h_x(x) is the 1D nullspace generator we already analyzed. In 1D with gcd=(x+1)², the nullspace vector h_x has weight exactly mx. Same for h_y with weight my. The minimum-weight 2D logical operator is the product of the shorter 1D operator with the identity in the other dimension, giving:
+
+D = min(mx, my)
+
+That's it. No search. No enumeration. The distance is forced by the factorization of xʳ+1 and yˢ+1 over GF(2).
+
+The Freshman's Dream f(x)² = f(x²) makes (x+1)² = x²+1 divide xʳ+1 whenever r is even. You set r = 2·mx specifically so that xʳ+1 = (xᵐˣ+1)² has the repeated-root structure. Same in y. The gcd consumes two copies of (x+1) and two of (y+1), leaving h_x of weight mx and h_y of weight my. The shorter dimension wins.
+
+For a square code where mx = my = D:
+
+N = 8D², K = 8, D = D, rate = 1/D²
+
+That's the surface code scaling; quadratic qubit cost, linear distance, but with 8 logical qubits instead of 1 or 2.
+
+The weight-8 stabilizers come from choosing a(x,y) = b(x,y) = (x+1)(y+1) which has 4 terms.
+
+Each circulant block contributes 4 ones, total 8 per check. You can choose denser polynomials to increase rate further, at the cost of heavier checks.
+
+The QFT diagonalizes the whole thing. The eigenvalues of the 2D circulant are a(ωˣ, ωʸ) evaluated at the r×s roots of unity. The shared zeros between a, b, xʳ+1, and yˢ+1 create the nullspace. The gcd degree counts the shared zeros. 
+
+# About me
+
+I'm BitStateEmulator on Reddit.
+

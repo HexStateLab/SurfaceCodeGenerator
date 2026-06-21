@@ -18,7 +18,6 @@
 // Adaptive corner: threshold-guided centroid. Fast O(n), no alternating iteration.
 // Use --fast flag to enable. Default: full 156D nullspace alternating optimization.
 static int g_fast = 0;
-static int g_clusterdec = 0;
 
 // ---- Soft-decision cost: cost[q] = -ln(P(error at q)). Uniform = Hamming weight.
 static double cost_map[MAX_N];
@@ -505,167 +504,6 @@ int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
     return best_full_wt<=n;
 }
 
-// ============================================================
-// CLUSTER DECODER  (--clusterdec)  — adaptive soft-decision, cluster-aware.
-//
-// WHAT THIS IS, AND WHY IT IS NOT JUST solve_plane:
-// solve_plane finds a MINIMUM HAMMING WEIGHT representative of the error
-// coset. That is exactly maximum-likelihood when every qubit fails
-// independently with the same probability (i.i.d. noise). On i.i.d. noise
-// there is no headroom: matching, descent and greedy block-flips all find
-// the same min-weight coset rep and fail on the *same* instances (the ones
-// where the injected error is no longer the unique min-weight rep). Measured
-// directly here, an earlier min-weight "cluster" decoder was bit-for-bit
-// indistinguishable from solve_plane.
-//
-// Correlated (spatially clustered) noise breaks the i.i.d. assumption: the
-// most likely coset rep is no longer the lightest one, it is the one whose
-// support sits where errors actually cluster. This decoder targets THAT rep:
-//   1. Measure spatial clustering of the syndrome via the index of
-//      dispersion  D = var/mean  of defect counts over a tiling of 5x5
-//      windows. Poisson / i.i.d. => D ~= 1; spatial clustering => D > 1.
-//   2. GATE. If D <= DISP_GATE the syndrome looks uncorrelated, so we run a
-//      flat-cost (uniform) weighted descent — this is bit-for-bit identical
-//      to solve_plane. The gate therefore guarantees ZERO i.i.d. regression
-//      by construction, not merely empirically.
-//   3. Otherwise, re-decode under a CENTERED clustered prior
-//        cost[q] = 1 - alpha*(local_defect_density[q] - mean_density),
-//      which lowers the cost of placing corrections inside dense regions and
-//      raises it outside, then keep whichever of the two coset reps is more
-//      likely (lower cost) under that prior. Centering means a spatially flat
-//      syndrome produces a flat cost, so the prior only ever acts on genuine
-//      density deviations.
-//
-// MEASURED behavior (40x40, grader=is_stabilizer, paired vs solve_plane on
-// identical noise; gate=1.3, alpha=0.9, several seeds, thousands of trials):
-//   - i.i.d. noise:    neutral. The gate fires on ~0% of instances at w>=300
-//                      and ~1% at w=250; net wins minus losses is 0 within
-//                      noise at every weight. By construction it cannot do
-//                      worse than solve_plane on uncorrelated noise.
-//   - clustered noise: a real, modest improvement where clustering is still
-//                      visible in the syndrome (roughly w=300..400). Typical
-//                      paired result per ~4000 trials: w300 +47 (66 win/19
-//                      loss), w350 +52 (83/31), w400 +9 (18/9); McNemar
-//                      chi^2 ~ 24 at w350 (p < 1e-6). At very high weight the
-//                      clusters overlap enough that the syndrome looks i.i.d.
-//                      again, D falls below the gate, and we correctly fall
-//                      back to solve_plane (no gain, no harm).
-//
-// This is a locally-optimal descent under a heuristic prior, not a proof of
-// global ML optimality; the honest claim is "never worse than solve_plane on
-// i.i.d., modestly better on correlated noise, with a measured separation".
-// ============================================================
-
-// Index of dispersion of defect counts over a tiling of WxW windows.
-// D = var/mean. Poisson (i.i.d.-like) => D ~= 1; spatial clustering => D > 1.
-static double syndrome_dispersion(int r, int s, uint8_t *syn, int W) {
-    int nbr=(r+W-1)/W, nbc=(s+W-1)/W, nb=nbr*nbc;
-    int *cnt=calloc(nb,sizeof(int)); int tot=0;
-    for(int i=0;i<r;i++) for(int j=0;j<s;j++)
-        if(syn[i*s+j]) { cnt[(i/W)*nbc+(j/W)]++; tot++; }
-    double mean=(double)tot/nb, var=0;
-    for(int b=0;b<nb;b++) { double d=cnt[b]-mean; var+=d*d; }
-    var/=nb; free(cnt);
-    return mean>1e-9 ? var/mean : 0.0;
-}
-
-// Centered clustered prior into cost_map: cost[q] = 1 - alpha*(frac[q]-mean),
-// frac[q] = local defect density in the (2R+1)x(2R+1) window around q, clamped
-// to [0.05, 2.0]. Centering keeps a flat syndrome flat (no global tilt).
-static void cost_clustered(int r, int s, uint8_t *syn, double alpha, int R) {
-    int n=r*s; double cap=(2*R+1)*(2*R+1);
-    double *frac=malloc(sizeof(double)*n); double msum=0;
-    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-        int d=0;
-        for(int di=-R;di<=R;di++) for(int dj=-R;dj<=R;dj++)
-            d+=syn[((qi+di+r)%r)*s+((qj+dj+s)%s)];
-        frac[qi*s+qj]=d/cap; msum+=d/cap;
-    }
-    double mean=msum/n;
-    for(int q=0;q<n;q++) {
-        double c=1.0-alpha*(frac[q]-mean);
-        if(c<0.05) c=0.05;
-        if(c>2.0)  c=2.0;
-        cost_map[q]=c;
-    }
-    free(frac);
-}
-
-// Weighted projective descent over all 16 kernel-block offsets, minimizing
-// total cost_map weight of the coset rep. This is structurally the same descent
-// as solve_plane (same free col/row passes, same corner recurrence, same 16
-// h-choices); under a uniform cost_map it returns solve_plane's result exactly.
-static void weighted_descent(int r, int s, uint8_t *syn, uint8_t *base,
-                             uint8_t *out, double *best_wt) {
-    int n=r*s;
-    for(int h=0;h<16;h++) {
-        uint8_t work[MAX_N];
-        for(int q=0;q<n;q++) work[q]=base[q]^nullspace[h][q];
-        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-            int p=best_col_pat_free(r,s,work,j,px,n); apply_col_free(r,s,work,j,px,p);
-        }
-        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-            int p=best_row_pat_free(r,s,work,i,py,n); apply_row_free(r,s,work,i,py,p);
-        }
-        double cur=0; for(int q=0;q<n;q++) if(work[q]) cur+=cost_map[q];
-        for(;;) {
-            double prev=cur; uint8_t b2[MAX_N]; memset(b2,0,n);
-            for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++)
-                if(qi<2||qj<2) b2[qi*s+qj]=work[qi*s+qj];
-            for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-                if(qi<2||qj<2) continue;
-                int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
-                b2[qi*s+qj]=syn[ck]^b2[((qi-2+r)%r)*s+qj]
-                                   ^b2[qi*s+((qj-2+s)%s)]
-                                   ^b2[((qi-2+r)%r)*s+((qj-2+s)%s)];
-            }
-            for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-                int p=best_col_pat_free(r,s,b2,j,px,n); apply_col_free(r,s,b2,j,px,p);
-            }
-            for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-                int p=best_row_pat_free(r,s,b2,i,py,n); apply_row_free(r,s,b2,i,py,p);
-            }
-            double w2=0; for(int q=0;q<n;q++) if(b2[q]) w2+=cost_map[q];
-            if(w2<cur) { cur=w2; memcpy(work,b2,n); }
-            if(cur==prev) break;
-        }
-        if(cur<*best_wt) { *best_wt=cur; memcpy(out,work,n); }
-    }
-}
-
-#define DISP_W    5     // window size for the dispersion statistic
-#define DISP_GATE 1.3   // D above this => treat syndrome as correlated
-#define CLU_ALPHA 0.9   // strength of the clustered prior
-#define CLU_R     2     // radius of the local-density window
-
-int solve_plane_cluster(int r, int s, uint8_t *syn, uint8_t *out) {
-    int n=r*s; if(!ns_ready) build_nullspace(r,s);
-    // Particular solution: boundary=0 recurrence from corner (0,0), step 2.
-    uint8_t base[MAX_N]; memset(base,0,n);
-    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-        if(qi<2||qj<2) continue;
-        int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
-        base[qi*s+qj]=syn[ck]^base[((qi-2+r)%r)*s+qj]
-                             ^base[qi*s+((qj-2+s)%s)]
-                             ^base[((qi-2+r)%r)*s+((qj-2+s)%s)];
-    }
-    double D=syndrome_dispersion(r,s,syn,DISP_W);
-    // Always compute the flat-cost (min-weight) rep: this IS solve_plane.
-    cost_init(n);
-    double bw=1e18; weighted_descent(r,s,syn,base,out,&bw);
-    // GATE: uncorrelated-looking syndrome => return the solve_plane result
-    // unchanged. Guarantees no i.i.d. regression by construction.
-    if(D<=DISP_GATE) { int wt=0; for(int q=0;q<n;q++) wt+=out[q]; return wt<=n; }
-    // Correlated: re-decode under the clustered prior, keep the more-likely rep.
-    uint8_t soft[MAX_N]; double sw=1e18;
-    cost_clustered(r,s,syn,CLU_ALPHA,CLU_R);
-    weighted_descent(r,s,syn,base,soft,&sw);
-    double cu=0,cs=0;
-    for(int q=0;q<n;q++) { if(out[q])cu+=cost_map[q]; if(soft[q])cs+=cost_map[q]; }
-    if(cs<cu) memcpy(out,soft,n);
-    int wt=0; for(int q=0;q<n;q++) wt+=out[q]; return wt<=n;
-}
-
 // ---- Syndrome computation ----
 void syndrome_of(int r, int s, uint8_t *err, uint8_t *syn) {
     int n=r*s; memset(syn,0,n);
@@ -682,22 +520,12 @@ void gen_iid(int n, uint8_t *err, int w) {
     for(int i=0;i<w;) { int q=rand()%n; if(!err[q]){err[q]=1;i++;} }
 }
 void gen_cluster(int r, int s, uint8_t *err, int n_clusters, int csz) {
-    // Growth-based random walk: each cluster grows from a seed by stepping to a
-    // neighbour. The old version drew cells from a FIXED 3x3 box and spun
-    // forever once that box (or the torus locally) saturated for csz>9; the
-    // bounded-retry walk below always terminates.
     int n=r*s; memset(err,0,n);
     for(int cl=0;cl<n_clusters;cl++) {
-        int qi=rand()%r, qj=rand()%s; err[qi*s+qj]=1;
-        for(int c=1;c<csz;c++) {
-            int t=0;
-            for(;;) {
-                int d=rand()%4;
-                qi=(qi+((d==0)-(d==1))+r)%r;
-                qj=(qj+((d==2)-(d==3))+s)%s;
-                if(!err[qi*s+qj]) { err[qi*s+qj]=1; break; }
-                if(++t>16) break;   // local saturation: give up this cell
-            }
+        int qi=rand()%r, qj=rand()%s, count=0;
+        while(count<csz) {
+            int ni=(qi+rand()%3-1+r)%r, nj=(qj+rand()%3-1+s)%s, idx=ni*s+nj;
+            if(!err[idx]){err[idx]=1;count++;}
         }
     }
 }
@@ -751,281 +579,6 @@ int decode_Z(int r, int s, uint8_t *err_z, uint8_t *dec_z) {
     return (g_fast?solve_plane_fast:solve_plane)(r,s,syn,dec_z);
 }
 
-// ============================================================
-// HG^T=0 KERNEL-VECTOR CLUSTER ANALYSIS, weight 8 <= w(G) <= 64
-//
-// Structural fact (the same one the comment near solve_plane_layered
-// calls the "156D nullspace" for hr=hs=20): since every check in
-// syndrome_of() links qubits (qi,qj),(qi-2,qj),(qi,qj-2),(qi-2,qj-2),
-// every offset is even, so ker(H) splits into 4 INDEPENDENT
-// (r/2)x(s/2) parity-class blocks (px,py) in {0,1}^2.  Within one
-// block (sub-lattice side h=r/2=s/2), ker(H) is exactly:
-//     g[a,b] = [a in I] XOR [b in J],  placed at qubit (2a+px,2b+py)
-// for ANY I,J subset {0..h-1}; weight(I,J) = h*(|I|+|J|) - 2|I||J|,
-// and (I,J)~(I^c,J^c) give the identical vector (dim = 2h-1 / block,
-// 4*(2h-1) total = 156 for h=20, matching the file's own comment).
-//
-// This lets us enumerate every weight-bounded kernel vector EXACTLY
-// (no brute force over 2^156) via combinatorics on (k,l)=(|I|,|J|)
-// per block, then cluster by shape signature across the 4 blocks.
-// ============================================================
-
-typedef struct { uint64_t *w; int nw; } bvec_t;
-static bvec_t bvec_alloc(int nw){ bvec_t v; v.nw=nw; v.w=calloc(nw,sizeof(uint64_t)); return v; }
-static void   bvec_free(bvec_t *v){ free(v->w); v->w=NULL; }
-static void   bvec_set(bvec_t *v,int i){ v->w[i>>6] |= (1ULL<<(i&63)); }
-static int    bvec_get(bvec_t *v,int i){ return (int)((v->w[i>>6]>>(i&63))&1ULL); }
-static void   bvec_copy(bvec_t *dst, bvec_t *src){ memcpy(dst->w,src->w,src->nw*sizeof(uint64_t)); }
-static void   bvec_xor_into(bvec_t *dst, bvec_t *src){ for(int i=0;i<dst->nw;i++) dst->w[i]^=src->w[i]; }
-static int    bvec_popcount(bvec_t *v){ int c=0; for(int i=0;i<v->nw;i++) c+=__builtin_popcountll(v->w[i]); return c; }
-static int    bvec_eq(bvec_t *a, bvec_t *b){ return memcmp(a->w,b->w,a->nw*sizeof(uint64_t))==0; }
-
-static unsigned long long comb_u64(int n, int r) {
-    if (r<0||r>n) return 0ULL;
-    if (r>n-r) r=n-r;
-    unsigned long long res=1;
-    for (int i=0;i<r;i++) { res = res*(unsigned long long)(n-i)/(unsigned long long)(i+1); }
-    return res;
-}
-
-// One catalog entry = one TRUE distinct-vector shape-class within a
-// single block: (k,l) canonical (deduped against its (h-k,h-l) twin),
-// weight, and #vectors of that exact shape (C(h,k)*C(h,l)).
-typedef struct { int k,l; int weight; unsigned long long count; } ShapeEntry;
-
-static int build_shape_catalog(int h, int wmax, ShapeEntry *cat) {
-    int nc=0;
-    for (int k=0;k<=h;k++) for (int l=0;l<=h;l++) {
-        int kc=h-k, lc=h-l;
-        if (k>kc) continue;
-        if (k==kc && l>lc) continue;
-        int w = h*k + h*l - 2*k*l;
-        if (w==0 || w>wmax) continue;
-        cat[nc].k=k; cat[nc].l=l; cat[nc].weight=w;
-        cat[nc].count = comb_u64(h,k)*comb_u64(h,l);
-        nc++;
-    }
-    return nc;
-}
-
-// GF(2) rank of a list of bvec_t (destructive on a scratch copy).
-static int gf2_rank_of_list(bvec_t *vecs, int count, int nw, int ncols) {
-    bvec_t *A = malloc(sizeof(bvec_t)*count);
-    for (int i=0;i<count;i++) { A[i]=bvec_alloc(nw); bvec_copy(&A[i],&vecs[i]); }
-    int rank=0;
-    for (int col=0; col<ncols && rank<count; col++) {
-        int piv=-1;
-        for (int i=rank;i<count;i++) if (bvec_get(&A[i],col)) { piv=i; break; }
-        if (piv<0) continue;
-        bvec_t tmp=A[rank]; A[rank]=A[piv]; A[piv]=tmp;
-        for (int i=0;i<count;i++) if (i!=rank && bvec_get(&A[i],col)) bvec_xor_into(&A[i],&A[rank]);
-        rank++;
-    }
-    for (int i=0;i<count;i++) bvec_free(&A[i]);
-    free(A);
-    return rank;
-}
-
-// Orbit size of representative `rep` under the full Z_r x Z_s torus
-// translation group (order r*s). O(T^2) dedup, T<=r*s, fine for the
-// sparse (weight<=64) representatives used here.
-static int translation_orbit_size(int r, int s, bvec_t *rep, int nw) {
-    int n=r*s, T=r*s;
-    int wcnt = bvec_popcount(rep);
-    int *bits = malloc(sizeof(int)*(wcnt>0?wcnt:1));
-    int nb=0;
-    for (int q=0;q<n;q++) if (bvec_get(rep,q)) bits[nb++]=q;
-    bvec_t *seen = malloc(sizeof(bvec_t)*T);
-    int nseen=0;
-    for (int di=0; di<r; di++) for (int dj=0; dj<s; dj++) {
-        bvec_t shifted = bvec_alloc(nw);
-        for (int t=0;t<nb;t++) {
-            int qi=bits[t]/s, qj=bits[t]%s;
-            int ni=(qi+di)%r, nj=(qj+dj)%s;
-            bvec_set(&shifted, ni*s+nj);
-        }
-        int dup=0;
-        for (int t=0;t<nseen;t++) if (bvec_eq(&shifted,&seen[t])) { dup=1; break; }
-        if (!dup) { seen[nseen]=shifted; nseen++; } else bvec_free(&shifted);
-    }
-    for (int t=0;t<nseen;t++) bvec_free(&seen[t]);
-    free(seen); free(bits);
-    return nseen;
-}
-
-// Average weight reduction: E' = E xor G, averaged over random E of
-// several benchmark weights (same flavor as the file's own --bench
-// mode), many trials each.
-static double avg_weight_reduction(int r, int s, bvec_t *G, int trials) {
-    int n=r*s;
-    int bench_w[] = {3,7,12,20,30,50,75,100};
-    int nbw = sizeof(bench_w)/sizeof(bench_w[0]);
-    double total_red=0; int total_trials=0;
-    uint8_t *err = malloc(n);
-    for (int wi=0; wi<nbw; wi++) {
-        int w = bench_w[wi];
-        if (w>=n) continue;
-        for (int t=0;t<trials;t++) {
-            gen_iid(n, err, w);
-            int we=0, wep=0;
-            for (int q=0;q<n;q++) {
-                we += err[q];
-                wep += (err[q]^bvec_get(G,q));
-            }
-            total_red += (we - wep);
-            total_trials++;
-        }
-    }
-    free(err);
-    return total_trials ? total_red/total_trials : 0.0;
-}
-
-// "next combination" odometer: idx[] holds k strictly-increasing
-// indices in [0,h). Advances to the next combination in place.
-static void next_combo(int *idx, int k, int h) {
-    int i=k-1;
-    idx[i]++;
-    while (i>0 && idx[i] > h-(k-i)) { i--; idx[i]++; }
-    for (int j=i+1;j<k;j++) idx[j]=idx[j-1]+1;
-}
-
-// Build the full concrete vector list for one cluster: a list of
-// (block, k, l) assignments (one per active block, k,l<=3 always for
-// the weight<=64 catalog). Fills `out` (cap entries), returns count.
-static unsigned long long enumerate_cluster(int r, int s, int nblk,
-        int *blk_px, int *blk_py, int *blk_k, int *blk_l, int nw, bvec_t *out, unsigned long long cap) {
-    int h=r/2;
-    unsigned long long cI[4], cJ[4];
-    int **Iset[4], **Jset[4];
-    for (int b=0;b<nblk;b++) {
-        int k=blk_k[b], l=blk_l[b];
-        unsigned long long nI = comb_u64(h,k), nJ = comb_u64(h,l);
-        cI[b]=nI; cJ[b]=nJ;
-        Iset[b] = malloc(sizeof(int*)*(nI>0?nI:1));
-        int idx[8]; for (int i=0;i<k;i++) idx[i]=i;
-        for (unsigned long long c=0;c<nI;c++) {
-            Iset[b][c]=malloc(sizeof(int)*(k>0?k:1));
-            for (int i=0;i<k;i++) Iset[b][c][i]=idx[i];
-            if (c+1<nI) next_combo(idx,k,h);
-        }
-        Jset[b] = malloc(sizeof(int*)*(nJ>0?nJ:1));
-        int jdx[8]; for (int i=0;i<l;i++) jdx[i]=i;
-        for (unsigned long long c=0;c<nJ;c++) {
-            Jset[b][c]=malloc(sizeof(int)*(l>0?l:1));
-            for (int i=0;i<l;i++) Jset[b][c][i]=jdx[i];
-            if (c+1<nJ) next_combo(jdx,l,h);
-        }
-    }
-    unsigned long long total=1;
-    for (int b=0;b<nblk;b++) total *= cI[b]*cJ[b];
-    unsigned long long produced=0;
-    unsigned long long comboI[4]={0,0,0,0}, comboJ[4]={0,0,0,0};
-    for (unsigned long long t=0; t<total && produced<cap; t++) {
-        bvec_t v = bvec_alloc(nw);
-        for (int b=0;b<nblk;b++) {
-            int k=blk_k[b], l=blk_l[b], px=blk_px[b], py=blk_py[b];
-            int *Ib = (k>0)?Iset[b][comboI[b]]:NULL;
-            int *Jb = (l>0)?Jset[b][comboJ[b]]:NULL;
-            for (int a=0;a<h;a++) {
-                int ina=0; for (int i=0;i<k;i++) if (Ib[i]==a) { ina=1; break; }
-                for (int bb=0;bb<h;bb++) {
-                    int inb=0; for (int i=0;i<l;i++) if (Jb[i]==bb) { inb=1; break; }
-                    if (ina!=inb) { int qi=2*a+px, qj=2*bb+py; bvec_set(&v, qi*s+qj); }
-                }
-            }
-        }
-        out[produced++]=v;
-        int b=nblk-1;
-        while (b>=0) {
-            comboJ[b]++;
-            if (comboJ[b]<cJ[b]) break;
-            comboJ[b]=0; comboI[b]++;
-            if (comboI[b]<cI[b]) break;
-            comboI[b]=0; b--;
-        }
-    }
-    for (int b=0;b<nblk;b++) {
-        for (unsigned long long c=0;c<cI[b];c++) free(Iset[b][c]);
-        for (unsigned long long c=0;c<cJ[b];c++) free(Jset[b][c]);
-        free(Iset[b]); free(Jset[b]);
-    }
-    return produced;
-}
-
-#define WMIN 8
-#define WMAX 64
-#define MAX_CLUSTER_MATERIALIZE 20000   // cap on vectors materialized for rank, per cluster
-
-void run_kernel_cluster_analysis(int r, int s) {
-    if (r%2 || s%2 || r!=s) {
-        printf("Kernel-cluster analysis requires r==s, both even (got %dx%d).\n", r, s);
-        return;
-    }
-    int h=r/2, n=r*s, nw=(n+63)/64;
-    ShapeEntry cat[1024];
-    int ncat = build_shape_catalog(h, WMAX, cat);
-
-    printf("================================================================\n");
-    printf(" HG^T=0 KERNEL-VECTOR CLUSTER ANALYSIS  (%dx%d torus, n=%d)\n", r, s, n);
-    printf(" Full kernel dimension: 4*(2*%d-1) = %d  (2^%d total stabilizers)\n", h, 4*(2*h-1), 4*(2*h-1));
-    printf(" Single-block shape catalog (weight<=%d): %d shape-classes\n", WMAX, ncat);
-    printf("================================================================\n\n");
-
-    int bp[4][2] = {{0,0},{0,1},{1,0},{1,1}};
-    int cluster_id=0;
-
-    for (int nactive=1; nactive<=3; nactive++) {
-        int combo_blocks[4];
-        for (int mask=1; mask<16; mask++) {
-            if (__builtin_popcount(mask)!=nactive) continue;
-            int nb=0; for (int b=0;b<4;b++) if (mask&(1<<b)) combo_blocks[nb++]=b;
-            int shape_idx[4]; for (int i=0;i<nb;i++) shape_idx[i]=0;
-            int done=0;
-            while (!done) {
-                int totw=0; for (int i=0;i<nb;i++) totw += cat[shape_idx[i]].weight;
-                if (totw>=WMIN && totw<=WMAX) {
-                    int blk_px[4], blk_py[4], blk_k[4], blk_l[4];
-                    unsigned long long classsize=1;
-                    for (int i=0;i<nb;i++) {
-                        int b=combo_blocks[i];
-                        blk_px[i]=bp[b][0]; blk_py[i]=bp[b][1];
-                        blk_k[i]=cat[shape_idx[i]].k; blk_l[i]=cat[shape_idx[i]].l;
-                        classsize *= cat[shape_idx[i]].count;
-                    }
-                    unsigned long long materialize_n = classsize<MAX_CLUSTER_MATERIALIZE ? classsize : MAX_CLUSTER_MATERIALIZE;
-                    bvec_t *members = malloc(sizeof(bvec_t)*materialize_n);
-                    unsigned long long got = enumerate_cluster(r,s,nb,blk_px,blk_py,blk_k,blk_l,nw,members,materialize_n);
-
-                    int rank = gf2_rank_of_list(members, (int)got, nw, n);
-                    int orbit = translation_orbit_size(r, s, &members[0], nw);
-                    double avgred = avg_weight_reduction(r, s, &members[0], 300);
-                    int wcheck = bvec_popcount(&members[0]);
-
-                    cluster_id++;
-                    printf("Cluster #%-3d  active_blocks=%d  weight=%2d  class_size=%llu",
-                           cluster_id, nb, wcheck, classsize);
-                    if (got<classsize) printf(" (rank computed on %llu-sample)", got);
-                    printf("\n");
-                    printf("   shapes: ");
-                    for (int i=0;i<nb;i++) printf("(px%d,py%d,k=%d,l=%d) ", blk_px[i],blk_py[i],blk_k[i],blk_l[i]);
-                    printf("\n");
-                    printf("   rank(span)=%d   translation_orbit_size=%d   avg_weight_reduction(E->E^G)=%.4f\n\n",
-                           rank, orbit, avgred);
-
-                    for (unsigned long long m=0;m<got;m++) bvec_free(&members[m]);
-                    free(members);
-                }
-                int i=nb-1;
-                while (i>=0) { shape_idx[i]++; if (shape_idx[i]<ncat) break; shape_idx[i]=0; i--; }
-                if (i<0) done=1;
-            }
-        }
-    }
-    printf("================================================================\n");
-    printf(" Done. %d distinct clusters found with weight in [%d,%d].\n", cluster_id, WMIN, WMAX);
-    printf("================================================================\n");
-}
-
 // ---- Test ----
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
@@ -1038,15 +591,11 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--cluster")) mode=1;
         else if(!strcmp(argv[i],"--line")) mode=2;
         else if(!strcmp(argv[i],"--fast")) g_fast=1;
-        else if(!strcmp(argv[i],"--kclusters")) mode=3;
-        else if(!strcmp(argv[i],"--clusterdec")) g_clusterdec=1;
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}
     }
     srand(seed);
     int n=r*s;
-
-    if(mode==3) { run_kernel_cluster_analysis(r,s); return 0; }
-
+    
     printf("Plane-Warp Decoder — %dx%d Torus, n=%d\n",r,s,n);
     printf("  Algorithm: %s\n", g_fast ? "adaptive corner, O(n)" : "full 156D nullspace, O(n)");
     
@@ -1065,7 +614,7 @@ int main(int argc, char **argv) {
                     else if(mi==1) gen_cluster(r,s,err,w/3+1,3);
                     else gen_line(r,s,err,w/5+1,5);
                     syndrome_of(r,s,err,syn);
-                    (g_clusterdec?solve_plane_cluster:(g_fast?solve_plane_fast:solve_plane))(r,s,syn,dec);
+                    (g_fast?solve_plane_fast:solve_plane)(r,s,syn,dec);
                     uint8_t diff[MAX_N];
                     for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
                     if(is_stabilizer(r,s,diff)) {
@@ -1087,7 +636,7 @@ int main(int argc, char **argv) {
             else if(mode==1) gen_cluster(r,s,err,weight/3+1,3);
             else gen_line(r,s,err,weight/5+1,5);
             syndrome_of(r,s,err,syn);
-            (g_clusterdec?solve_plane_cluster:solve_plane)(r,s,syn,dec);
+            solve_plane(r,s,syn,dec);
             uint8_t diff[MAX_N];
             for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
             if(is_stabilizer(r,s,diff)) {

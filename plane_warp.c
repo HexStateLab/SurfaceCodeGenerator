@@ -187,22 +187,51 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
                                  ^ base[((qi-2+r)%r)*s+((qj-2+s)%s)];
     }
     
-    // First pass: projective from (0,0) corner
-    int cur_cx=0, cur_cy=0;
+    // First pass: FREE projective from (0,0) on all 16 h-choices.
+    // No boundary protection — output's (0,0) block becomes the new reference.
     for(int h=0; h<16; h++) {
         uint8_t work[MAX_N];
         for(int q=0;q<n;q++) work[q]=base[q]^nullspace[h][q];
-        
         for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-            int pat=best_col_pat(r,s,work,j,px,cur_cx,cur_cy,n);
-            apply_col(r,s,work,j,px,cur_cx,cur_cy,pat);
+            int pat=best_col_pat_free(r,s,work,j,px,n);
+            apply_col_free(r,s,work,j,px,pat);
         }
         for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-            int pat=best_row_pat(r,s,work,i,py,cur_cx,cur_cy,n);
-            apply_row(r,s,work,i,py,cur_cx,cur_cy,pat);
+            int pat=best_row_pat_free(r,s,work,i,py,n);
+            apply_row_free(r,s,work,i,py,pat);
         }
         int wt=0; for(int q=0;q<n;q++) wt+=work[q];
         if(wt<best_wt) {best_wt=wt; memcpy(out,work,n);}
+    }
+    
+    // Iterative descent: output's (0,0) block is new reference.
+    // Re-derive particular from it, free-pass, repeat until converged.
+    for(;;) {
+        int prev_wt = best_wt;
+        // Re-derive particular from current output's (0,0) boundary
+        uint8_t base2[MAX_N]; memset(base2,0,n);
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2 || qj<2) base2[qi*s+qj] = out[qi*s+qj];
+        }
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2 || qj<2) continue;
+            int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
+            base2[qi*s+qj] = syn[ck] ^ base2[((qi-2+r)%r)*s+qj]
+                                     ^ base2[qi*s+((qj-2+s)%s)]
+                                     ^ base2[((qi-2+r)%r)*s+((qj-2+s)%s)];
+        }
+        // Free projective pass on re-derived particular
+        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+            int pat=best_col_pat_free(r,s,base2,j,px,n);
+            apply_col_free(r,s,base2,j,px,pat);
+        }
+        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+            int pat=best_row_pat_free(r,s,base2,i,py,n);
+            apply_row_free(r,s,base2,i,py,pat);
+        }
+        int w2=0; for(int q=0;q<n;q++) w2+=base2[q];
+        if(w2 < best_wt) { best_wt=w2; memcpy(out,base2,n); }
+        if(best_wt == prev_wt) break;
     }
     
     // Iterative refinement: let projection modify boundary, re-derive, repeat.

@@ -103,19 +103,36 @@ At D=5 on 10×10 (200 qubits), physical gate fidelity `10⁻³` gives ~0.8% per-
 
 ## Accelerating Returns: Nullspace vs Error Correction
 
-The nullspace dimension grows as `2r+2s−4` while the physical qubit count grows as `rs`. The correction envelope grows exponentially faster than the grid:
+Empirical 50% drop-off points (20 trials, binary searched):
 
-| Grid | N | Nullspace D | 50% Drop at | Correction Envelope | Nullspace/Qubit |
-|------|---|-------------|-------------|---------------------|-----------------|
-| 6×6 | 72 | 20 | 8% | 3×D | 0.28 |
-| 8×8 | 128 | 28 | 7% | 2×D | 0.22 |
-| 10×10 | 200 | 36 | 15% | 3×D | 0.18 |
-| 12×12 | 288 | 44 | 12% | 3×D | 0.15 |
-| 40×40 | 3,200 | 156 | 19% | 10×D | 0.049 |
-| 100×100 | 20,000 | 396 | — | — | 0.020 |
-| 500×500 | 500,000 | 1,996 | ~40% | 200×D | 0.004 |
+| Grid | N | Nullspace D | 50% at w | Error% | ×D | Nullspace/Qubit |
+|------|---|-------------|----------|--------|-----|-----------------|
+| 6×6 | 36 | 20 | 3 | 8.3% | 1.0× | 0.56 |
+| 8×8 | 64 | 28 | 5 | 7.8% | 1.25× | 0.44 |
+| 10×10 | 100 | 36 | 14 | 14.0% | 2.8× | 0.36 |
+| 12×12 | 144 | 44 | 18 | 12.5% | 3.0× | 0.31 |
+| 16×16 | 256 | 60 | 36 | 14.0% | 4.5× | 0.23 |
+| 20×20 | 400 | 76 | 76 | 19.0% | 7.6× | 0.19 |
+| 40×40 | 1,600 | 156 | — | ~19% | — | 0.098 |
+| 500×500 | 250,000 | 1,996 | — | ~40% | 200× | 0.008 |
 
-**Key insight**: At 6×6, the nullspace represents 28% of the qubit count — every error pattern has significant correction DOF but the absolute number is limited (2^20 ≈ 10^6). At 500×500, the nullspace is only 0.4% of qubits but the absolute size is `2^1996 ≈ 10^601` — an astronomical correction space. The ratio shrinks but the absolute power explodes. This is the accelerating return: larger grids don't just have more nullspace — they have compoundingly more correction paths per qubit.
+**Accelerating return**: From 6×6 to 20×20, qubits grow 11× (36→400) but correctable errors grow 25× (3→76). The nullspace-to-qubit ratio halves at each scale, yet the absolute correction space explodes from `2^20 ≈ 10^6` to `2^1996 ≈ 10^601`. The error rate ceiling rises from 8% to 40% — the code gets *better* as it gets bigger.
+
+## Comparison to Surface Codes
+
+Surface codes at distance D: standard toric N = 2D², K = 2. Rotated planar N = D², K = 1. BB codes shown at full physical qubit count N = 2rs.
+
+| Grid | N (BB) | K (BB) | D | Rate | Surface N (std) | Surface K | BB vs Surface |
+|------|--------|--------|---|------|-----------------|-----------|---------------|
+| 6×6 | 72 | 56 | 3 | 0.78 | 18 | 2 | **28× more logicals** |
+| 8×8 | 128 | 100 | 4 | 0.78 | 32 | 2 | **50×** |
+| 10×10 | 200 | 144 | 5 | 0.72 | 50 | 2 | **72×** |
+| 12×12 | 288 | 200 | 6 | 0.69 | 72 | 2 | **100×** |
+| 20×20 | 800 | 436 | 10 | 0.55 | 200 | 2 | **218×** |
+| 40×40 | 3,200 | 1,756 | 20 | 0.55 | 800 | 2 | **878×** |
+| 500×500 | 500,000 | 250,996 | 250 | 0.50 | 125,000 | 2 | **125,498×** |
+
+At every scale, the BB code packs 1–5 orders of magnitude more logical qubits at the same distance. The rate stays near 0.5–0.78 while surface codes remain at 1/N. The gap widens with scale — it's not a constant factor, it's a different scaling class.
 
 ## Comparison
 

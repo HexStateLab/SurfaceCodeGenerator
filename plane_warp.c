@@ -18,6 +18,10 @@
 // Adaptive corner: threshold-guided centroid. Fast O(n), no alternating iteration.
 // Use --fast flag to enable. Default: full 156D nullspace alternating optimization.
 static int g_fast = 0;
+
+// ---- Soft-decision cost: cost[q] = -ln(P(error at q)). Uniform = Hamming weight.
+static double cost_map[MAX_N];
+static void cost_init(int n) { for(int q=0;q<n;q++) cost_map[q]=1.0; }
 void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
     int n=r*s, sx=0, sy=0, count=0;
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
@@ -37,7 +41,8 @@ void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
 
 // Fast solver: adaptive corner + 16 nullspace XOR. No alternating optimization.
 int solve_plane_fast(int r, int s, uint8_t *syn, uint8_t *out) {
-    int n=r*s, best_wt=n+1, acx, acy;
+    int n=r*s; double best_wt=n+1.0; int acx, acy;
+    cost_init(n);
     adaptive_corner(r,s,syn,&acx,&acy);
     // Compute particular solution at adaptive corner with ns=0
     uint8_t base[MAX_N]; memset(base,0,n);
@@ -54,7 +59,7 @@ int solve_plane_fast(int r, int s, uint8_t *syn, uint8_t *out) {
         uint8_t sol[MAX_N]; memcpy(sol,base,n);
         for(int dqi=0;dqi<2;dqi++) for(int dqj=0;dqj<2;dqj++)
             if(ns&(1<<(dqi*2+dqj))) sol[((acx+dqi)%r)*s+((acy+dqj)%s)]^=1;
-        int wt=0; for(int q=0;q<n;q++) wt+=sol[q];
+        double wt=0; for(int q=0;q<n;q++) if(sol[q]) wt+=cost_map[q];
         if(wt<best_wt) {best_wt=wt; memcpy(out,sol,n);}
     }
     return best_wt<=n;
@@ -174,8 +179,9 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
 }
 
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
-    int n=r*s, best_wt=n+1;
+    int n=r*s; double best_wt=n+1.0;
     if(!ns_ready) build_nullspace(r,s);
+    cost_init(n);
     
     // Compute particular solution at corner (0,0), h=0 (boundary: rows 0-1, cols 0-1)
     uint8_t base[MAX_N]; memset(base,0,n);
@@ -188,7 +194,8 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     }
     
     // First pass: FREE projective from (0,0) on all 16 h-choices.
-    // No boundary protection — output's (0,0) block becomes the new reference.
+    // Each h-choice with free pass + iterative descent to convergence.
+    // Different h may converge to different fixed points.
     for(int h=0; h<16; h++) {
         uint8_t work[MAX_N];
         for(int q=0;q<n;q++) work[q]=base[q]^nullspace[h][q];
@@ -200,74 +207,34 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             int pat=best_row_pat_free(r,s,work,i,py,n);
             apply_row_free(r,s,work,i,py,pat);
         }
-        int wt=0; for(int q=0;q<n;q++) wt+=work[q];
-        if(wt<best_wt) {best_wt=wt; memcpy(out,work,n);}
-    }
-    
-    // Iterative descent: output's (0,0) block is new reference.
-    // Re-derive particular from it, free-pass, repeat until converged.
-    for(;;) {
-        int prev_wt = best_wt;
-        // Re-derive particular from current output's (0,0) boundary
-        uint8_t base2[MAX_N]; memset(base2,0,n);
-        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-            if(qi<2 || qj<2) base2[qi*s+qj] = out[qi*s+qj];
+        double cur_wt=0; for(int q=0;q<n;q++) if(work[q]) cur_wt+=cost_map[q];
+        // Iterative descent from this h
+        for(;;) {
+            double prev=cur_wt;
+            uint8_t base2[MAX_N]; memset(base2,0,n);
+            for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+                if(qi<2||qj<2) base2[qi*s+qj]=work[qi*s+qj];
+            }
+            for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+                if(qi<2||qj<2) continue;
+                int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
+                base2[qi*s+qj]=syn[ck]^base2[((qi-2+r)%r)*s+qj]
+                                      ^base2[qi*s+((qj-2+s)%s)]
+                                      ^base2[((qi-2+r)%r)*s+((qj-2+s)%s)];
+            }
+            for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+                int pat=best_col_pat_free(r,s,base2,j,px,n);
+                apply_col_free(r,s,base2,j,px,pat);
+            }
+            for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+                int pat=best_row_pat_free(r,s,base2,i,py,n);
+                apply_row_free(r,s,base2,i,py,pat);
+            }
+            double w2=0; for(int q=0;q<n;q++) if(base2[q]) w2+=cost_map[q];
+            if(w2<cur_wt){cur_wt=w2;memcpy(work,base2,n);}
+            if(cur_wt==prev) break;
         }
-        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-            if(qi<2 || qj<2) continue;
-            int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
-            base2[qi*s+qj] = syn[ck] ^ base2[((qi-2+r)%r)*s+qj]
-                                     ^ base2[qi*s+((qj-2+s)%s)]
-                                     ^ base2[((qi-2+r)%r)*s+((qj-2+s)%s)];
-        }
-        // Free projective pass on re-derived particular
-        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-            int pat=best_col_pat_free(r,s,base2,j,px,n);
-            apply_col_free(r,s,base2,j,px,pat);
-        }
-        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-            int pat=best_row_pat_free(r,s,base2,i,py,n);
-            apply_row_free(r,s,base2,i,py,pat);
-        }
-        int w2=0; for(int q=0;q<n;q++) w2+=base2[q];
-        if(w2 < best_wt) { best_wt=w2; memcpy(out,base2,n); }
-        if(best_wt == prev_wt) break;
-    }
-    
-    // Iterative refinement: let projection modify boundary, re-derive, repeat.
-    // Each pass shifts the nullspace reference, escaping the single-pass minimum.
-    for(int refine=0; refine<4 && best_wt > n/10; refine++) {
-        uint8_t prev[MAX_N]; memcpy(prev,out,n);
-        // Re-derive particular from prev's boundary
-        uint8_t base2[MAX_N]; memset(base2,0,n);
-        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-            if(qi<2 || qj<2) base2[qi*s+qj] = prev[qi*s+qj];
-        }
-        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-            if(qi<2 || qj<2) continue;
-            int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
-            base2[qi*s+qj] = syn[ck] ^ base2[((qi-2+r)%r)*s+qj]
-                                     ^ base2[qi*s+((qj-2+s)%s)]
-                                     ^ base2[((qi-2+r)%r)*s+((qj-2+s)%s)];
-        }
-        // Project WITHOUT boundary protection — let boundary shift
-        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-            int pat=best_col_pat_free(r,s,base2,j,px,n);
-            apply_col_free(r,s,base2,j,px,pat);
-        }
-        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-            int pat=best_row_pat_free(r,s,base2,i,py,n);
-            apply_row_free(r,s,base2,i,py,pat);
-        }
-        int w2=0; for(int q=0;q<n;q++) w2+=base2[q];
-        // Verify syndrome: free pass must not break constraints
-        uint8_t vsyn[MAX_N]; memset(vsyn,0,n);
-        for(int q=0;q<n;q++) if(base2[q]) {
-            int qi=q/s, qj=q%s;
-            for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
-                vsyn[((qi-di+r)%r)*s+((qj-dj+s)%s)] ^= 1;
-        }
-        if(memcmp(vsyn,syn,n)==0 && w2<best_wt) {best_wt=w2; memcpy(out,base2,n);}
+        if(cur_wt<best_wt){best_wt=cur_wt;memcpy(out,work,n);}
     }
     return best_wt<=n;
 }

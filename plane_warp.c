@@ -1019,6 +1019,29 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--fast")) g_fast=1;
         else if(!strcmp(argv[i],"--selftest")) selftest=1;
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
+        else if(!strcmp(argv[i],"--decode-cost")) {
+            // Read N syndrome bytes + N cost bytes (one per qubit, 0-255).
+            // cost = -ln(p_error).  Uniform default = 1.0.
+            uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
+            int n=r*s;
+            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            for(int q=0;q<n;q++) {
+                int c; if((c=getchar())==EOF) { fprintf(stderr,"short cost\n"); return 1; }
+                cost_map[q] = c ? -log(c/255.0) : 10.0; // 0 → high cost (unlikely error)
+            }
+            memcpy(syn, raw_syn, n);
+            memset(total_dec, 0, n);
+            for(int pass=0;pass<5;pass++) {
+                preprocess_syndrome(r,s,syn);
+                solve_plane(r,s,syn,dec);
+                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                uint8_t guess_syn[MAX_N];
+                syndrome_of(r,s,total_dec,guess_syn);
+                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+            }
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
         else if(!strcmp(argv[i],"--decode")) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
@@ -1053,14 +1076,58 @@ int main(int argc, char **argv) {
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
-        else if(!strcmp(argv[i],"--decode-3d")) {
-            // 4D lift: pick the single sub-lattice decode with minimum
-            // positive correction weight. Gate noise inflates weight in
-            // affected sub-lattices; the least-affected one is closest to
-            // the true data error.
-            uint8_t syn_full[MAX_N], raw_syn[MAX_N], syn[MAX_N], dec[MAX_N];
-            uint8_t best[MAX_N]; double best_w; int got=0;
+        else if(!strcmp(argv[i],"--decode-lr")) {
+            // Likelihood ratio: test gate error hypotheses at residual
+            // positions. If XORing out the gate's expected syndrome
+            // reduces correction cost, the hypothesis is accepted.
+            uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
+            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            memcpy(syn, raw_syn, n);
+            // First decode pass
+            preprocess_syndrome(r,s,syn);
+            memset(total_dec,0,n);
+            for(int pass=0;pass<5;pass++) {
+                preprocess_syndrome(r,s,syn);
+                solve_plane(r,s,syn,dec);
+                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                uint8_t guess_syn[MAX_N];
+                syndrome_of(r,s,total_dec,guess_syn);
+                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+            }
+            double base_cost=0; for(int q=0;q<n;q++) if(total_dec[q]) base_cost+=cost_map[q];
+            // Test residual positions: flip each, re-decode, keep if cheaper
+            uint8_t residual[MAX_N];
+            for(int q=0;q<n;q++) residual[q]=raw_syn[q]^syn[q];
+            for(int p=0;p<n;p++) if(residual[p]) {
+                uint8_t test_syn[MAX_N]; memcpy(test_syn,raw_syn,n);
+                test_syn[p]^=1;
+                preprocess_syndrome(r,s,test_syn);
+                uint8_t test_dec[MAX_N]; memset(test_dec,0,n);
+                for(int pass=0;pass<3;pass++) {
+                    preprocess_syndrome(r,s,test_syn);
+                    solve_plane(r,s,test_syn,dec);
+                    for(int q=0;q<n;q++) test_dec[q]^=dec[q];
+                    uint8_t gs[MAX_N];
+                    syndrome_of(r,s,test_dec,gs);
+                    for(int q=0;q<n;q++) test_syn[q]=raw_syn[q]^gs[q];
+                }
+                double test_cost=0; for(int q=0;q<n;q++) if(test_dec[q]) test_cost+=cost_map[q];
+                if(test_cost<base_cost){base_cost=test_cost;memcpy(total_dec,test_dec,n);}
+            }
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-3d")) {
+            // 4D projection: each CZ gate maps to a 4D coordinate
+            // (px, py, si, sj).  Gate errors at different CZ positions
+            // within a check have disjoint syndrome signatures.  
+            // Decode each sub-lattice, keep only corrections whose
+            // syndrome matches the sub-lattice's own syndrome pattern
+            // (data errors).  Discard corrections that spill out.
+            uint8_t syn_full[MAX_N], raw_syn[MAX_N], syn[MAX_N], dec[MAX_N];
+            int n=r*s;
+            uint8_t out[MAX_N]; memset(out,0,n);
             if (fread(syn_full,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
             preprocess_syndrome(r,s,syn_full);
             for(int u=0;u<4;u++) {
@@ -1082,11 +1149,15 @@ int main(int argc, char **argv) {
                     syndrome_of(r,s,total_dec,guess_syn);
                     for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
                 }
-                double wt=0; for(int q=0;q<n;q++) if(total_dec[q]) wt+=1.0;
-                if(!got || (wt>0 && wt<best_w)){best_w=wt;memcpy(best,total_dec,n);got=1;}
+                // Only keep corrections aligned with this sub-lattice's syndrome:
+                // correction's implied syndrome should be subset of sub-lattice's raw syndr.
+                uint8_t corr_syn[MAX_N];
+                syndrome_of(r,s,total_dec,corr_syn);
+                int aligned=1;
+                for(int q=0;q<n;q++) if(corr_syn[q] && !raw_syn[q]){aligned=0;break;}
+                if(aligned) for(int q=0;q<n;q++) out[q]=total_dec[q];
             }
-            if(!got) memset(best,0,n);
-            fwrite(best,1,n,stdout); fflush(stdout);
+            fwrite(out,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-mr")) {

@@ -963,6 +963,23 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--fast")) g_fast=1;
         else if(!strcmp(argv[i],"--selftest")) selftest=1;
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
+        else if(!strcmp(argv[i],"--decode")) {
+            uint8_t syn[MAX_N], dec[MAX_N];
+            int n=r*s;
+            if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            solve_plane(r,s,syn,dec);
+            fwrite(dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-z")) {
+            uint8_t syn_raw[MAX_N], syn_shift[MAX_N], dec[MAX_N];
+            int n=r*s;
+            if (fread(syn_raw,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            for(int q=0;q<n;q++){ int qi=q/s, qj=q%s; syn_shift[q]=syn_raw[((qi+2)%r)*s+((qj+2)%s)]; }
+            solve_plane(r,s,syn_shift,dec);
+            fwrite(dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}
     }
     if(selftest) return run_selftest(seed);

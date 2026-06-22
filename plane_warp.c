@@ -1054,16 +1054,14 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-3d")) {
-            // 4D lift: decode each of 4 sub-lattice syndromes independently.
-            // Gate noise breaks the joint-image constraint: the 4 sub-lattice
-            // syndromes must come from the same error vector. MV across
-            // independent sub-lattice decodes filters gate-noise artifacts.
-            uint8_t syn_full[MAX_N], sub_syn[MAX_N], dec[MAX_N];
+            // 4D joint-image lift: 4 sub-lattice decodes. Gate noise inflates
+            // correction weight in one sub-lattice. Pick the minimum-weight
+            // decode — the clean sub-lattices give correct corrections.
+            uint8_t syn_full[MAX_N], sub_syn[MAX_N], dec[MAX_N], best[MAX_N];
             int n=r*s;
             if (fread(syn_full,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            int votes[MAX_N]; memset(votes,0,n*sizeof(int));
+            double best_wt=n+1.0;
             for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
-                // Scatter sub-lattice syndrome to original grid positions
                 memset(sub_syn,0,n);
                 int hr=r/2, hs=s/2;
                 for(int si=0;si<hr;si++) for(int sj=0;sj<hs;sj++) {
@@ -1071,12 +1069,10 @@ int main(int argc, char **argv) {
                     sub_syn[pos]=syn_full[pos];
                 }
                 solve_plane(r,s,sub_syn,dec);
-                for(int q=0;q<n;q++) if(dec[q]) votes[q]++;
+                double wt=0; for(int q=0;q<n;q++) if(dec[q]) wt+=1.0;
+                if(wt<best_wt){best_wt=wt;memcpy(best,dec,n);}
             }
-            // MV across 4 sub-lattice decodes: ≥2/4 → correction
-            uint8_t out[MAX_N];
-            for(int q=0;q<n;q++) out[q]=(votes[q]>=2);
-            fwrite(out,1,n,stdout); fflush(stdout);
+            fwrite(best,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-z")) {

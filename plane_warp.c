@@ -1033,7 +1033,7 @@ int main(int argc, char **argv) {
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
             memcpy(syn, raw_syn, n);
             memset(total_dec, 0, n);
-            for(int pass=0;pass<4;pass++) {
+            for(int pass=0;pass<5;pass++) {
                 preprocess_syndrome(r,s,syn);
                 solve_plane(r,s,syn,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];

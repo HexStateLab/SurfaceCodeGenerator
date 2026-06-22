@@ -1020,11 +1020,20 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--selftest")) selftest=1;
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
         else if(!strcmp(argv[i],"--decode")) {
-            uint8_t syn[MAX_N], dec[MAX_N];
+            uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
-            if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            solve_plane(r,s,syn,dec);
-            fwrite(dec,1,n,stdout); fflush(stdout);
+            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            memcpy(syn, raw_syn, n);
+            memset(total_dec, 0, n);
+            for(int pass=0;pass<5;pass++) {
+                preprocess_syndrome(r,s,syn);
+                solve_plane(r,s,syn,dec);
+                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                uint8_t guess_syn[MAX_N];
+                syndrome_of(r,s,total_dec,guess_syn);
+                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+            }
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-pp")) {

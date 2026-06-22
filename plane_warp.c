@@ -952,23 +952,6 @@ int run_selftest(int seed) {
 }
 
 // ============================================================
-// ALGEBRAIC SYNDROME RECONSTRUCTION
-//
-// In GF(2)[x,y]/⟨xʳ+1,yˢ+1⟩ with check polynomial a=(x²+1)(y²+1):
-//   C = a·Q  ⇒  h·C ≡ 0  for all h with h·a ≡ 0.
-//
-// Annihilators:  hₓ = 1+x²+…+xʳ⁻²  (since hₓ·(x²+1)=xʳ+1≡0)
-//                h_y = 1+y²+…+yˢ⁻²  (similarly)
-//
-// Spatial domain:
-//   hₓ·C = 0  →  ⊕ₖ C(u-2k, v) = 0    (sub-lattice row parity)
-//   h_y·C = 0  →  ⊕ₖ C(u, v-2k) = 0    (sub-lattice column parity)
-//
-// A measurement flip at (u₀,v₀) creates exactly one odd sub-lattice
-// row and one odd sub-lattice column.  Greedy sequential pairing
-// resolves the ambiguity; iteration handles cascading.
-// ============================================================
-// ============================================================
 // ALGEBRAIC SYNDROME RECONSTRUCTION — product-code decomposition.
 //
 // In GF(2)[x,y]/⟨xʳ+1,yˢ+1⟩, hₓ=1+x²+…+xʳ⁻² and h_y=1+y²+…+yˢ⁻²
@@ -1059,6 +1042,24 @@ int main(int argc, char **argv) {
                 for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
             }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-mr")) {
+            // Multi-round: stdin = round_count(u32) + round_count*N syndrome bytes
+            // Majority vote across rounds → preprocess → decode
+            uint8_t syn[MAX_N], mv_syn[MAX_N], dec[MAX_N];
+            int n=r*s, rounds;
+            if (fread(&rounds,4,1,stdin)!=1 || rounds<2 || rounds>16) { fprintf(stderr,"bad rounds\n"); return 1; }
+            int votes[MAX_N]; memset(votes,0,n*sizeof(int));
+            for(int rnd=0;rnd<rounds;rnd++) {
+                if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read r%d\n",rnd); return 1; }
+                for(int q=0;q<n;q++) if(syn[q]) votes[q]++;
+            }
+            int thresh=rounds/2+1;
+            for(int q=0;q<n;q++) mv_syn[q]=(votes[q]>=thresh);
+            preprocess_syndrome(r,s,mv_syn);
+            solve_plane(r,s,mv_syn,dec);
+            fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-z")) {

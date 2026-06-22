@@ -2,6 +2,15 @@
 
 Exact maximum-likelihood decoder for toroidal BB codes with `HX = [A|B]`, `HZ = [B^T|A^T]`. Solves `Ax = s` over GF(2) via backward recurrence propagation, then finds the minimum-weight solution over the **full 156-dimensional nullspace** using alternating optimization. O(n) per decode. Topological stabilizer check.
 
+## Where we are now (June 2026)
+
+| Grid | Physical Qubits (single-grid) | Physical Qubits (full BB) | Distance | Logical Qubits (single-grid) | Logical Qubits (full BB, monomial) | Rate (full BB) | Viable at p_g |
+|------|------|------|----------|------|------|------|--------------|
+| 6×6 | 36 | 72 | 3 | 20 | **56** | 77.8% | 0.1% (today) |
+| 20×20 | 400 | 800 | 10 | 76 | **476** | 59.5% | 0.01% (soon) |
+| 40×40 | 1,600 | 3,200 | 20 | 156 | **1,756** | 54.9% | 0.005% |
+| 80×80 | 6,400 | 12,800 | 40 | 316 | **6,316** | 49.3% | 0.002% |
+
 ## Benchmarks
 
 All comparisons use the exact same STIM circuit with 36 HZ checks and a Z-logical observable on the first sub-lattice row.

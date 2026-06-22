@@ -13,6 +13,9 @@
 #define MAX_S 600
 #define MAX_N (MAX_R*MAX_S)  // n = physical qubits, no 2x factor needed
 
+// Fast stride-2 torus wrap: avoids % division
+#define WRAP2(x, dim) ((x) >= 2 ? (x) - 2 : (x) + (dim) - 2)
+
 // Adaptive corner: run one pass of threshold decoder (>=3 of 4 checks fire)
 // to get a rough error estimate, then use its centroid. O(n), much tighter
 // than raw syndrome centroid for multi-cluster errors.
@@ -54,10 +57,10 @@ int solve_plane_fast(int r, int s, uint8_t *syn, uint8_t *out) {
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
         int rel_i=(qi-acx+r)%r, rel_j=(qj-acy+s)%s;
         if(rel_i<2 && rel_j<2) continue;
-        int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
-        base[qi*s+qj] = syn[ck] ^ base[((qi-2+r)%r)*s+qj]
-                                 ^ base[qi*s+((qj-2+s)%s)]
-                                 ^ base[((qi-2+r)%r)*s+((qj-2+s)%s)];
+        int ci2=WRAP2(qi, r), cj2=WRAP2(qj, s), ck=ci2*s+cj2;
+        base[qi*s+qj] = syn[ck] ^ base[(WRAP2(qi, r))*s+qj]
+                                 ^ base[qi*s+(WRAP2(qj, s))]
+                                 ^ base[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
     }
     // Enumerate 16 nullspace additions: each shifts the 2x2 corner at (acx,acy)
     for(int ns=0; ns<16; ns++) {
@@ -85,11 +88,11 @@ static void build_nullspace(int r, int s) {
         // Propagate from boundary (OR-skip: rows 0-1 and cols 0-1 are fixed)
         for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
             if(qi<2 || qj<2) continue;
-            int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s;
+            int ci2=WRAP2(qi, r), cj2=WRAP2(qj, s);
             nullspace[h][qi*s+qj] =
-                nullspace[h][((qi-2+r)%r)*s+qj]
-              ^ nullspace[h][qi*s+((qj-2+s)%s)]
-              ^ nullspace[h][((qi-2+r)%r)*s+((qj-2+s)%s)];
+                nullspace[h][(WRAP2(qi, r))*s+qj]
+              ^ nullspace[h][qi*s+(WRAP2(qj, s))]
+              ^ nullspace[h][(WRAP2(qi, r))*s+(WRAP2(qj, s))];
         }
     }
     ns_ready=1; ns_r=r; ns_s=s;
@@ -108,7 +111,7 @@ static void compute_base_at(int r, int s, uint8_t *syn, int cx, int cy, uint8_t 
         if(ri<2 || rj<2) continue;
         int qi=(cx+ri)%r, qj=(cy+rj)%s;
         int qi2=(cx+ri-2+r)%r, qj2=(cy+rj-2+s)%s;
-        int ck=((qi-2+r)%r)*s+((qj-2+s)%s);   // syndrome offset is fixed by the code, not the corner
+        int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));   // syndrome offset is fixed by the code, not the corner
         base[qi*s+qj] = syn[ck] ^ base[qi2*s+qj] ^ base[qi*s+qj2] ^ base[qi2*s+qj2];
     }
 }
@@ -266,10 +269,10 @@ static int solve_plane_escape(int r, int s, uint8_t *syn, uint8_t *out, double *
                     if(qi<2||qj<2) base2[qi*s+qj]=work[qi*s+qj];
                 for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
                     if(qi<2||qj<2) continue;
-                    int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
-                    base2[qi*s+qj]=syn[ck]^base2[((qi-2+r)%r)*s+qj]
-                                          ^base2[qi*s+((qj-2+s)%s)]
-                                          ^base2[((qi-2+r)%r)*s+((qj-2+s)%s)];
+                    int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));
+                    base2[qi*s+qj]=syn[ck]^base2[(WRAP2(qi, r))*s+qj]
+                                          ^base2[qi*s+(WRAP2(qj, s))]
+                                          ^base2[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
                 }
                 for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
                     int pat=best_col_pat_free(r,s,base2,j,px,n);
@@ -298,10 +301,10 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     uint8_t base[MAX_N]; memset(base,0,n);
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
         if(qi<2 || qj<2) continue;
-        int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
-        base[qi*s+qj] = syn[ck] ^ base[((qi-2+r)%r)*s+qj]
-                                 ^ base[qi*s+((qj-2+s)%s)]
-                                 ^ base[((qi-2+r)%r)*s+((qj-2+s)%s)];
+        int ci2=WRAP2(qi, r), cj2=WRAP2(qj, s), ck=ci2*s+cj2;
+        base[qi*s+qj] = syn[ck] ^ base[(WRAP2(qi, r))*s+qj]
+                                 ^ base[qi*s+(WRAP2(qj, s))]
+                                 ^ base[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
     }
     
     // First pass: FREE projective from (0,0) on all 16 h-choices.
@@ -328,10 +331,10 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             }
             for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
                 if(qi<2||qj<2) continue;
-                int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
-                base2[qi*s+qj]=syn[ck]^base2[((qi-2+r)%r)*s+qj]
-                                      ^base2[qi*s+((qj-2+s)%s)]
-                                      ^base2[((qi-2+r)%r)*s+((qj-2+s)%s)];
+                int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));
+                base2[qi*s+qj]=syn[ck]^base2[(WRAP2(qi, r))*s+qj]
+                                      ^base2[qi*s+(WRAP2(qj, s))]
+                                      ^base2[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
             }
             for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
                 int pat=best_col_pat_free(r,s,base2,j,px,n);
@@ -357,10 +360,10 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
         }
         for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
             if(qi<2||qj<2) continue;
-            int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
-            base3[qi*s+qj]=syn[ck]^base3[((qi-2+r)%r)*s+qj]
-                                  ^base3[qi*s+((qj-2+s)%s)]
-                                  ^base3[((qi-2+r)%r)*s+((qj-2+s)%s)];
+            int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));
+            base3[qi*s+qj]=syn[ck]^base3[(WRAP2(qi, r))*s+qj]
+                                  ^base3[qi*s+(WRAP2(qj, s))]
+                                  ^base3[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
         }
         // ROTATED: rows-first then columns
         for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
@@ -591,8 +594,8 @@ int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
             }
             for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
                 if(qi<2||qj<2) continue;
-                int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
-                base3[qi*s+qj]=syn_mod[ck]^base3[((qi-2+r)%r)*s+qj]^base3[qi*s+((qj-2+s)%s)]^base3[((qi-2+r)%r)*s+((qj-2+s)%s)];
+                int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));
+                base3[qi*s+qj]=syn_mod[ck]^base3[(WRAP2(qi, r))*s+qj]^base3[qi*s+(WRAP2(qj, s))]^base3[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
             }
             for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
                 int pat=best_col_pat_free(r,s,base3,j,px,n);
@@ -824,10 +827,10 @@ static int selftest_corner_generalization(int r, int s) {
     uint8_t base_orig[MAX_N]; memset(base_orig,0,n);
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
         if(qi<2||qj<2) continue;
-        int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
-        base_orig[qi*s+qj]=syn[ck]^base_orig[((qi-2+r)%r)*s+qj]
-                                   ^base_orig[qi*s+((qj-2+s)%s)]
-                                   ^base_orig[((qi-2+r)%r)*s+((qj-2+s)%s)];
+        int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));
+        base_orig[qi*s+qj]=syn[ck]^base_orig[(WRAP2(qi, r))*s+qj]
+                                   ^base_orig[qi*s+(WRAP2(qj, s))]
+                                   ^base_orig[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
     }
     uint8_t base_gen[MAX_N];
     compute_base_at(r,s,syn,0,0,base_gen);
@@ -949,55 +952,70 @@ int run_selftest(int seed) {
 }
 
 // ============================================================
-// ALGEBRAIC SYNDROME RECONSTRUCTION — unit-flip cost + greedy
-// matching.  For each candidate syndrome correction at position
-// (px+2*ri, py+2*cj), compute the implied particular solution
-// change and its Hamming weight.  Greedily assign each odd row
-// to the odd column that minimizes total correction weight.
-// O(k²·n) per sub-lattice per pass.
+// ALGEBRAIC SYNDROME RECONSTRUCTION
+//
+// In GF(2)[x,y]/⟨xʳ+1,yˢ+1⟩ with check polynomial a=(x²+1)(y²+1):
+//   C = a·Q  ⇒  h·C ≡ 0  for all h with h·a ≡ 0.
+//
+// Annihilators:  hₓ = 1+x²+…+xʳ⁻²  (since hₓ·(x²+1)=xʳ+1≡0)
+//                h_y = 1+y²+…+yˢ⁻²  (similarly)
+//
+// Spatial domain:
+//   hₓ·C = 0  →  ⊕ₖ C(u-2k, v) = 0    (sub-lattice row parity)
+//   h_y·C = 0  →  ⊕ₖ C(u, v-2k) = 0    (sub-lattice column parity)
+//
+// A measurement flip at (u₀,v₀) creates exactly one odd sub-lattice
+// row and one odd sub-lattice column.  Greedy sequential pairing
+// resolves the ambiguity; iteration handles cascading.
+// ============================================================
+// ============================================================
+// ALGEBRAIC SYNDROME RECONSTRUCTION — product-code decomposition.
+//
+// In GF(2)[x,y]/⟨xʳ+1,yˢ+1⟩, hₓ=1+x²+…+xʳ⁻² and h_y=1+y²+…+yˢ⁻²
+// annihilate a=(x²+1)(y²+1).  Each sub-lattice is a 2D product
+// repetition code: a measurement flip at (a,b) toggles exactly one
+// row (Rₐ) and one column (C_b).
+//
+// Minimum-weight correction (single deterministic pass):
+//   1. Intersections (cost 1): pair each Rᵢ with a Cⱼ, flip (Rᵢ,Cⱼ).
+//   2. Leftover row pairs (cost 2): flip (rₐ,0)⊕(r_b,0) → resolves
+//      both rows, column 0 toggled twice (net even).
+//   3. Leftover col pairs (cost 2): flip (0,cₐ)⊕(0,c_b) analogously.
+//
+// Since ∑R ≡ ∑C (mod 2), leftovers always come in even counts.
+// O(n) deterministic, no distance calculations, no iteration.
 // ============================================================
 static void preprocess_syndrome(int r, int s, uint8_t *syn) {
-    int n=r*s;
-    uint8_t base0[MAX_N], unit_syn[MAX_N], unit_base[MAX_N];
-    compute_base_at(r,s,syn,0,0,base0);
+    int hr=r/2, hs=s/2;
+    for(int i=0;i<2;i++) for(int j=0;j<2;j++) {
+        int odd_r[300], odd_c[300], nr=0, nc=0;
 
-    for(;;) {
-        int changed=0;
-        for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
-            int hr=r/2, hs=s/2;
-            int odd_rows[300], odd_cols[300];
-            int nr=0, nc=0;
-            for(int si=0;si<hr;si++) {
-                int rp=0;
-                for(int sj=0;sj<hs;sj++) rp^=syn[(px+2*si)*s+(py+2*sj)];
-                if(rp) odd_rows[nr++]=si;
-            }
-            for(int sj=0;sj<hs;sj++) {
-                int cp=0;
-                for(int si=0;si<hr;si++) cp^=syn[(px+2*si)*s+(py+2*sj)];
-                if(cp) odd_cols[nc++]=sj;
-            }
-            if(nr==0||nc==0) continue;
-
-            // Greedy row-by-row: for each odd row, find the best odd column
-            int matched[300]={0};
-            for(int i=0;i<nr;i++) {
-                int best_j=-1, best_wt=n+1;
-                for(int j=0;j<nc;j++) if(!matched[j]) {
-                    int flip_pos=(px+2*odd_rows[i])*s+(py+2*odd_cols[j]);
-                    memset(unit_syn,0,n); unit_syn[flip_pos]=1;
-                    compute_base_at(r,s,unit_syn,0,0,unit_base);
-                    int wt=0;
-                    for(int q=0;q<n;q++) if(base0[q]^unit_base[q]) wt++;
-                    if(wt<best_wt){best_wt=wt;best_j=j;}
-                }
-                if(best_j>=0){
-                    syn[(px+2*odd_rows[i])*s+(py+2*odd_cols[best_j])]^=1;
-                    matched[best_j]=1; changed=1;
-                }
-            }
+        // h_x·C = 0 → row parities
+        for(int si=0;si<hr;si++) {
+            int rp=0;
+            for(int sj=0;sj<hs;sj++) rp^=syn[(i+2*si)*s+(j+2*sj)];
+            if(rp) odd_r[nr++]=si;
         }
-        if(!changed) break;
+        // h_y·C = 0 → column parities
+        for(int sj=0;sj<hs;sj++) {
+            int cp=0;
+            for(int si=0;si<hr;si++) cp^=syn[(i+2*si)*s+(j+2*sj)];
+            if(cp) odd_c[nc++]=sj;
+        }
+        // Phase 1 — intersections: pair row defects to column defects (cost 1)
+        int pairs = nr<nc ? nr : nc;
+        for(int k=0;k<pairs;k++)
+            syn[(i+2*odd_r[k])*s+(j+2*odd_c[k])]^=1;
+
+        // Phase 2 — leftover row pairs (cost 2 per pair)
+        for(int k=pairs;k+1<nr;k+=2)
+            syn[(i+2*odd_r[k])*s+(j+0*2)]^=1,
+            syn[(i+2*odd_r[k+1])*s+(j+0*2)]^=1;
+
+        // Phase 3 — leftover column pairs (cost 2 per pair)
+        for(int k=pairs;k+1<nc;k+=2)
+            syn[(i+0*2)*s+(j+2*odd_c[k])]^=1,
+            syn[(i+0*2)*s+(j+2*odd_c[k+1])]^=1;
     }
 }
 
@@ -1027,16 +1045,20 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-pp")) {
-            uint8_t syn[MAX_N], dec[MAX_N];
+            uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
-            if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            preprocess_syndrome(r,s,syn);
+            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            memcpy(syn, raw_syn, n);
+            memset(total_dec, 0, n);
             for(int pass=0;pass<4;pass++) {
-                solve_plane(r,s,syn,dec);
-                syndrome_of(r,s,dec,syn);
                 preprocess_syndrome(r,s,syn);
+                solve_plane(r,s,syn,dec);
+                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                uint8_t guess_syn[MAX_N];
+                syndrome_of(r,s,total_dec,guess_syn);
+                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
             }
-            fwrite(dec,1,n,stdout); fflush(stdout);
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-z")) {

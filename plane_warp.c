@@ -1002,7 +1002,52 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
     }
 }
 
-
+// ============================================================
+// SPACETIME DIFFERENCE DECODER  (--decode-st)
+//
+// Lifts the static 2D decode into 2+1D to suppress readout /
+// measurement (syndrome-extraction) error. Reads R rounds of syndrome,
+// decodes the DIFFERENCE between consecutive rounds, and XOR-integrates
+// the per-layer corrections.
+//
+// Convention: pre-measurement syndrome is the all-zero state, and each
+// of the R rounds is an independent noisy stabilizer readout. (If your
+// circuit gives a noiseless final data-readout round, it just appears
+// as the last layer and integrates the same way.)
+//
+// Why this cancels readout noise:
+//   * A DATA fault entering at round t flips s_t..s_{R-1}, so it appears
+//     as exactly one valid syndrome bump in the difference layer d_t,
+//     gets decoded once by solve_plane, and contributes once. Correct.
+//   * A READOUT fault on check c in round t flips ONLY s_t, so it shows
+//     up as the SAME single isolated plaquette defect {c} in both d_t
+//     and d_{t+1}. A lone plaquette defect violates the row/col
+//     metacheck, so preprocess_syndrome annihilates it outright in each
+//     layer -> it never reaches solve_plane and contributes 0 to the
+//     integrated correction. Correct.
+//
+// Validity envelope: exact for ISOLATED faults (per above). Where
+// spacetime defects OVERLAP (high readout-error density, or a readout
+// fault colliding with a data fault in the same layer) the per-layer
+// metacheck no longer cleanly separates them and the cancellation is
+// only approximate. That overlap regime is where you swap the per-layer
+// solve_plane call for true 3D matching weighted by the Stim DEM edges.
+static int decode_spacetime(int r, int s, int rounds,
+                            const uint8_t *rounds_buf, uint8_t *out) {
+    int n = r * s;
+    uint8_t prev[MAX_N], cur[MAX_N], diff[MAX_N], corr[MAX_N];
+    memset(prev, 0, n);
+    memset(out,  0, n);
+    for (int t = 0; t < rounds; t++) {
+        memcpy(cur, rounds_buf + (size_t)t * n, n);
+        for (int q = 0; q < n; q++) diff[q] = cur[q] ^ prev[q]; // detector layer
+        preprocess_syndrome(r, s, diff);   // metacheck-snap: kills isolated readout faults
+        solve_plane(r, s, diff, corr);     // spatial decode of this increment
+        for (int q = 0; q < n; q++) out[q] ^= corr[q]; // integrate over time
+        memcpy(prev, cur, n);
+    }
+    return 1;
+}
 
 // ---- Test ----
 int main(int argc, char **argv) {
@@ -1106,6 +1151,24 @@ int main(int argc, char **argv) {
             free(votes);
             preprocess_syndrome(r,s,mv_syn);
             solve_plane(r,s,mv_syn,dec);
+            fwrite(dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-st")) {
+            // Spacetime difference decode.
+            // stdin: rounds(u32) + rounds*N syndrome bytes  (same layout as --decode-mr)
+            int n=r*s, rounds;
+            if (fread(&rounds,4,1,stdin)!=1 || rounds<1 || rounds>4096) {
+                fprintf(stderr,"bad rounds\n"); return 1;
+            }
+            uint8_t *buf = malloc((size_t)rounds*n);
+            if(!buf){ fprintf(stderr,"oom\n"); return 1; }
+            if (fread(buf,1,(size_t)rounds*n,stdin)!=(size_t)rounds*n) {
+                fprintf(stderr,"short read\n"); free(buf); return 1;
+            }
+            uint8_t dec[MAX_N];
+            decode_spacetime(r,s,rounds,buf,dec);
+            free(buf);
             fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
         }

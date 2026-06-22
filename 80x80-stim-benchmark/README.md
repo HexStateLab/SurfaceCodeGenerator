@@ -10,7 +10,7 @@
 | CZ gates per round | 25,600 |
 | 3-round total | 76,800 CZ gates |
 | Code distance | d≈40 |
-| Logical qubits | 316 |
+| Logical qubits | 7696 |
 | Encoding rate | 4.9% |
 
 The 80×80 grid pushes the BB code to distance 40 — meaning up to **19 simultaneous errors are uniquely correctable** by the ML decoder. At this distance, logical errors require a coordinated pattern of 20+ physical faults, which at p_gate=0.01% has probability near zero.

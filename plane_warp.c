@@ -949,27 +949,24 @@ int run_selftest(int seed) {
 }
 
 // ============================================================
-// ALGEBRAIC SYNDROME RECONSTRUCTION — decoder-guided pairing.
-//
-// H^T·S = 0 means each sub-lattice row/col must have even parity.
-// A measurement flip creates one odd row and one odd column.  With
-// k flips in a sub-lattice there are k! valid pairings — all have
-// the same syndrome weight — so the decoder is used as oracle:
-// try each pairing, decode, keep the one with lowest correction
-// weight.  This decomposes S_meas into S_true + N exactly.
+// ALGEBRAIC SYNDROME RECONSTRUCTION — unit-flip cost + greedy
+// matching.  For each candidate syndrome correction at position
+// (px+2*ri, py+2*cj), compute the implied particular solution
+// change and its Hamming weight.  Greedily assign each odd row
+// to the odd column that minimizes total correction weight.
+// O(k²·n) per sub-lattice per pass.
 // ============================================================
-static int factorial(int n) { int f=1; for(int i=2;i<=n;i++) f*=i; return f; }
-
-static void swap(int *a, int *b) { int t=*a; *a=*b; *b=t; }
-
 static void preprocess_syndrome(int r, int s, uint8_t *syn) {
+    int n=r*s;
+    uint8_t base0[MAX_N], unit_syn[MAX_N], unit_base[MAX_N];
+    compute_base_at(r,s,syn,0,0,base0);
+
     for(;;) {
         int changed=0;
         for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
             int hr=r/2, hs=s/2;
-            int odd_rows[50], odd_cols[50];
+            int odd_rows[300], odd_cols[300];
             int nr=0, nc=0;
-
             for(int si=0;si<hr;si++) {
                 int rp=0;
                 for(int sj=0;sj<hs;sj++) rp^=syn[(px+2*si)*s+(py+2*sj)];
@@ -981,52 +978,23 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
                 if(cp) odd_cols[nc++]=sj;
             }
             if(nr==0||nc==0) continue;
-            if(nr!=nc) { nr=nr<nc?nr:nc; nc=nr; } // safety
 
-            int k=nr, nfact=factorial(k);
-            double best_wt=1e18;
-            int best_col[50];
-            for(int i=0;i<k;i++) best_col[i]=odd_cols[i];
-            int perm[50]; for(int i=0;i<k;i++) perm[i]=i;
-
-            // Try all k! permutations (heap's algorithm on perm indices)
-            uint8_t *c = malloc(k); if(!c) continue;
-            for(int i=0;i<k;i++) c[i]=0;
-            int ii=0;
-
-            for(int pass=0; pass<nfact && pass<120; pass++) {
-                // Current pairing: odd_rows[i] ↔ odd_cols[perm[i]]
-                uint8_t syn_try[MAX_N];
-                memcpy(syn_try, syn, r*s);
-                for(int i=0;i<k;i++)
-                    syn_try[(px+2*odd_rows[i])*s+(py+2*odd_cols[perm[i]])]^=1;
-
-                uint8_t dec[MAX_N]; double wt;
-                cost_init(r*s);
-                solve_plane(r,s,syn_try,dec);
-                wt=0; for(int q=0;q<r*s;q++) if(dec[q]) wt+=cost_map[q];
-
-                if(wt<best_wt) {
-                    best_wt=wt;
-                    for(int i=0;i<k;i++) best_col[i]=odd_cols[perm[i]];
+            // Greedy row-by-row: for each odd row, find the best odd column
+            int matched[300]={0};
+            for(int i=0;i<nr;i++) {
+                int best_j=-1, best_wt=n+1;
+                for(int j=0;j<nc;j++) if(!matched[j]) {
+                    int flip_pos=(px+2*odd_rows[i])*s+(py+2*odd_cols[j]);
+                    memset(unit_syn,0,n); unit_syn[flip_pos]=1;
+                    compute_base_at(r,s,unit_syn,0,0,unit_base);
+                    int wt=0;
+                    for(int q=0;q<n;q++) if(base0[q]^unit_base[q]) wt++;
+                    if(wt<best_wt){best_wt=wt;best_j=j;}
                 }
-
-                // Heap's algorithm: next permutation
-                while(ii<k) {
-                    if(c[ii]<ii) {
-                        if(ii&1) swap(&perm[0],&perm[ii]);
-                        else swap(&perm[c[ii]],&perm[ii]);
-                        c[ii]++; ii=0; break;
-                    } else { c[ii]=0; ii++; }
+                if(best_j>=0){
+                    syn[(px+2*odd_rows[i])*s+(py+2*odd_cols[best_j])]^=1;
+                    matched[best_j]=1; changed=1;
                 }
-                if(ii>=k) break;
-            }
-            free(c);
-
-            // Apply best pairing
-            for(int i=0;i<k;i++) {
-                syn[(px+2*odd_rows[i])*s+(py+2*best_col[i])]^=1;
-                changed=1;
             }
         }
         if(!changed) break;
@@ -1063,7 +1031,11 @@ int main(int argc, char **argv) {
             int n=r*s;
             if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
             preprocess_syndrome(r,s,syn);
-            solve_plane(r,s,syn,dec);
+            for(int pass=0;pass<4;pass++) {
+                solve_plane(r,s,syn,dec);
+                syndrome_of(r,s,dec,syn);
+                preprocess_syndrome(r,s,syn);
+            }
             fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
         }

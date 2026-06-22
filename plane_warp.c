@@ -1003,81 +1003,6 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
 }
 
 
-
-// ============================================================
-// HYBRID DECODER — repetition-sector pre-filter + BB-solver.
-// The repetition (row/col parity) sector has p_th ≈ 3-4%,
-// much higher than the BB sector.  Catch most errors at the rep
-// level, feed the residual to solve_plane.
-// ============================================================
-static int rep_decoder_1d(const uint8_t *syn_flat, int d, int rounds, uint8_t *corr) {
-    // syn_flat[t*d + i] = syndrome at round t, position i
-    memset(corr, 0, d);
-    // Detection events
-    int defects[1024][2], nd = 0;
-    for (int t = 1; t <= rounds; t++) {
-        const uint8_t *syn = (t <= rounds) ? syn_flat + (t-1)*d : NULL;
-        const uint8_t *prev = (t > 1) ? syn_flat + (t-2)*d : NULL;
-        for (int i = 0; i < d; i++) {
-            int s = syn ? syn[i] : 0;
-            int p = prev ? prev[i] : 0;
-            if (s != p && nd < 1024) {
-                defects[nd][0] = i; defects[nd][1] = t-1; nd++;
-            }
-        }
-    }
-    if (nd < 2 || nd % 2) return 0;
-    // Greedy minimum-weight matching
-    uint8_t matched[1024]; memset(matched, 0, nd);
-    for (int a = 0; a < nd; a++) {
-        if (matched[a]) continue;
-        int best = -1, bestdist = 1<<30;
-        for (int b = a+1; b < nd; b++) {
-            if (matched[b]) continue;
-            int ds = abs(defects[a][0] - defects[b][0]);
-            if (d - ds < ds) ds = d - ds;
-            int dist = ds + abs(defects[a][1] - defects[b][1]);
-            if (dist < bestdist) { bestdist = dist; best = b; }
-        }
-        if (best < 0) continue;
-        matched[a] = matched[best] = 1;
-        int i1 = defects[a][0], i2 = defects[best][0];
-        int up = (i2 - i1 + d) % d, down = d - up;
-        if (up <= down) for (int k = 1; k <= up; k++) corr[(i1 + k) % d] ^= 1;
-        else for (int k = 0; k < down; k++) corr[(i1 - k + d) % d] ^= 1;
-    }
-    return 1;
-}
-
-static void rep_prefilter(int r, int s, int rounds, const uint8_t *syn_rounds, uint8_t *rep_corr) {
-    int n = r * s, hr = r/2, hs = s/2;
-    memset(rep_corr, 0, n);
-    for (int px = 0; px < 2; px++) for (int py = 0; py < 2; py++) {
-        // Row decoding
-        for (int si = 0; si < hr; si++) {
-            uint8_t row_syn[1024];
-            for (int t = 0; t < rounds; t++)
-                for (int sj = 0; sj < hs; sj++)
-                    row_syn[t*hs+sj] = syn_rounds[(size_t)t*n + (px+2*si)*s + (py+2*sj)];
-            uint8_t row_corr[64];
-            rep_decoder_1d(row_syn, hs, rounds, row_corr);
-            for (int sj = 0; sj < hs; sj++)
-                rep_corr[(px+2*si)*s + (py+2*sj)] ^= row_corr[sj];
-        }
-        // Column decoding
-        for (int sj = 0; sj < hs; sj++) {
-            uint8_t col_syn[1024];
-            for (int t = 0; t < rounds; t++)
-                for (int si = 0; si < hr; si++)
-                    col_syn[t*hr+si] = syn_rounds[(size_t)t*n + (px+2*si)*s + (py+2*sj)];
-            uint8_t col_corr[64];
-            rep_decoder_1d(col_syn, hr, rounds, col_corr);
-            for (int si = 0; si < hr; si++)
-                rep_corr[(px+2*si)*s + (py+2*sj)] ^= col_corr[si];
-        }
-    }
-}
-
 // ---- Test ----
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
@@ -1190,39 +1115,6 @@ int main(int argc, char **argv) {
             preprocess_syndrome(r,s,mv_syn);
             solve_plane(r,s,mv_syn,dec);
             fwrite(dec,1,n,stdout); fflush(stdout);
-            return 0;
-        }
-        else if(!strcmp(argv[i],"--decode-hybrid")) {
-            // Repetition-sector pre-filter + BB-solver.
-            // stdin: rounds(u32) + rounds*N syndrome bytes.
-            int n = r*s, rounds;
-            if (fread(&rounds,4,1,stdin)!=1 || rounds<2 || rounds>64) { fprintf(stderr,"bad rounds\n"); return 1; }
-            uint8_t *syn_rounds = malloc((size_t)rounds*n);
-            if(!syn_rounds) return 1;
-            if (fread(syn_rounds,1,(size_t)rounds*n,stdin)!=(size_t)rounds*n) { free(syn_rounds); return 1; }
-            // Rep prefilter: decode row/col parity sector
-            uint8_t rep_corr[MAX_N];
-            rep_prefilter(r, s, rounds, syn_rounds, rep_corr);
-            // Remove rep correction's syndrome from last round
-            uint8_t last_syn[MAX_N]; memcpy(last_syn, syn_rounds + (size_t)(rounds-1)*n, n);
-            uint8_t rep_syn[MAX_N]; syndrome_of(r, s, rep_corr, rep_syn);
-            for (int q = 0; q < n; q++) last_syn[q] ^= rep_syn[q];
-            // BB-solver on residual
-            uint8_t dec[MAX_N];
-            uint8_t syn[MAX_N]; memcpy(syn, last_syn, n);
-            uint8_t total[MAX_N]; memset(total, 0, n);
-            for (int pass = 0; pass < 5; pass++) {
-                preprocess_syndrome(r, s, syn);
-                solve_plane(r, s, syn, dec);
-                for (int q = 0; q < n; q++) total[q] ^= dec[q];
-                uint8_t gs[MAX_N]; syndrome_of(r, s, total, gs);
-                for (int q = 0; q < n; q++) syn[q] = last_syn[q] ^ gs[q];
-            }
-            // Combine: rep correction + BB correction
-            uint8_t out[MAX_N];
-            for (int q = 0; q < n; q++) out[q] = rep_corr[q] ^ total[q];
-            fwrite(out, 1, n, stdout); fflush(stdout);
-            free(syn_rounds);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-z")) {

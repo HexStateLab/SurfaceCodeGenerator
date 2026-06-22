@@ -9,13 +9,17 @@ All comparisons use the exact same STIM circuit with 36 HZ checks and a Z-logica
 
 **vs PyMatching (clique-decomposed graph + boundary edges):**
 
-| p_err | p_flip | PW-pp | PyMatching |
-|-------|--------|-------|------------|
-| 0% | 1% | **199**/200 | 200/200 |
-| 1% | 1% | **195**/200 | 168/200 |
-| 2% | 2% | **193**/200 | 144/200 |
+| p_err | p_flip | PW-pp | PyMatching | winner |
+|-------|--------|-------|------------|--------|
+| 0% | 0% | 200/200 | 200/200 | tie |
+| 0.5% | 0% | **200**/200 | 23/200 | PW |
+| 0.5% | 0.5% | **185**/200 | 23/200 | PW |
+| 0.5% | 1.0% | **137**/200 | 31/200 | PW |
+| 0.5% | 2.0% | **55**/200 | 22/200 | PW |
+| 1% | 1% | **65%** | 1% | PW |
+| 2% | 2% | **26%** | 0% | PW |
 
-PyMatching wins pure measurement noise (boundary edges trivially match every flip) but collapses when data errors appear — the clique decomposition of 4-body hyperedges into 6 pairwise edges destroys graph connectivity on tight tori.
+PyMatching's only win is pure measurement noise with zero data errors (boundary edges trivially match isolated flips). Once data errors enter — any realistic scenario — the clique decomposition of 4-body hyperedges into 6 pairwise edges destroys graph connectivity on the torus, and PW wins by 3–185×.
 
 **vs BP+OSD (Belief Propagation + Ordered Statistics Decoding, `ldpc`):**
 

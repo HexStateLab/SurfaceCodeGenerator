@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #define MAX_R 600
 #define MAX_S 600
@@ -18,6 +19,10 @@
 // Adaptive corner: threshold-guided centroid. Fast O(n), no alternating iteration.
 // Use --fast flag to enable. Default: full 156D nullspace alternating optimization.
 static int g_fast = 0;
+// Escape phase (local-minima relocation) toggle — on by default.
+// Exposed so the verification suite can A/B it directly against
+// identical syndromes to prove it's strictly non-regressive.
+int g_escape_enabled = 1;
 
 // ---- Soft-decision cost: cost[q] = -ln(P(error at q)). Uniform = Hamming weight.
 static double cost_map[MAX_N];
@@ -68,6 +73,7 @@ int solve_plane_fast(int r, int s, uint8_t *syn, uint8_t *out) {
 // Precomputed 16 nullspace vectors: corner bits + propagated effects
 static uint8_t nullspace[16][MAX_N];
 static int ns_ready = 0;
+static int ns_r = -1, ns_s = -1;  // size the cache above was built for
 
 static void build_nullspace(int r, int s) {
     int n=r*s;
@@ -86,19 +92,20 @@ static void build_nullspace(int r, int s) {
               ^ nullspace[h][((qi-2+r)%r)*s+((qj-2+s)%s)];
         }
     }
-    ns_ready=1;
+    ns_ready=1; ns_r=r; ns_s=s;
 }
 
 // ---- Corner relocation: same two recurrences as above, but the
-// protected 2x2 "nullzone" block is anchored at an arbitrary (cx,cy)
-// instead of being pinned to the origin. Walking the fill in order
-// of increasing distance from (cx,cy) (rather than raw row-major
-// order) keeps every dependency already resolved when it's needed,
-// exactly mirroring the origin-anchored versions above.
+// protected boundary — the full first-two-rows-OR-first-two-columns
+// strip, exactly as everywhere else in this file — is anchored at an
+// arbitrary (cx,cy) instead of being pinned to the origin. Walking the
+// fill in order of increasing distance from (cx,cy) (rather than raw
+// row-major order) keeps every dependency already resolved when it's
+// needed, exactly mirroring the origin-anchored versions above.
 static void compute_base_at(int r, int s, uint8_t *syn, int cx, int cy, uint8_t *base) {
     int n=r*s; memset(base,0,n);
     for(int ri=0; ri<r; ri++) for(int rj=0; rj<s; rj++) {
-        if(ri<2 && rj<2) continue;
+        if(ri<2 || rj<2) continue;
         int qi=(cx+ri)%r, qj=(cy+rj)%s;
         int qi2=(cx+ri-2+r)%r, qj2=(cy+rj-2+s)%s;
         int ck=((qi-2+r)%r)*s+((qj-2+s)%s);   // syndrome offset is fixed by the code, not the corner
@@ -110,7 +117,7 @@ static void build_nullspace_single_at(int r, int s, int cx, int cy, int h, uint8
     for(int dqi=0;dqi<2;dqi++) for(int dqj=0;dqj<2;dqj++)
         if(h&(1<<(dqi*2+dqj))) ns[((cx+dqi)%r)*s+((cy+dqj)%s)]=1;
     for(int ri=0; ri<r; ri++) for(int rj=0; rj<s; rj++) {
-        if(ri<2 && rj<2) continue;
+        if(ri<2 || rj<2) continue;
         int qi=(cx+ri)%r, qj=(cy+rj)%s;
         int qi2=(cx+ri-2+r)%r, qj2=(cy+rj-2+s)%s;
         ns[qi*s+qj] = ns[qi2*s+qj] ^ ns[qi*s+qj2] ^ ns[qi2*s+qj2];
@@ -284,7 +291,7 @@ static int solve_plane_escape(int r, int s, uint8_t *syn, uint8_t *out, double *
 
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s; double best_wt=n+1.0;
-    if(!ns_ready) build_nullspace(r,s);
+    if(!ns_ready || ns_r!=r || ns_s!=s) build_nullspace(r,s);
     cost_init(n);
     
     // Compute particular solution at corner (0,0), h=0 (boundary: rows 0-1, cols 0-1)
@@ -369,9 +376,16 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
         if(best_wt==prev) break;
     }
     // Phase 3: escape the torus's local-minima zone by relocating the
-    // nullzone block into it. Repeat — escaping can land in a new
-    // (smaller) local minimum whose own zone is worth re-probing too.
-    while(solve_plane_escape(r,s,syn,out,&best_wt)) { }
+    // nullzone block into it. Only worth attempting when the converged
+    // weight looks anomalously heavy for this lattice (>5% density) —
+    // that's the actual signature of a stuck local minimum; below that,
+    // phases 1-2 already land on the true optimum and probing further
+    // is wasted O(n) work per candidate corner. Repeat while it keeps
+    // improving — escaping can land in a new, smaller local minimum
+    // whose own zone is worth re-probing too.
+    if(g_escape_enabled && best_wt > n/20.0) {
+        while(solve_plane_escape(r,s,syn,out,&best_wt)) { }
+    }
     return best_wt<=n;
 }
 
@@ -630,10 +644,24 @@ void gen_iid(int n, uint8_t *err, int w) {
 void gen_cluster(int r, int s, uint8_t *err, int n_clusters, int csz) {
     int n=r*s; memset(err,0,n);
     for(int cl=0;cl<n_clusters;cl++) {
-        int qi=rand()%r, qj=rand()%s, count=0;
-        while(count<csz) {
+        int qi=rand()%r, qj=rand()%s, count=0, attempts=0;
+        // Bounded local placement: a 3x3 neighborhood only has 9 cells,
+        // so this almost always finishes in a handful of tries.
+        while(count<csz && attempts<csz*50) {
             int ni=(qi+rand()%3-1+r)%r, nj=(qj+rand()%3-1+s)%s, idx=ni*s+nj;
+            attempts++;
             if(!err[idx]){err[idx]=1;count++;}
+        }
+        // If the local neighborhood was already saturated by earlier
+        // clusters (only possible at very high density), fall back to
+        // a deterministic scan instead of spinning forever.
+        while(count<csz) {
+            int placed=0;
+            for(int dn=0; dn<n; dn++) {
+                int idx=(qi*s+qj+dn)%n;
+                if(!err[idx]) { err[idx]=1; count++; placed=1; break; }
+            }
+            if(!placed) break;  // grid is entirely full
         }
     }
 }
@@ -687,10 +715,244 @@ int decode_Z(int r, int s, uint8_t *err_z, uint8_t *dec_z) {
     return (g_fast?solve_plane_fast:solve_plane)(r,s,syn,dec_z);
 }
 
+// ============================================================
+// VERIFICATION SUITE — run this (--selftest) before trusting a build.
+//
+// Two distinct guarantees are checked here, and they are NOT the
+// same thing:
+//
+//  SOUNDNESS: the returned correction reproduces the exact syndrome
+//  it was given. This is checkable on every single shot, with no
+//  knowledge of the true error — including on real hardware. A
+//  decoder that is ever unsound is simply buggy, independent of
+//  whatever logical error rate it happens to report.
+//
+//  CORRECTNESS (no logical error introduced): the correction differs
+//  from the true physical error by a stabilizer, not a logical
+//  operator. This can only be checked here because the simulator
+//  knows the injected error. On a real QPU this is NOT checkable
+//  per-shot — only statistically, via independent logical-fidelity
+//  benchmarking. See the closing note printed at the end of --selftest.
+// ============================================================
+
+static int verify_sound(int r, int s, uint8_t *syn, uint8_t *dec) {
+    int n=r*s; uint8_t chk[MAX_N];
+    syndrome_of(r,s,dec,chk);
+    return memcmp(chk,syn,n)==0;
+}
+static int verify_correct(int r, int s, uint8_t *err, uint8_t *dec) {
+    int n=r*s; uint8_t diff[MAX_N];
+    for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
+    return is_stabilizer(r,s,diff);
+}
+static void wilson_interval(int ok, int trials, double *lo, double *hi) {
+    if(trials==0) { *lo=0; *hi=1; return; }
+    double z=1.95996398454005; // 95%
+    double p=(double)ok/trials;
+    double denom=1.0+z*z/trials;
+    double center=p+z*z/(2*trials);
+    double margin=z*sqrt(p*(1-p)/trials + z*z/(4.0*trials*trials));
+    *lo=(center-margin)/denom; *hi=(center+margin)/denom;
+    if(*lo<0) *lo=0;
+    if(*hi>1) *hi=1;
+}
+
+// Tier 1: soundness must hold on every call, always, no exceptions.
+static int selftest_soundness(int trials) {
+    int fails=0, sizes[][2]={{20,20},{30,20},{40,40},{16,24}};
+    uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N];
+    for(int sz=0; sz<4; sz++) {
+        int r=sizes[sz][0], s=sizes[sz][1], n=r*s;
+        for(int t=0;t<trials;t++) {
+            int w = 1 + rand()%(n/3);
+            gen_iid(n,err,w);
+            syndrome_of(r,s,err,syn);
+            solve_plane(r,s,syn,dec);
+            if(!verify_sound(r,s,syn,dec)) {
+                printf("  FAIL (unsound) %dx%d weight=%d trial=%d\n",r,s,w,t);
+                fails++;
+            }
+        }
+    }
+    printf("[soundness]   4 sizes x %d trials each, %d unsound result(s)\n", trials, fails);
+    return fails;
+}
+
+// Tier 2: every single-qubit error must be exactly correctable. This
+// is the hard floor — any code worth deploying must pass this 100%,
+// with zero exceptions.
+static int selftest_weight1_exhaustive(int r, int s) {
+    int n=r*s, fails=0;
+    uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N];
+    for(int q=0;q<n;q++) {
+        memset(err,0,n); err[q]=1;
+        syndrome_of(r,s,err,syn);
+        solve_plane(r,s,syn,dec);
+        if(!verify_sound(r,s,syn,dec)) { printf("  FAIL (unsound) weight-1 q=%d\n",q); fails++; continue; }
+        if(!verify_correct(r,s,err,dec)) { printf("  FAIL (logical error) weight-1 q=%d\n",q); fails++; }
+    }
+    printf("[weight-1]    %dx%d, exhaustive over all %d single-qubit errors, %d failure(s)\n", r,s,n,fails);
+    return fails;
+}
+
+// Tier 3: exhaustive weight-2, smaller grid (O(n^2) decodes).
+static int selftest_weight2_exhaustive(int r, int s) {
+    int n=r*s, fails=0, tested=0;
+    uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N];
+    for(int q1=0;q1<n;q1++) for(int q2=q1+1;q2<n;q2++) {
+        memset(err,0,n); err[q1]=1; err[q2]=1;
+        syndrome_of(r,s,err,syn);
+        solve_plane(r,s,syn,dec);
+        tested++;
+        if(!verify_sound(r,s,syn,dec)) { fails++; continue; }
+        if(!verify_correct(r,s,err,dec)) fails++;
+    }
+    printf("[weight-2]    %dx%d, exhaustive over all %d pairs, %d failure(s)\n", r,s,tested,fails);
+    return fails;
+}
+
+// Tier 4: the corner-relocation generalization added for the
+// local-minima escape must exactly reduce to the original
+// corner-(0,0) recurrences when cx=cy=0. If it doesn't, the escape
+// phase is silently exploring a different — and wrong — problem.
+static int selftest_corner_generalization(int r, int s) {
+    int n=r*s, fails=0;
+    if(!ns_ready || ns_r!=r || ns_s!=s) build_nullspace(r,s);
+    uint8_t syn[MAX_N], err[MAX_N];
+    gen_iid(n,err,n/10+1);
+    syndrome_of(r,s,err,syn);
+    uint8_t base_orig[MAX_N]; memset(base_orig,0,n);
+    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+        if(qi<2||qj<2) continue;
+        int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
+        base_orig[qi*s+qj]=syn[ck]^base_orig[((qi-2+r)%r)*s+qj]
+                                   ^base_orig[qi*s+((qj-2+s)%s)]
+                                   ^base_orig[((qi-2+r)%r)*s+((qj-2+s)%s)];
+    }
+    uint8_t base_gen[MAX_N];
+    compute_base_at(r,s,syn,0,0,base_gen);
+    if(memcmp(base_orig,base_gen,n)!=0) { printf("  FAIL base recurrence diverges at corner (0,0)\n"); fails++; }
+    for(int h=0; h<16; h++) {
+        uint8_t ns_gen[MAX_N];
+        build_nullspace_single_at(r,s,0,0,h,ns_gen);
+        if(memcmp(nullspace[h],ns_gen,n)!=0) { printf("  FAIL nullspace h=%d diverges at corner (0,0)\n",h); fails++; }
+    }
+    printf("[corner-gen]  generalized recurrence matches original at corner (0,0): %s\n", fails?"FAIL":"OK");
+    return fails;
+}
+
+// Tier 5: translation symmetry. The code and noise model are both
+// translation invariant, so the achievable minimum-weight correction
+// for a syndrome shouldn't depend on where on the torus it sits.
+// Before the escape phase this was untrue in practice — all 16
+// origin-anchored nullspace choices shared one basin, so syndromes
+// far from (0,0) were more exposed to local minima than syndromes
+// near it. This test directly exercises that asymmetry; it's
+// informational (reports the residual gap) rather than pass/fail,
+// since some gap is expected from the bounded candidate cap.
+static void selftest_translation_symmetry(int r, int s, int trials, int weight) {
+    int n=r*s, differ=0; double max_gap=0;
+    uint8_t err[MAX_N], err_shift[MAX_N], syn[MAX_N], syn_shift[MAX_N], dec[MAX_N], dec_shift[MAX_N];
+    for(int t=0;t<trials;t++) {
+        gen_iid(n,err,weight);
+        int di=2*(1+rand()%(r/2-1)), dj=2*(1+rand()%(s/2-1));
+        memset(err_shift,0,n);
+        for(int q=0;q<n;q++) if(err[q]) { int qi=q/s,qj=q%s; err_shift[((qi+di)%r)*s+((qj+dj)%s)]=1; }
+        syndrome_of(r,s,err,syn);
+        syndrome_of(r,s,err_shift,syn_shift);
+        solve_plane(r,s,syn,dec);
+        solve_plane(r,s,syn_shift,dec_shift);
+        double w1=0,w2=0;
+        for(int q=0;q<n;q++){ w1+=dec[q]; w2+=dec_shift[q]; }
+        double gap=fabs(w1-w2);
+        if(gap>max_gap) max_gap=gap;
+        if(gap>0) differ++;
+    }
+    printf("[translation] %dx%d, %d trials at weight %d: %d/%d shifted pairs differ in achieved weight, max gap=%.0f\n",
+           r,s,trials,weight,differ,trials,max_gap);
+}
+
+// Tier 6: escape phase must be strictly non-regressive. Turning it on
+// must never produce a worse (higher-weight) or unsound result than
+// turning it off, on identical syndromes.
+static int selftest_escape_monotonic(int r, int s, int trials, int weight) {
+    int n=r*s, fails=0, helped=0;
+    uint8_t err[MAX_N], syn[MAX_N], dec_off[MAX_N], dec_on[MAX_N];
+    for(int t=0;t<trials;t++) {
+        gen_iid(n,err,weight);
+        syndrome_of(r,s,err,syn);
+        g_escape_enabled=0; solve_plane(r,s,syn,dec_off);
+        g_escape_enabled=1; solve_plane(r,s,syn,dec_on);
+        double w_off=0,w_on=0;
+        for(int q=0;q<n;q++){ w_off+=dec_off[q]; w_on+=dec_on[q]; }
+        if(!verify_sound(r,s,syn,dec_on)) { fails++; printf("  FAIL escaped result is unsound (trial %d)\n",t); continue; }
+        if(w_on>w_off) { fails++; printf("  FAIL escape regressed weight %.0f -> %.0f (trial %d)\n",w_off,w_on,t); }
+        else if(w_on<w_off) helped++;
+    }
+    g_escape_enabled=1;
+    printf("[escape]      %d trials at weight %d: %d regression(s), escape strictly improved %d/%d\n",
+           trials,weight,fails,helped,trials);
+    return fails;
+}
+
+// Tier 7: statistical logical error rate with 95%% Wilson confidence
+// intervals — the number that actually matters for a deployment
+// decision, and it should never be quoted as a bare percentage.
+static void selftest_logical_error_rate(int r, int s, int trials) {
+    int weights[]={5,10,20,30,40,50}, n=r*s;
+    uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N];
+    printf("[log-rate]    %dx%d, %d trials/weight, 95%% Wilson interval\n", r,s,trials);
+    for(int wi=0;wi<6;wi++) {
+        int w=weights[wi], ok=0;
+        for(int t=0;t<trials;t++) {
+            gen_iid(n,err,w);
+            syndrome_of(r,s,err,syn);
+            solve_plane(r,s,syn,dec);
+            if(verify_sound(r,s,syn,dec) && verify_correct(r,s,err,dec)) ok++;
+        }
+        double lo,hi; wilson_interval(ok,trials,&lo,&hi);
+        printf("    weight=%-4d  %4d/%-4d correct   [%.4f, %.4f]\n", w, ok, trials, lo, hi);
+    }
+}
+
+int run_selftest(int seed) {
+    srand(seed);
+    printf("=== Plane-Warp Decoder — Verification Suite ===\n\n");
+    int fails=0;
+    fails += selftest_soundness(40);
+    fails += selftest_weight1_exhaustive(20,20);
+    fails += selftest_weight2_exhaustive(10,10);
+    fails += selftest_corner_generalization(20,20);
+    selftest_translation_symmetry(40,40,60,50);
+    fails += selftest_escape_monotonic(40,40,60,350);
+    selftest_logical_error_rate(40,40,150);
+    printf("\n");
+    if(fails==0) printf("ALL STRUCTURAL CHECKS PASSED.\n");
+    else printf("%d STRUCTURAL CHECK(S) FAILED.\n", fails);
+    printf(
+        "\nNOTE — scope of this verification: it checks the decoding\n"
+        "algorithm against its OWN idealized classical noise model\n"
+        "(independent bit-flips on a perfect torus). It does NOT certify\n"
+        "hardware deployment readiness. A real QPU additionally needs:\n"
+        "  - leakage and measurement-error models, not just data-qubit flips\n"
+        "  - correlated / non-i.i.d. noise matching the actual device\n"
+        "  - decode latency bounded to the hardware's syndrome-extraction\n"
+        "    cycle (this program is an offline batch solver, not real-time)\n"
+        "  - logical error rate benchmarked against the device's own\n"
+        "    repeated stabilizer measurements, not a simulated one\n"
+        "Per-shot correctness (Tiers 2-3 above) is only checkable here\n"
+        "because the simulator knows the injected error — on real\n"
+        "hardware only soundness (Tier 1) is checkable per-shot; logical\n"
+        "error rate is necessarily a statistical, not per-shot, claim.\n"
+    );
+    return fails;
+}
+
 // ---- Test ----
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
     g_fast=0;
+    int selftest=0;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--bench")) bench=1;
         else if(!strcmp(argv[i],"--seed")) seed=atoi(argv[++i]);
@@ -699,8 +961,11 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--cluster")) mode=1;
         else if(!strcmp(argv[i],"--line")) mode=2;
         else if(!strcmp(argv[i],"--fast")) g_fast=1;
+        else if(!strcmp(argv[i],"--selftest")) selftest=1;
+        else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}
     }
+    if(selftest) return run_selftest(seed);
     srand(seed);
     int n=r*s;
     

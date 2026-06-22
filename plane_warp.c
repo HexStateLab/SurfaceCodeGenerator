@@ -1054,25 +1054,59 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-3d")) {
-            // 4D joint-image lift: 4 sub-lattice decodes. Gate noise inflates
-            // correction weight in one sub-lattice. Pick the minimum-weight
-            // decode — the clean sub-lattices give correct corrections.
-            uint8_t syn_full[MAX_N], sub_syn[MAX_N], dec[MAX_N], best[MAX_N];
+            // 4D lift: pick the single sub-lattice decode with minimum
+            // positive correction weight. Gate noise inflates weight in
+            // affected sub-lattices; the least-affected one is closest to
+            // the true data error.
+            uint8_t syn_full[MAX_N], raw_syn[MAX_N], syn[MAX_N], dec[MAX_N];
+            uint8_t best[MAX_N]; double best_w; int got=0;
             int n=r*s;
             if (fread(syn_full,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            double best_wt=n+1.0;
-            for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
-                memset(sub_syn,0,n);
+            preprocess_syndrome(r,s,syn_full);
+            for(int u=0;u<4;u++) {
+                int px=u/2, py=u%2;
+                memset(raw_syn,0,n); int has_syn=0;
                 int hr=r/2, hs=s/2;
                 for(int si=0;si<hr;si++) for(int sj=0;sj<hs;sj++) {
                     int pos=(px+2*si)*s+(py+2*sj);
-                    sub_syn[pos]=syn_full[pos];
+                    if((raw_syn[pos]=syn_full[pos])) has_syn=1;
                 }
-                solve_plane(r,s,sub_syn,dec);
-                double wt=0; for(int q=0;q<n;q++) if(dec[q]) wt+=1.0;
-                if(wt<best_wt){best_wt=wt;memcpy(best,dec,n);}
+                if(!has_syn) continue;
+                memcpy(syn,raw_syn,n);
+                uint8_t total_dec[MAX_N]; memset(total_dec,0,n);
+                for(int pass=0;pass<5;pass++) {
+                    preprocess_syndrome(r,s,syn);
+                    solve_plane(r,s,syn,dec);
+                    for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                    uint8_t guess_syn[MAX_N];
+                    syndrome_of(r,s,total_dec,guess_syn);
+                    for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+                }
+                double wt=0; for(int q=0;q<n;q++) if(total_dec[q]) wt+=1.0;
+                if(!got || (wt>0 && wt<best_w)){best_w=wt;memcpy(best,total_dec,n);got=1;}
             }
+            if(!got) memset(best,0,n);
             fwrite(best,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-mr")) {
+            // Multi-round: stdin = round_count(u32) + round_count*N syndrome bytes
+            // Majority vote across rounds → preprocess → decode
+            uint8_t syn[MAX_N], mv_syn[MAX_N], dec[MAX_N];
+            int n=r*s, rounds;
+            if (fread(&rounds,4,1,stdin)!=1 || rounds<2 || rounds>16) { fprintf(stderr,"bad rounds\n"); return 1; }
+            int *votes = calloc(n, sizeof(int));
+            if(!votes) return 1;
+            for(int rnd=0;rnd<rounds;rnd++) {
+                if (fread(syn,1,n,stdin)!=(size_t)n) { free(votes); return 1; }
+                for(int q=0;q<n;q++) if(syn[q]) votes[q]++;
+            }
+            int thresh=rounds/2+1;
+            for(int q=0;q<n;q++) mv_syn[q]=(votes[q]>=thresh);
+            free(votes);
+            preprocess_syndrome(r,s,mv_syn);
+            solve_plane(r,s,mv_syn,dec);
+            fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-z")) {

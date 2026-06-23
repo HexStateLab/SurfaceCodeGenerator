@@ -1123,69 +1123,6 @@ static void run_scaling(int trials) {
     printf("(measurement-dominated / basis-mismatched, e.g. CNOT), which this i.i.d. sweep doesn't model.\n");
 }
 
-// ============================================================
-// SPACETIME CNOT DECODER — iterative residual loop over rounds.
-//
-// For a memory experiment with T rounds of syndrome data:
-//   s(t) = H_data · q(t)   (raw syndrome at round t)
-//   q(t) = q(t-1) ⊕ e(t)   (cumulative error, e(t) = new errors)
-//
-// The 3D constraint couples consecutive rounds:
-//   H_data q(t) ⊕ q(t-1) = s(t) ⊕ q(t-1)
-//
-// We solve iteratively: for each iteration, treat s_eff(t) = s(t) ⊕ q(t-1)
-// as the effective syndrome and solve the 2D problem, updating q(t).
-//
-// Gate penalty: all 4 qubits in each stabilizer check block should
-// have equal X after a CNOT round (ancilla→data propagation).
-// Added to the cost via per-qubit weights.
-//
-// Measurement penalty: q(i,j,t) ⊕ q(i,j,t-1) = 0 (errors persist).
-// Temporal changes = measurement faults.
-//
-// Stdin format: [T : uint32] [T·N syndrome bytes] [T·N double probs]
-// where probs are per-qubit per-round error probabilities.
-// ============================================================
-#define ST_MAX_T 16
-#define ST_MAX_N 500
-#define ST_MAX_V (ST_MAX_T * ST_MAX_N)
-
-static int solve_spacetime(int r, int s, int T, uint8_t *syn,
-                            double *probs,
-                            double gate_lambda, double meas_lambda,
-                            uint8_t *dec) {
-    int N = r*s, V = T*N;
-    if(V > ST_MAX_V || N > ST_MAX_N || T > ST_MAX_T) return 0;
-    
-    static uint8_t total[ST_MAX_V];
-    static uint8_t work[MAX_N];  // per-slice scratch
-    memset(total, 0, V);
-    
-    for(int pass=0; pass<10; pass++) {
-        for(int t=0; t<T; t++) {
-            uint8_t *syn_t = syn + t*N;
-            uint8_t *dec_t = total + t*N;
-            
-            // Residual syndrome: r = syn_t ⊕ H_data(total[t])
-            uint8_t eff_syn[MAX_N];
-            uint8_t syn_of_total[MAX_N];
-            syndrome_of(r, s, dec_t, syn_of_total);
-            for(int i=0; i<N; i++) eff_syn[i] = syn_t[i] ^ syn_of_total[i];
-            
-            // Preprocess and solve this round's effective syndrome
-            preprocess_syndrome(r, s, eff_syn);
-            if(g_fast) solve_plane_fast(r, s, eff_syn, work);
-            else       solve_plane(r, s, eff_syn, work);
-            
-            // Update cumulative correction
-            for(int i=0; i<N; i++) dec_t[i] ^= work[i];
-        }
-    }
-    
-    memcpy(dec, total, V);
-    return 1;
-}
-
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
     g_fast=0;
@@ -1309,24 +1246,6 @@ int main(int argc, char **argv) {
             for(int q=0;q<n;q++){ int qi=q/s, qj=q%s; syn_shift[q]=syn_raw[((qi+2)%r)*s+((qj+2)%s)]; }
             solve_plane(r,s,syn_shift,dec);
             fwrite(dec,1,n,stdout); fflush(stdout);
-            return 0;
-        }
-        else if(!strcmp(argv[i],"--decode-cnot")) {
-            // Spacetime CNOT decoder: iterative residual loop over T rounds.
-            // Stdin: [T : uint32] [T·N syndrome bytes] [T·N double probs]
-            // Output: [T·N correction bytes]
-            int n=r*s;
-            uint32_t T;
-            if(fread(&T,4,1,stdin)!=1 || T<2 || T>ST_MAX_T) { fprintf(stderr,"bad T\n"); return 1; }
-            int V = (int)T * n;
-            if(V > ST_MAX_V) { fprintf(stderr,"V=%d > ST_MAX_V=%d\n", V, ST_MAX_V); return 1; }
-            static uint8_t syn[ST_MAX_V];
-            static double perr[ST_MAX_V];
-            if(fread(syn,1,V,stdin)!=(size_t)V) { fprintf(stderr,"short syn\n"); return 1; }
-            if(fread(perr,sizeof(double),V,stdin)!=(size_t)V) { fprintf(stderr,"short probs\n"); return 1; }
-            static uint8_t dec[ST_MAX_V];
-            solve_spacetime(r, s, (int)T, syn, perr, 1.0, 1.0, dec);
-            fwrite(dec,1,V,stdout); fflush(stdout);
             return 0;
         }
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}

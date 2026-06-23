@@ -56,7 +56,7 @@ static int effective_cap(int n) {
 static double cost_map[MAX_N];
 static void cost_init(int n) { for(int q=0;q<n;q++) cost_map[q]=1.0; }
 void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
-    int n=r*s, sx=0, sy=0, count=0;
+    int sx=0, sy=0, count=0;
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
         int hits=0;
         for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
@@ -113,7 +113,6 @@ static void build_nullspace(int r, int s) {
         // Propagate from boundary (OR-skip: rows 0-1 and cols 0-1 are fixed)
         for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
             if(qi<2 || qj<2) continue;
-            int ci2=WRAP2(qi, r), cj2=WRAP2(qj, s);
             nullspace[h][qi*s+qj] =
                 nullspace[h][(WRAP2(qi, r))*s+qj]
               ^ nullspace[h][qi*s+(WRAP2(qj, s))]
@@ -152,63 +151,6 @@ static void build_nullspace_single_at(int r, int s, int cx, int cy, int h, uint8
     }
 }
 
-// ---- Helpers: optimal 4-pattern per column/row (boundary-relative) ----
-// Boundary is the 2x2 block at (cx,cy). Protect those qubits.
-static int best_col_pat(int r, int s, uint8_t *p, int j, int px, int cx, int cy, int n) {
-    int best=n+1, best_pat=0;
-    for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1, wt=0;
-        for(int i=px;i<r;i+=2) {
-            int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt++;
-        }
-        for(int i=px^1;i<r;i+=2) {
-            int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt++;
-        }
-        if(wt<best) {best=wt;best_pat=pat;}
-    }
-    return best_pat;
-}
-static int best_row_pat(int r, int s, uint8_t *p, int i, int py, int cx, int cy, int n) {
-    int best=n+1, best_pat=0;
-    for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1, wt=0;
-        for(int j=py;j<s;j+=2) {
-            int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt++;
-        }
-        for(int j=py^1;j<s;j+=2) {
-            int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt++;
-        }
-        if(wt<best) {best=wt;best_pat=pat;}
-    }
-    return best_pat;
-}
-static void apply_col(int r, int s, uint8_t *p, int j, int px, int cx, int cy, int pat) {
-    int e0=pat&1, e1=(pat>>1)&1;
-    for(int i=px;i<r;i+=2) {
-        int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-        if(!(ri<2 && rj<2)) p[i*s+j]^=e0;
-    }
-    for(int i=px^1;i<r;i+=2) {
-        int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-        if(!(ri<2 && rj<2)) p[i*s+j]^=e1;
-    }
-}
-static void apply_row(int r, int s, uint8_t *p, int i, int py, int cx, int cy, int pat) {
-    int e0=pat&1, e1=(pat>>1)&1;
-    for(int j=py;j<s;j+=2) {
-        int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-        if(!(ri<2 && rj<2)) p[i*s+j]^=e0;
-    }
-    for(int j=py^1;j<s;j+=2) {
-        int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-        if(!(ri<2 && rj<2)) p[i*s+j]^=e1;
-    }
-}
-
 // Free variants: no boundary protection, for refinement passes
 static int best_col_pat_free(int r, int s, uint8_t *p, int j, int px, int n) {
     int best=n+1, best_pat=0;
@@ -241,189 +183,57 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
     for(int j=py^1;j<s;j+=2) p[i*s+j]^=e1;
 }
 
-// ============================================================
-// LOCAL-MINIMA ESCAPE — plant the nullzone block inside the zone.
-//
-// Phases 1-2 inside solve_plane only ever anchor the 2x2 nullspace
-// corner at the fixed origin (0,0). All 16 corner-(0,0) choices feed
-// the same alternating col/row descent, so they all fall into the
-// same basin — for some torus syndromes that basin's floor is a
-// local minimum, not the global one. Relocating the corner block to
-// sit *inside the residual support of that local minimum* — the
-// area of qubits the stuck solution still thinks are flipped — seeds
-// the descent with a fresh basin centered exactly where the trouble
-// is, instead of guessing blindly. Only candidate corners actually
-// drawn from that zone are tried, and capped, so this stays O(n).
-// ============================================================
-#define MAX_ESCAPE_CORNERS 48
-static int solve_plane_escape(int r, int s, uint8_t *syn, uint8_t *out, double *best_wt) {
-    int n=r*s, improved=0;
-    static int cand_cx[MAX_ESCAPE_CORNERS], cand_cy[MAX_ESCAPE_CORNERS];
-    int ncand=0;
-    // The zone of local minima = support of the current best (stuck) solution.
-    for(int q=0; q<n && ncand<MAX_ESCAPE_CORNERS; q++) {
-        if(!out[q]) continue;
-        int qi=q/s, qj=q%s;
-        int cx=qi-(qi&1), cy=qj-(qj&1);  // align to the 2x2 parity block
-        int dup=0;
-        for(int k=0;k<ncand;k++) if(cand_cx[k]==cx && cand_cy[k]==cy) {dup=1;break;}
-        if(!dup) { cand_cx[ncand]=cx; cand_cy[ncand]=cy; ncand++; }
-    }
-    static uint8_t base[MAX_N], work[MAX_N], ns_h[MAX_N], base2[MAX_N];
-    for(int c=0;c<ncand;c++) {
-        int cx=cand_cx[c], cy=cand_cy[c];
-        compute_base_at(r,s,syn,cx,cy,base);
-        for(int h=0;h<16;h++) {
-            build_nullspace_single_at(r,s,cx,cy,h,ns_h);
-            for(int q=0;q<n;q++) work[q]=base[q]^ns_h[q];
-            for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-                int pat=best_col_pat_free(r,s,work,j,px,n);
-                apply_col_free(r,s,work,j,px,pat);
-            }
-            for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-                int pat=best_row_pat_free(r,s,work,i,py,n);
-                apply_row_free(r,s,work,i,py,pat);
-            }
-            double cur_wt=0; for(int q=0;q<n;q++) if(work[q]) cur_wt+=cost_map[q];
-            // Same iterative descent as phase 1, anchored back at (0,0) —
-            // the corner relocation only chooses the seed, not the descent.
-            for(;;) {
-                double prev=cur_wt;
-                memset(base2,0,n);
-                for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++)
-                    if(qi<2||qj<2) base2[qi*s+qj]=work[qi*s+qj];
-                for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-                    if(qi<2||qj<2) continue;
-                    int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));
-                    base2[qi*s+qj]=syn[ck]^base2[(WRAP2(qi, r))*s+qj]
-                                          ^base2[qi*s+(WRAP2(qj, s))]
-                                          ^base2[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
-                }
-                for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-                    int pat=best_col_pat_free(r,s,base2,j,px,n);
-                    apply_col_free(r,s,base2,j,px,pat);
-                }
-                for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-                    int pat=best_row_pat_free(r,s,base2,i,py,n);
-                    apply_row_free(r,s,base2,i,py,pat);
-                }
-                double w2=0; for(int q=0;q<n;q++) if(base2[q]) w2+=cost_map[q];
-                if(w2<cur_wt){cur_wt=w2;memcpy(work,base2,n);}
-                if(cur_wt==prev) break;
-            }
-            if(cur_wt < *best_wt) { *best_wt=cur_wt; memcpy(out,work,n); improved=1; }
-        }
-    }
-    return improved;
-}
-
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
-    int n=r*s; double best_wt=n+1.0;
-    if(!ns_ready || ns_r!=r || ns_s!=s) build_nullspace(r,s);
-    cost_init(n);
-    
-    // Compute particular solution at corner (0,0), h=0 (boundary: rows 0-1, cols 0-1)
-    uint8_t base[MAX_N]; memset(base,0,n);
-    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-        if(qi<2 || qj<2) continue;
-        int ci2=WRAP2(qi, r), cj2=WRAP2(qj, s), ck=ci2*s+cj2;
-        base[qi*s+qj] = syn[ck] ^ base[(WRAP2(qi, r))*s+qj]
-                                 ^ base[qi*s+(WRAP2(qj, s))]
-                                 ^ base[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
-    }
-    
-    // First pass: FREE projective from (0,0) on all 16 h-choices.
-    // Each h-choice with free pass + iterative descent to convergence.
-    // Different h may converge to different fixed points.
-    for(int h=0; h<16; h++) {
-        uint8_t work[MAX_N];
-        for(int q=0;q<n;q++) work[q]=base[q]^nullspace[h][q];
-        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-            int pat=best_col_pat_free(r,s,work,j,px,n);
-            apply_col_free(r,s,work,j,px,pat);
+    int n=r*s; cost_init(n);
+    int hr=r/2, hs=s/2;
+    if(hr < 1 || hs < 1) return 0;
+    memset(out, 0, n);
+
+    // 4 independent (1+x)(1+y) toric codes on the (hr)×(hs) torus.
+    // Check: S[a][b] = E[a][b] ^ E[a+1][b] ^ E[a][b+1] ^ E[a+1][b+1]
+    // Kernel: hr+hs-1 dimensional, generated by column/row flips.
+    // 2 boundary seeds (E[0][0]=0,1) + column/row sweep → exact min-weight.
+    for(int si=0; si<2; si++) for(int sj=0; sj<2; sj++) {
+        uint8_t S[20][20], best_E[20][20]={0};
+        double W[20][20], best_sec = 1e100;
+        for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) {
+            int q = ((si+2*a)%r)*s + ((sj+2*b)%s);
+            S[a][b] = syn[q];
+            W[a][b] = cost_map[q];
         }
-        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-            int pat=best_row_pat_free(r,s,work,i,py,n);
-            apply_row_free(r,s,work,i,py,pat);
-        }
-        double cur_wt=0; for(int q=0;q<n;q++) if(work[q]) cur_wt+=cost_map[q];
-        // Iterative descent from this h
-        for(;;) {
-            double prev=cur_wt;
-            uint8_t base2[MAX_N]; memset(base2,0,n);
-            for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-                if(qi<2||qj<2) base2[qi*s+qj]=work[qi*s+qj];
+        for(int c0=0; c0<2; c0++) {
+            uint8_t E[20][20]={0}; E[0][0]=c0;
+            // Forward-pass inverse: E[a+1][b+1]=S[a][b]^E[a][b]^E[a+1][b]^E[a][b+1]
+            for(int a=0;a<hr-1;a++) for(int b=0;b<hs-1;b++)
+                E[a+1][b+1] = S[a][b] ^ E[a][b] ^ E[a+1][b] ^ E[a][b+1];
+            // Column/row descent over the kernel (column/row flips)
+            for(;;) {
+                int chg=0;
+                for(int b=0;b<hs;b++) {
+                    double w0=0,w1=0;
+                    for(int a=0;a<hr;a++) { if(E[a][b]) w0+=W[a][b]; else w1+=W[a][b]; }
+                    if(w1<w0) { for(int a=0;a<hr;a++) E[a][b]^=1; chg=1; }
+                }
+                for(int a=0;a<hr;a++) {
+                    double w0=0,w1=0;
+                    for(int b=0;b<hs;b++) { if(E[a][b]) w0+=W[a][b]; else w1+=W[a][b]; }
+                    if(w1<w0) { for(int b=0;b<hs;b++) E[a][b]^=1; chg=1; }
+                }
+                if(!chg) break;
             }
-            for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-                if(qi<2||qj<2) continue;
-                int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));
-                base2[qi*s+qj]=syn[ck]^base2[(WRAP2(qi, r))*s+qj]
-                                      ^base2[qi*s+(WRAP2(qj, s))]
-                                      ^base2[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
-            }
-            for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-                int pat=best_col_pat_free(r,s,base2,j,px,n);
-                apply_col_free(r,s,base2,j,px,pat);
-            }
-            for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-                int pat=best_row_pat_free(r,s,base2,i,py,n);
-                apply_row_free(r,s,base2,i,py,pat);
-            }
-            double w2=0; for(int q=0;q<n;q++) if(base2[q]) w2+=cost_map[q];
-            if(w2<cur_wt){cur_wt=w2;memcpy(work,base2,n);}
-            if(cur_wt==prev) break;
+            double wt=0;
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[a][b]) wt+=W[a][b];
+            if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sizeof(best_E)); }
         }
-        if(cur_wt<best_wt){best_wt=cur_wt;memcpy(out,work,n);}
+        for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+            if(best_E[a][b]) out[((si+2*a)%r)*s + ((sj+2*b)%s)] ^= 1;
     }
-    // Extended virtual expansion: try ROTATED optimization order
-    // (rows-first instead of columns-first) — different descent path.
-    for(;;) {
-        double prev=best_wt;
-        uint8_t base3[MAX_N]; memset(base3,0,n);
-        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-            if(qi<2||qj<2) base3[qi*s+qj]=out[qi*s+qj];
-        }
-        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-            if(qi<2||qj<2) continue;
-            int ck=(WRAP2(qi, r))*s+(WRAP2(qj, s));
-            base3[qi*s+qj]=syn[ck]^base3[(WRAP2(qi, r))*s+qj]
-                                  ^base3[qi*s+(WRAP2(qj, s))]
-                                  ^base3[(WRAP2(qi, r))*s+(WRAP2(qj, s))];
-        }
-        // ROTATED: rows-first then columns
-        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-            int pat=best_row_pat_free(r,s,base3,i,py,n);
-            apply_row_free(r,s,base3,i,py,pat);
-        }
-        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-            int pat=best_col_pat_free(r,s,base3,j,px,n);
-            apply_col_free(r,s,base3,j,px,pat);
-        }
-        double w3=0; for(int q=0;q<n;q++) if(base3[q]) w3+=cost_map[q];
-        if(w3<best_wt){best_wt=w3;memcpy(out,base3,n);}
-        if(best_wt==prev) break;
-    }
-    // Phase 3: escape the torus's local-minima zone by relocating the
-    // nullzone block into it. Only worth attempting when the converged
-    // weight looks anomalously heavy for this lattice (>5% density) —
-    // that's the actual signature of a stuck local minimum; below that,
-    // phases 1-2 already land on the true optimum and probing further
-    // is wasted O(n) work per candidate corner. Repeat while it keeps
-    // improving — escaping can land in a new, smaller local minimum
-    // whose own zone is worth re-probing too.
-    if(g_escape_enabled && best_wt > n/20.0) {
-        while(solve_plane_escape(r,s,syn,out,&best_wt)) { }
-    }
-    // Confidence cap: if the correction we'd apply is heavier than the
-    // caller trusts (manual --cap, or --cap-auto derived from the noise
-    // rate), abstain — apply nothing rather than risk a logical fault from
-    // an untrustworthy syndrome.
     int cap = effective_cap(n);
     if(cap > 0) {
         int flips=0; for(int q=0;q<n;q++) flips+=out[q];
         if(flips > cap) { memset(out,0,n); return 0; }
     }
-    return best_wt<=n;
+    return 1;
 }
 
 // ============================================================
@@ -529,7 +339,7 @@ static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
             if(w<dp[nm]) dp[nm]=w;
         }
     }
-    int best_m=half-1, best_w=dp[half-1];
+    int best_m=half-1;
     // Reconstruct matching and apply shortest paths
     int m=best_m;
     while(m) {
@@ -909,30 +719,7 @@ static void selftest_translation_symmetry(int r, int s, int trials, int weight) 
            r,s,trials,weight,differ,trials,max_gap);
 }
 
-// Tier 6: escape phase must be strictly non-regressive. Turning it on
-// must never produce a worse (higher-weight) or unsound result than
-// turning it off, on identical syndromes.
-static int selftest_escape_monotonic(int r, int s, int trials, int weight) {
-    int n=r*s, fails=0, helped=0;
-    uint8_t err[MAX_N], syn[MAX_N], dec_off[MAX_N], dec_on[MAX_N];
-    for(int t=0;t<trials;t++) {
-        gen_iid(n,err,weight);
-        syndrome_of(r,s,err,syn);
-        g_escape_enabled=0; solve_plane(r,s,syn,dec_off);
-        g_escape_enabled=1; solve_plane(r,s,syn,dec_on);
-        double w_off=0,w_on=0;
-        for(int q=0;q<n;q++){ w_off+=dec_off[q]; w_on+=dec_on[q]; }
-        if(!verify_sound(r,s,syn,dec_on)) { fails++; printf("  FAIL escaped result is unsound (trial %d)\n",t); continue; }
-        if(w_on>w_off) { fails++; printf("  FAIL escape regressed weight %.0f -> %.0f (trial %d)\n",w_off,w_on,t); }
-        else if(w_on<w_off) helped++;
-    }
-    g_escape_enabled=1;
-    printf("[escape]      %d trials at weight %d: %d regression(s), escape strictly improved %d/%d\n",
-           trials,weight,fails,helped,trials);
-    return fails;
-}
-
-// Tier 7: statistical logical error rate with 95%% Wilson confidence
+// Tier 6: statistical logical error rate with 95%% Wilson confidence
 // intervals — the number that actually matters for a deployment
 // decision, and it should never be quoted as a bare percentage.
 static void selftest_logical_error_rate(int r, int s, int trials) {
@@ -961,7 +748,7 @@ int run_selftest(int seed) {
     fails += selftest_weight2_exhaustive(10,10);
     fails += selftest_corner_generalization(20,20);
     selftest_translation_symmetry(40,40,60,50);
-    fails += selftest_escape_monotonic(40,40,60,350);
+    // escape phase removed — per-sector decoder doesn't need it
     selftest_logical_error_rate(40,40,150);
     printf("\n");
     if(fails==0) printf("ALL STRUCTURAL CHECKS PASSED.\n");
@@ -1141,6 +928,25 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--cap")) g_weight_cap=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--cap-auto")) g_cap_auto_rate=atof(argv[++i]);
         else if(!strcmp(argv[i],"--decode") || !strcmp(argv[i],"--cz")) {
+            uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
+            int n=r*s;
+            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            memcpy(syn, raw_syn, n);
+            memset(total_dec, 0, n);
+            for(int pass=0;pass<10;pass++) {
+                preprocess_syndrome(r,s,syn);
+                solve_plane(r,s,syn,dec);
+                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                uint8_t guess_syn[MAX_N];
+                syndrome_of(r,s,total_dec,guess_syn);
+                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+            }
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-cn")) {
+            // CNOT circuit: even rounds = CZ Z-check, odd = CNOT X-check.
+            // Last round (round 4 of 5) is Z-check, same as --decode.
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }

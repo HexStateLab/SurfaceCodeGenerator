@@ -1123,6 +1123,130 @@ static void run_scaling(int trials) {
     printf("(measurement-dominated / basis-mismatched, e.g. CNOT), which this i.i.d. sweep doesn't model.\n");
 }
 
+// ============================================================
+// SPACETIME CNOT DECODER — GF(2) nullspace over time.
+//
+// Lifts the 2D recurrence to 3D:
+//   (1+x²)(1+y²)(1+t) q = c
+//
+// i.e.  c(i,j,t) = q(i,j,t) ⊕ q(i-2,j,t) ⊕ q(i,j-2,t)
+//                  ⊕ q(i-2,j-2,t) ⊕ q(i,j,t-1)
+//
+// Boundary (free variables): {i<2} ∪ {j<2} ∪ {t=0}.
+// Particular solution: set boundary = 0, propagate via recurrence.
+// Nullspace search: greedily flip boundary bits to minimize
+//   cost = |q| + gl·|H_gate q| + ml·|H_time q|
+//
+// H_time: q(i,j,t) ⊕ q(i,j,t+1) = 0  (temporal persistence)
+// H_gate: all 4 qubits in each stabilizer check block are equal
+//         at each time slice (CNOT ancilla→data propagation)
+//
+// Stdin format: [T as uint32] [T·N syndrome bytes] [T·N double probs]
+// Requires r,s even and T≥2.
+// ============================================================
+#define ST_TMAX 8
+#define ST_NMAX 500
+#define ST_VMAX (ST_TMAX * ST_NMAX)
+
+static void st_recur_fill(int r, int s, int T,
+                          uint8_t *boundary, uint8_t *syn, uint8_t *q) {
+    int N = r*s, V = T*N;
+    memcpy(q, boundary, V);
+    for(int t=0; t<T; t++) {
+        int toff = t*N;
+        int tm1 = (t-1)*N;
+        for(int i=2; i<r; i++) {
+            int row_m2 = (i-2)*s;
+            int row_i  = i*s;
+            for(int j=2; j<s; j++) {
+                if(t==0) continue;
+                int idx = toff + row_i + j;
+                q[idx] = syn[idx]
+                       ^ q[toff + row_m2 + j]
+                       ^ q[toff + row_i + (j-2)]
+                       ^ q[toff + row_m2 + (j-2)]
+                       ^ q[tm1 + row_i + j];
+            }
+        }
+    }
+}
+
+static double st_cost(int r, int s, int T, uint8_t *q,
+                      double gl, double ml) {
+    int N = r*s, V = T*N;
+    double c = 0;
+    for(int v=0; v<V; v++) if(q[v]) c += 1.0;
+    for(int t=0; t<T-1; t++) {
+        int toff = t*N, t1off = (t+1)*N;
+        // Temporal violations: qubit changes between rounds
+        for(int i=0; i<N; i++)
+            if(q[toff+i] ^ q[t1off+i]) c += ml;
+        // Gate violations: Z-check block consistency
+        for(int i=0; i<r; i+=2) {
+            for(int j=0; j<s; j+=2) {
+                int b0 = q[t1off + i*s + j];
+                int b1 = q[t1off + ((i+2)%r)*s + j];
+                int b2 = q[t1off + i*s + ((j+2)%s)];
+                int b3 = q[t1off + ((i+2)%r)*s + ((j+2)%s)];
+                int s4 = b0+b1+b2+b3;
+                if(s4 > 0 && s4 < 4) c += gl;
+            }
+        }
+        // X-check block consistency (even-even parity)
+        for(int i=2; i<r; i+=2) {
+            for(int j=2; j<s; j+=2) {
+                int b0 = q[t1off + ((i-2)%r)*s + ((j-2)%s)];
+                int b1 = q[t1off + ((i-2)%r)*s + j];
+                int b2 = q[t1off + i*s + ((j-2)%s)];
+                int b3 = q[t1off + i*s + j];
+                int s4 = b0+b1+b2+b3;
+                if(s4 > 0 && s4 < 4) c += gl;
+            }
+        }
+    }
+    return c;
+}
+
+static void st_optimize(int r, int s, int T, uint8_t *syn,
+                        double gl, double ml, uint8_t *q) {
+    int N = r*s, V = T*N;
+    double best = st_cost(r, s, T, q, gl, ml);
+    uint8_t trial[ST_VMAX];
+    int changed = 1;
+    while(changed) {
+        changed = 0;
+        for(int t=0; t<T && !changed; t++) {
+            for(int i=0; i<r && !changed; i++) {
+                for(int j=0; j<s && !changed; j++) {
+                    int is_b = (i<2 || j<2 || t==0);
+                    if(!is_b) continue;
+                    memcpy(trial, q, V);
+                    trial[t*N + i*s + j] ^= 1;
+                    st_recur_fill(r, s, T, trial, syn, trial);
+                    double cost = st_cost(r, s, T, trial, gl, ml);
+                    if(cost < best) {
+                        best = cost; memcpy(q, trial, V); changed = 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static int solve_spacetime(int r, int s, int T, uint8_t *syn,
+                            double gl, double ml, uint8_t *dec) {
+    int V = T * r * s;
+    if(V > ST_VMAX || r*s > ST_NMAX || T > ST_TMAX) {
+        fprintf(stderr, "spacetime: V=%d > %d\n", V, ST_VMAX);
+        return 0;
+    }
+    uint8_t boundary[ST_VMAX];
+    memset(boundary, 0, V);
+    st_recur_fill(r, s, T, boundary, syn, dec);
+    st_optimize(r, s, T, syn, gl, ml, dec);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
     g_fast=0;
@@ -1246,6 +1370,24 @@ int main(int argc, char **argv) {
             for(int q=0;q<n;q++){ int qi=q/s, qj=q%s; syn_shift[q]=syn_raw[((qi+2)%r)*s+((qj+2)%s)]; }
             solve_plane(r,s,syn_shift,dec);
             fwrite(dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-cnot")) {
+            // Spacetime CNOT decoder: (1+x²)(1+y²)(1+t)(1+G) q = s
+            // Stdin: [T : uint32] [T·N syndrome bytes] [T·N double probs]
+            // Output: [T·N correction bytes]
+            int n=r*s;
+            uint32_t T;
+            if(fread(&T,4,1,stdin)!=1 || T<2 || T>ST_TMAX) { fprintf(stderr,"bad T\n"); return 1; }
+            int V = (int)T * n;
+            if(V > ST_VMAX) { fprintf(stderr,"V=%d > ST_VMAX=%d\n", V, ST_VMAX); return 1; }
+            static uint8_t syn[ST_VMAX];
+            static double perr[ST_VMAX];
+            if(fread(syn,1,V,stdin)!=(size_t)V) { fprintf(stderr,"short syn\n"); return 1; }
+            if(fread(perr,sizeof(double),V,stdin)!=(size_t)V) { fprintf(stderr,"short probs\n"); return 1; }
+            static uint8_t dec[ST_VMAX];
+            solve_spacetime(r, s, (int)T, syn, 1.0, 1.0, dec);
+            fwrite(dec,1,V,stdout); fflush(stdout);
             return 0;
         }
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}

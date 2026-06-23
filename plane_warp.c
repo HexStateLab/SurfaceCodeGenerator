@@ -29,7 +29,25 @@ int g_escape_enabled = 1;
 
 // ---- Soft-decision cost: cost[q] = -ln(P(error at q)). Uniform = Hamming weight.
 static double cost_map[MAX_N];
-static void cost_init(int n) { for(int q=0;q<n;q++) cost_map[q]=1.0; }
+static int    g_use_cost_model = 0;        // when set, cost_init loads the model below
+static double g_cost_model[MAX_N];
+static void cost_init(int n) {
+    if(g_use_cost_model) for(int q=0;q<n;q++) cost_map[q]=g_cost_model[q];
+    else                 for(int q=0;q<n;q++) cost_map[q]=1.0;
+}
+// Load a per-qubit error model. The ML weight of placing a flip on qubit q
+// is log((1-p_q)/p_q): a high-error qubit gets a LOW cost, so the decoder
+// prefers to explain the syndrome through it. With a uniform p this reduces
+// exactly to Hamming weight, so default behaviour is unchanged.
+static void cost_set_from_probs(int n, const double *perr) {
+    for(int q=0;q<n;q++) {
+        double p=perr[q];
+        if(p<1e-9) p=1e-9; else if(p>0.49) p=0.49;
+        g_cost_model[q]=log((1.0-p)/p);
+    }
+    g_use_cost_model=1;
+}
+static void cost_clear_model(void){ g_use_cost_model=0; }
 void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
     int n=r*s, sx=0, sy=0, count=0;
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
@@ -130,32 +148,32 @@ static void build_nullspace_single_at(int r, int s, int cx, int cy, int h, uint8
 // ---- Helpers: optimal 4-pattern per column/row (boundary-relative) ----
 // Boundary is the 2x2 block at (cx,cy). Protect those qubits.
 static int best_col_pat(int r, int s, uint8_t *p, int j, int px, int cx, int cy, int n) {
-    int best=n+1, best_pat=0;
+    (void)n; double best=1e18; int best_pat=0;
     for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1, wt=0;
+        int e0=pat&1, e1=(pat>>1)&1; double wt=0;
         for(int i=px;i<r;i+=2) {
             int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt++;
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt+=cost_map[i*s+j];
         }
         for(int i=px^1;i<r;i+=2) {
             int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt++;
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt+=cost_map[i*s+j];
         }
         if(wt<best) {best=wt;best_pat=pat;}
     }
     return best_pat;
 }
 static int best_row_pat(int r, int s, uint8_t *p, int i, int py, int cx, int cy, int n) {
-    int best=n+1, best_pat=0;
+    (void)n; double best=1e18; int best_pat=0;
     for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1, wt=0;
+        int e0=pat&1, e1=(pat>>1)&1; double wt=0;
         for(int j=py;j<s;j+=2) {
             int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt++;
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt+=cost_map[i*s+j];
         }
         for(int j=py^1;j<s;j+=2) {
             int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt++;
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt+=cost_map[i*s+j];
         }
         if(wt<best) {best=wt;best_pat=pat;}
     }
@@ -186,21 +204,21 @@ static void apply_row(int r, int s, uint8_t *p, int i, int py, int cx, int cy, i
 
 // Free variants: no boundary protection, for refinement passes
 static int best_col_pat_free(int r, int s, uint8_t *p, int j, int px, int n) {
-    int best=n+1, best_pat=0;
+    (void)n; double best=1e18; int best_pat=0;
     for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1, wt=0;
-        for(int i=px;i<r;i+=2) if(p[i*s+j]^e0) wt++;
-        for(int i=px^1;i<r;i+=2) if(p[i*s+j]^e1) wt++;
+        int e0=pat&1, e1=(pat>>1)&1; double wt=0;
+        for(int i=px;i<r;i+=2) if(p[i*s+j]^e0) wt+=cost_map[i*s+j];
+        for(int i=px^1;i<r;i+=2) if(p[i*s+j]^e1) wt+=cost_map[i*s+j];
         if(wt<best){best=wt;best_pat=pat;}
     }
     return best_pat;
 }
 static int best_row_pat_free(int r, int s, uint8_t *p, int i, int py, int n) {
-    int best=n+1, best_pat=0;
+    (void)n; double best=1e18; int best_pat=0;
     for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1, wt=0;
-        for(int j=py;j<s;j+=2) if(p[i*s+j]^e0) wt++;
-        for(int j=py^1;j<s;j+=2) if(p[i*s+j]^e1) wt++;
+        int e0=pat&1, e1=(pat>>1)&1; double wt=0;
+        for(int j=py;j<s;j+=2) if(p[i*s+j]^e0) wt+=cost_map[i*s+j];
+        for(int j=py^1;j<s;j+=2) if(p[i*s+j]^e1) wt+=cost_map[i*s+j];
         if(wt<best){best=wt;best_pat=pat;}
     }
     return best_pat;
@@ -1082,6 +1100,31 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--selftest")) selftest=1;
         else if(!strcmp(argv[i],"--scaling")) { scaling=1; if(i+1<argc && argv[i+1][0]!='-') scaling_trials=atoi(argv[++i]); }
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
+        else if(!strcmp(argv[i],"--decode-soft")) {
+            // Soft-decision decode: stdin = n bytes syndrome, then n float64
+            // per-qubit error probabilities (little-endian). Same iterative
+            // residual loop as --decode, but the decoder minimizes ML
+            // likelihood-weight from the model instead of Hamming weight.
+            uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
+            static double perr[MAX_N];
+            int n=r*s;
+            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read (syn)\n"); return 1; }
+            if (fread(perr,sizeof(double),n,stdin)!=(size_t)n) { fprintf(stderr,"short read (model)\n"); return 1; }
+            cost_set_from_probs(n, perr);
+            memcpy(syn, raw_syn, n);
+            memset(total_dec, 0, n);
+            for(int pass=0;pass<10;pass++) {
+                preprocess_syndrome(r,s,syn);
+                solve_plane(r,s,syn,dec);
+                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                uint8_t guess_syn[MAX_N];
+                syndrome_of(r,s,total_dec,guess_syn);
+                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+            }
+            cost_clear_model();
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
         else if(!strcmp(argv[i],"--decode")) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;

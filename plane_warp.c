@@ -1004,10 +1004,73 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
 
 
 // ---- Test ----
+// ============================================================
+// SUB-THRESHOLD SCALING LAW — quantifying logical-error suppression.
+//
+// "Driving down gate error" at the ENCODED level is governed by one
+// formula. A logical fault needs ~d/2 physical errors to line up along a
+// logical operator (a sublattice row/column, weight d = L/2 on the LxL
+// torus), so the logical error rate obeys, below threshold,
+//
+//        p_L(d) ~ A * (p / p_th)^(d/2)
+//
+// with p the physical error rate and p_th the decoder's threshold.
+// Writing  Lambda := p_th / p,  each increase of distance by 2 divides
+// the logical error by Lambda:   p_L(d) / p_L(d+2) = Lambda.   So a
+// single fit at known p recovers BOTH the suppression factor Lambda and
+// the threshold p_th = Lambda * p. Two levers fall out: raise d (each +2
+// buys a factor Lambda) or lower physical p (which raises Lambda and
+// compounds). This mode measures p_L(d) with the ACTUAL decoder across
+// code sizes and fits log(p_L) vs d to extract Lambda and p_th.
+// ============================================================
+static void run_scaling(int trials) {
+    g_fast = 1;                                   // O(n) solver for the sweep
+    int Ls[] = {8,12,16,20,24};                   // d = L/2 in {4,6,8,10,12}
+    int nL = 5;
+    double ps[] = {0.02,0.03,0.04,0.05};
+    int nP = 4;
+    static uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N];
+
+    printf("Sub-threshold scaling law — plane_warp decoder, i.i.d. data noise, %d trials/point\n", trials);
+    printf("p_L(d) = A*(p/p_th)^(d/2);   Lambda = p_th/p = suppression per +2 distance\n\n");
+    printf("    p   ");
+    for(int li=0;li<nL;li++) printf("   d=%-2d  ", Ls[li]/2);
+    printf("    Lambda   p_th(fit)\n");
+
+    for(int pi=0; pi<nP; pi++) {
+        double p = ps[pi];
+        double xs[8], ys[8]; int m=0;
+        printf("  %4.1f%% ", p*100);
+        for(int li=0; li<nL; li++) {
+            int L=Ls[li], n=L*L, d=L/2, fail=0;
+            for(int t=0;t<trials;t++) {
+                for(int q=0;q<n;q++) err[q] = ((double)rand()/RAND_MAX < p) ? 1 : 0;
+                syndrome_of(L,L,err,syn);
+                solve_plane(L,L,syn,dec);
+                if(!(verify_sound(L,L,syn,dec) && verify_correct(L,L,err,dec))) fail++;
+            }
+            double pL = (double)fail/trials;
+            printf(" %7.5f", pL);
+            if(fail>=5){ xs[m]=d; ys[m]=log(pL); m++; }   // only fit statistically meaningful cells
+        }
+        if(m>=2) {
+            double sx=0,sy=0,sxx=0,sxy=0;
+            for(int i=0;i<m;i++){ sx+=xs[i]; sy+=ys[i]; sxx+=xs[i]*xs[i]; sxy+=xs[i]*ys[i]; }
+            double b = (m*sxy - sx*sy)/(m*sxx - sx*sx);   // slope of log(p_L) vs d
+            double Lambda = exp(-2.0*b), p_th = Lambda*p;
+            printf("    %6.2f    %5.2f%%\n", Lambda, p_th*100);
+        } else {
+            printf("    (need >=2 nonzero points to fit)\n");
+        }
+    }
+    printf("\nLambda>1: below threshold (distance helps); Lambda<1: above (distance hurts).\n");
+    printf("Suppress logical error: +2 distance -> /Lambda;  lower physical p -> larger Lambda.\n");
+}
+
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
     g_fast=0;
-    int selftest=0;
+    int selftest=0, scaling=0, scaling_trials=20000;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--bench")) bench=1;
         else if(!strcmp(argv[i],"--seed")) seed=atoi(argv[++i]);
@@ -1017,6 +1080,7 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--line")) mode=2;
         else if(!strcmp(argv[i],"--fast")) g_fast=1;
         else if(!strcmp(argv[i],"--selftest")) selftest=1;
+        else if(!strcmp(argv[i],"--scaling")) { scaling=1; if(i+1<argc && argv[i+1][0]!='-') scaling_trials=atoi(argv[++i]); }
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
         else if(!strcmp(argv[i],"--decode")) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
@@ -1129,6 +1193,7 @@ int main(int argc, char **argv) {
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}
     }
     if(selftest) return run_selftest(seed);
+    if(scaling) { srand(seed); run_scaling(scaling_trials); return 0; }
     srand(seed);
     int n=r*s;
     

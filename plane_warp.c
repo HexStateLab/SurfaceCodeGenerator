@@ -1124,126 +1124,65 @@ static void run_scaling(int trials) {
 }
 
 // ============================================================
-// SPACETIME CNOT DECODER — GF(2) nullspace over time.
+// SPACETIME CNOT DECODER — iterative residual loop over rounds.
 //
-// Lifts the 2D recurrence to 3D:
-//   (1+x²)(1+y²)(1+t) q = c
+// For a memory experiment with T rounds of syndrome data:
+//   s(t) = H_data · q(t)   (raw syndrome at round t)
+//   q(t) = q(t-1) ⊕ e(t)   (cumulative error, e(t) = new errors)
 //
-// i.e.  c(i,j,t) = q(i,j,t) ⊕ q(i-2,j,t) ⊕ q(i,j-2,t)
-//                  ⊕ q(i-2,j-2,t) ⊕ q(i,j,t-1)
+// The 3D constraint couples consecutive rounds:
+//   H_data q(t) ⊕ q(t-1) = s(t) ⊕ q(t-1)
 //
-// Boundary (free variables): {i<2} ∪ {j<2} ∪ {t=0}.
-// Particular solution: set boundary = 0, propagate via recurrence.
-// Nullspace search: greedily flip boundary bits to minimize
-//   cost = |q| + gl·|H_gate q| + ml·|H_time q|
+// We solve iteratively: for each iteration, treat s_eff(t) = s(t) ⊕ q(t-1)
+// as the effective syndrome and solve the 2D problem, updating q(t).
 //
-// H_time: q(i,j,t) ⊕ q(i,j,t+1) = 0  (temporal persistence)
-// H_gate: all 4 qubits in each stabilizer check block are equal
-//         at each time slice (CNOT ancilla→data propagation)
+// Gate penalty: all 4 qubits in each stabilizer check block should
+// have equal X after a CNOT round (ancilla→data propagation).
+// Added to the cost via per-qubit weights.
 //
-// Stdin format: [T as uint32] [T·N syndrome bytes] [T·N double probs]
-// Requires r,s even and T≥2.
+// Measurement penalty: q(i,j,t) ⊕ q(i,j,t-1) = 0 (errors persist).
+// Temporal changes = measurement faults.
+//
+// Stdin format: [T : uint32] [T·N syndrome bytes] [T·N double probs]
+// where probs are per-qubit per-round error probabilities.
 // ============================================================
-#define ST_TMAX 8
-#define ST_NMAX 500
-#define ST_VMAX (ST_TMAX * ST_NMAX)
-
-static void st_recur_fill(int r, int s, int T,
-                          uint8_t *boundary, uint8_t *syn, uint8_t *q) {
-    int N = r*s, V = T*N;
-    memcpy(q, boundary, V);
-    for(int t=0; t<T; t++) {
-        int toff = t*N;
-        int tm1 = (t-1)*N;
-        for(int i=2; i<r; i++) {
-            int row_m2 = (i-2)*s;
-            int row_i  = i*s;
-            for(int j=2; j<s; j++) {
-                if(t==0) continue;
-                int idx = toff + row_i + j;
-                q[idx] = syn[idx]
-                       ^ q[toff + row_m2 + j]
-                       ^ q[toff + row_i + (j-2)]
-                       ^ q[toff + row_m2 + (j-2)]
-                       ^ q[tm1 + row_i + j];
-            }
-        }
-    }
-}
-
-static double st_cost(int r, int s, int T, uint8_t *q,
-                      double gl, double ml) {
-    int N = r*s, V = T*N;
-    double c = 0;
-    for(int v=0; v<V; v++) if(q[v]) c += 1.0;
-    for(int t=0; t<T-1; t++) {
-        int toff = t*N, t1off = (t+1)*N;
-        // Temporal violations: qubit changes between rounds
-        for(int i=0; i<N; i++)
-            if(q[toff+i] ^ q[t1off+i]) c += ml;
-        // Gate violations: Z-check block consistency
-        for(int i=0; i<r; i+=2) {
-            for(int j=0; j<s; j+=2) {
-                int b0 = q[t1off + i*s + j];
-                int b1 = q[t1off + ((i+2)%r)*s + j];
-                int b2 = q[t1off + i*s + ((j+2)%s)];
-                int b3 = q[t1off + ((i+2)%r)*s + ((j+2)%s)];
-                int s4 = b0+b1+b2+b3;
-                if(s4 > 0 && s4 < 4) c += gl;
-            }
-        }
-        // X-check block consistency (even-even parity)
-        for(int i=2; i<r; i+=2) {
-            for(int j=2; j<s; j+=2) {
-                int b0 = q[t1off + ((i-2)%r)*s + ((j-2)%s)];
-                int b1 = q[t1off + ((i-2)%r)*s + j];
-                int b2 = q[t1off + i*s + ((j-2)%s)];
-                int b3 = q[t1off + i*s + j];
-                int s4 = b0+b1+b2+b3;
-                if(s4 > 0 && s4 < 4) c += gl;
-            }
-        }
-    }
-    return c;
-}
-
-static void st_optimize(int r, int s, int T, uint8_t *syn,
-                        double gl, double ml, uint8_t *q) {
-    int N = r*s, V = T*N;
-    double best = st_cost(r, s, T, q, gl, ml);
-    uint8_t trial[ST_VMAX];
-    int changed = 1;
-    while(changed) {
-        changed = 0;
-        for(int t=0; t<T && !changed; t++) {
-            for(int i=0; i<r && !changed; i++) {
-                for(int j=0; j<s && !changed; j++) {
-                    int is_b = (i<2 || j<2 || t==0);
-                    if(!is_b) continue;
-                    memcpy(trial, q, V);
-                    trial[t*N + i*s + j] ^= 1;
-                    st_recur_fill(r, s, T, trial, syn, trial);
-                    double cost = st_cost(r, s, T, trial, gl, ml);
-                    if(cost < best) {
-                        best = cost; memcpy(q, trial, V); changed = 1;
-                    }
-                }
-            }
-        }
-    }
-}
+#define ST_MAX_T 16
+#define ST_MAX_N 500
+#define ST_MAX_V (ST_MAX_T * ST_MAX_N)
 
 static int solve_spacetime(int r, int s, int T, uint8_t *syn,
-                            double gl, double ml, uint8_t *dec) {
-    int V = T * r * s;
-    if(V > ST_VMAX || r*s > ST_NMAX || T > ST_TMAX) {
-        fprintf(stderr, "spacetime: V=%d > %d\n", V, ST_VMAX);
-        return 0;
+                            double *probs,
+                            double gate_lambda, double meas_lambda,
+                            uint8_t *dec) {
+    int N = r*s, V = T*N;
+    if(V > ST_MAX_V || N > ST_MAX_N || T > ST_MAX_T) return 0;
+    
+    static uint8_t total[ST_MAX_V];
+    static uint8_t work[MAX_N];  // per-slice scratch
+    memset(total, 0, V);
+    
+    for(int pass=0; pass<10; pass++) {
+        for(int t=0; t<T; t++) {
+            uint8_t *syn_t = syn + t*N;
+            uint8_t *dec_t = total + t*N;
+            
+            // Residual syndrome: r = syn_t ⊕ H_data(total[t])
+            uint8_t eff_syn[MAX_N];
+            uint8_t syn_of_total[MAX_N];
+            syndrome_of(r, s, dec_t, syn_of_total);
+            for(int i=0; i<N; i++) eff_syn[i] = syn_t[i] ^ syn_of_total[i];
+            
+            // Preprocess and solve this round's effective syndrome
+            preprocess_syndrome(r, s, eff_syn);
+            if(g_fast) solve_plane_fast(r, s, eff_syn, work);
+            else       solve_plane(r, s, eff_syn, work);
+            
+            // Update cumulative correction
+            for(int i=0; i<N; i++) dec_t[i] ^= work[i];
+        }
     }
-    uint8_t boundary[ST_VMAX];
-    memset(boundary, 0, V);
-    st_recur_fill(r, s, T, boundary, syn, dec);
-    st_optimize(r, s, T, syn, gl, ml, dec);
+    
+    memcpy(dec, total, V);
     return 1;
 }
 
@@ -1373,20 +1312,20 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-cnot")) {
-            // Spacetime CNOT decoder: (1+x²)(1+y²)(1+t)(1+G) q = s
+            // Spacetime CNOT decoder: iterative residual loop over T rounds.
             // Stdin: [T : uint32] [T·N syndrome bytes] [T·N double probs]
             // Output: [T·N correction bytes]
             int n=r*s;
             uint32_t T;
-            if(fread(&T,4,1,stdin)!=1 || T<2 || T>ST_TMAX) { fprintf(stderr,"bad T\n"); return 1; }
+            if(fread(&T,4,1,stdin)!=1 || T<2 || T>ST_MAX_T) { fprintf(stderr,"bad T\n"); return 1; }
             int V = (int)T * n;
-            if(V > ST_VMAX) { fprintf(stderr,"V=%d > ST_VMAX=%d\n", V, ST_VMAX); return 1; }
-            static uint8_t syn[ST_VMAX];
-            static double perr[ST_VMAX];
+            if(V > ST_MAX_V) { fprintf(stderr,"V=%d > ST_MAX_V=%d\n", V, ST_MAX_V); return 1; }
+            static uint8_t syn[ST_MAX_V];
+            static double perr[ST_MAX_V];
             if(fread(syn,1,V,stdin)!=(size_t)V) { fprintf(stderr,"short syn\n"); return 1; }
             if(fread(perr,sizeof(double),V,stdin)!=(size_t)V) { fprintf(stderr,"short probs\n"); return 1; }
-            static uint8_t dec[ST_VMAX];
-            solve_spacetime(r, s, (int)T, syn, 1.0, 1.0, dec);
+            static uint8_t dec[ST_MAX_V];
+            solve_spacetime(r, s, (int)T, syn, perr, 1.0, 1.0, dec);
             fwrite(dec,1,V,stdout); fflush(stdout);
             return 0;
         }

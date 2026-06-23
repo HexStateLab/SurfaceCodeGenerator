@@ -42,7 +42,6 @@ int g_weight_cap = 0;
 // It scales with the noise level, so you set it once from the hardware rate
 // instead of hand-tuning a flip count.
 double g_cap_auto_rate = 0.0;
-double g_st_rate = 0.0;   // >0 enables weighted spacetime decode inside --decode
 static int effective_cap(int n) {
     if(g_cap_auto_rate > 0.0) {
         double mu  = g_cap_auto_rate * n;
@@ -1124,65 +1123,6 @@ static void run_scaling(int trials) {
     printf("(measurement-dominated / basis-mismatched, e.g. CNOT), which this i.i.d. sweep doesn't model.\n");
 }
 
-/* ===== Structural spacetime decode (plane idiom, no matrix, no DEM) =====
-   Lifts solve_plane's spatial recurrence to the 3D torus x time. Two error
-   classes, both structural:
-     data error  -> a spatial defect cluster within one time slice (solve_plane's job)
-     meas fault  -> a temporal edge: it flips D(c,t) AND D(c,t+1) on the same check
-   Detectors D(c,t), t=0..T: consecutive ancilla differences; the final layer t=T is
-   the (clean) data-derived check parity vs the last ancilla round.
-
-   Forward temporal recurrence with a measurement-fault carry: at each slice a defect
-   that has a partner on the next slice of the same check is deferred as a measurement
-   fault (carried to cancel its partner) rather than paid for as data. The residual
-   per-slice syndrome is solved spatially by solve_plane (torus-correct, cost-weighted),
-   and the per-slice data corrections accumulate into the running data correction. The
-   final clean layer pins the logical class. On a clean-readout circuit the temporal
-   telescope makes this reduce to single-frame; its value is the noisy-readout regime,
-   where there is no clean final syndrome and the carry is what removes measurement
-   faults round by round. Costs: g_st_rate sets the data/measurement weight balance used
-   when deciding whether a temporal pair is cheaper deferred (meas) than paid as data. */
-static void decode_spacetime(int r,int s){
-    int N=r*s;
-    uint32_t T32=0,NS32=0;
-    if(fread(&T32,4,1,stdin)!=1||fread(&NS32,4,1,stdin)!=1){fprintf(stderr,"st: short read header\n");exit(1);}
-    int T=(int)T32, nShots=(int)NS32;
-    size_t ancB=(size_t)T*N;
-    uint8_t *anc=malloc(ancB), *dsyn=malloc(N);
-    uint8_t *D=malloc((size_t)(T+1)*N);                 /* detectors D(c,t) */
-    uint8_t carry[MAX_N], newcarry[MAX_N], eff[MAX_N], sigma[MAX_N], dec[MAX_N], total[MAX_N];
-    for(int sh=0; sh<nShots; sh++){
-        if(fread(anc,1,ancB,stdin)!=ancB||fread(dsyn,1,N,stdin)!=(size_t)N){fprintf(stderr,"st: short read shot\n");exit(1);}
-        for(int c=0;c<N;c++)               D[c]=anc[c]&1;                       /* D(c,0)=anc(c,0) */
-        for(int t=1;t<T;t++) for(int c=0;c<N;c++) D[t*N+c]=(anc[t*N+c]^anc[(t-1)*N+c])&1;
-        for(int c=0;c<N;c++)               D[T*N+c]=(dsyn[c]^anc[(T-1)*N+c])&1; /* final clean layer */
-
-        memset(carry,0,N); memset(total,0,N);
-        for(int t=0;t<=T;t++){
-            for(int c=0;c<N;c++) eff[c]=D[t*N+c]^carry[c];
-            if(t<T){
-                /* temporal edge: defer a defect that re-appears next round on the same
-                   check (the measurement-fault signature), so it cancels at t+1 */
-                for(int c=0;c<N;c++){
-                    newcarry[c] = (eff[c] && D[(t+1)*N+c]) ? 1 : 0;
-                    sigma[c]    = eff[c] ^ newcarry[c];
-                }
-                preprocess_syndrome(r,s,sigma);
-                solve_plane(r,s,sigma,dec);
-                for(int q=0;q<N;q++) total[q]^=dec[q];
-                memcpy(carry,newcarry,N);
-            } else {
-                preprocess_syndrome(r,s,eff);
-                solve_plane(r,s,eff,dec);
-                for(int q=0;q<N;q++) total[q]^=dec[q];
-            }
-        }
-        fwrite(total,1,N,stdout);
-    }
-    fflush(stdout);
-    free(anc);free(dsyn);free(D);
-}
-
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
     g_fast=0;
@@ -1200,9 +1140,7 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
         else if(!strcmp(argv[i],"--cap")) g_weight_cap=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--cap-auto")) g_cap_auto_rate=atof(argv[++i]);
-        else if(!strcmp(argv[i],"--st")) g_st_rate=atof(argv[++i]);
         else if(!strcmp(argv[i],"--decode") || !strcmp(argv[i],"--cz")) {
-            if(g_st_rate > 0.0) { decode_spacetime(r,s); return 0; }   // weighted spacetime mode
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }

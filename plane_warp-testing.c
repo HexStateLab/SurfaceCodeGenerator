@@ -1360,6 +1360,10 @@ int main(int argc, char **argv) {
                 }
                 if(rnd==rounds-1) memcpy(raw_last,syn,n);
             }
+            // Fine-grid MV for forward-pass (cleaner than raw_last)
+            uint8_t mv[MAX_N];
+            for(int q=0;q<n;q++) mv[q]=(fine_votes[q]>rounds/2);
+            free(fine_votes);
             // Compute MV coarse solutions from accumulated votes
             uint8_t *Ec_arr[4]={0};
             for(int f=0;f<4;f++){
@@ -1393,8 +1397,8 @@ int main(int argc, char **argv) {
             }
             // Free accumulators
             for(int f=0;f<4;f++) free(coarse_votes[f]);
-            // 10-pass pipeline with precomputed Ec from coarse-level MV
-            memcpy(syn, raw_last, n);
+            // 10-pass pipeline with precomputed Ec and MV forward-pass
+            memcpy(syn, mv, n);
             uint8_t dec[MAX_N], total_dec[MAX_N];
             memset(total_dec, 0, n);
             for(int pass=0;pass<10;pass++){
@@ -1403,7 +1407,7 @@ int main(int argc, char **argv) {
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
                 uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);
-                for(int q=0;q<n;q++) syn[q]=raw_last[q]^guess_syn[q];
+                for(int q=0;q<n;q++) syn[q]=mv[q]^guess_syn[q];
             }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             for(int f=0;f<4;f++) free(Ec_arr[f]);

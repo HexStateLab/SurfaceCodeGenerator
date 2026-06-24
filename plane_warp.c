@@ -196,7 +196,7 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
     // Check if any face will be active before allocating
     { int any_face=0;
-      for(int f=0;f<4;f++){int hrc=hr/2,hsc=hs/2;if(hrc>=2&&hsc>=2)any_face=1;}
+      for(int f=0;f<4;f++){int hrc=hr/2,hsc=hs/2;if(hrc>=1&&hsc>=1)any_face=1;}
       if(!any_face){solve_plane(r,s,syn,out);return;} }
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
@@ -206,7 +206,7 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     uint8_t *Ec_heap[4]={0}; // malloc'd per face
     for(int f=0;f<4;f++){
         hrc[f]=hr/2; hsc[f]=hs/2;
-        if(hrc[f]<2||hsc[f]<2) continue;
+        if(hrc[f]<1||hsc[f]<1) continue;
         uint8_t Sf[MAX_N]; // shifted syndrome
         for(int i=0;i<r;i++)for(int j=0;j<s;j++)
             Sf[i*s+j]=syn[((i+dx[f])%r)*s+((j+dy[f])%s)];

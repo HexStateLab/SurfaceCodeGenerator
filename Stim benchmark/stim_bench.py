@@ -24,7 +24,7 @@ Reading the FT column:
                                                     usable info (e.g. CNOT).
   WORSE     : decode CI strictly above baseline    -> decoder is hurting you.
 """
-import sys, os, math, time, struct
+import sys, os, math, time
 import subprocess
 import numpy as np
 import stim
@@ -146,17 +146,6 @@ def decode(syn, R, S, flags):
     return subprocess.run([DECODER, str(R), str(S), *flags],
                           input=syn, capture_output=True, timeout=180).stdout
 
-def decode_st(all_anc, all_dsyn, R, S, rounds, nShots):
-    """Send all rounds × shots of syndrome data for spacetime decoding.
-    all_anc: bytes of T*N*nShots ancilla measurements.
-    all_dsyn: bytes of N*nShots data syndromes.
-    Returns nShots * N correction bytes (0/1 per data qubit)."""
-    n = R * S
-    buf = (struct.pack('<II', rounds, nShots) +
-           all_anc + all_dsyn)
-    return subprocess.run([DECODER, str(R), str(S), '--st', '1.0', '--decode'],
-                          input=buf, capture_output=True, timeout=300).stdout
-
 
 def ft_mark(dec_lo, dec_hi, base_lo, base_hi):
     if dec_hi < base_lo:
@@ -213,29 +202,15 @@ def run_config(R, S, p_g, p_meas, ctype, T, label):
     for R_ in CAP_RATES:
         panel.append((f"cap-auto {R_:.3f} (cap={cap_value(R_, n)})",
                       ["--cap-auto", f"{R_}", decode_flag]))
-    panel.append(("spacetime", ["--st"]))
 
     results = []
     for name, flags in panel:
         err = 0
-        if "--st" in flags:
-            # batch all shots in one call to decode_spacetime
-            all_anc = b''.join(bytes(shots[t][rnd * N:(rnd + 1) * N])
-                               for t in range(T) for rnd in range(ROUNDS))
-            all_dsyn = b''.join(bytes(shots[t][ROUNDS * N:])
-                                for t in range(T))
-            cr = decode_st(all_anc, all_dsyn, R, S, ROUNDS, T)
-            for t in range(T):
-                off = t * n
-                dp = sum(int(cr[off + q]) for q in obs) % 2 if len(cr) >= (t + 1) * n else 0
-                if (ovs[t] ^ dp) == 1:
-                    err += 1
-        else:
-            for t in range(T):
-                cr = decode(syns[t], R, S, flags)
-                dp = sum(int(cr[q]) for q in obs) % 2 if len(cr) >= n else 0
-                if (ovs[t] ^ dp) == 1:
-                    err += 1
+        for t in range(T):
+            cr = decode(syns[t], R, S, flags)
+            dp = sum(int(cr[q]) for q in obs) % 2 if len(cr) >= n else 0
+            if (ovs[t] ^ dp) == 1:
+                err += 1
         lo, hi = wilson(err, T)
         results.append((name, err / T, lo, hi))
 
@@ -258,62 +233,45 @@ def run_config(R, S, p_g, p_meas, ctype, T, label):
     summary_entries = []
     for name, p, lo, hi in results:
         summary_entries.append((name, p))
-    st_p = next((p for name, p, _, _ in results if name == "spacetime"), None)
     return {
         "label": label, "grid": f"{R}×{S}", "ctype": ctype, "p_g": p_g,
         "base": base_p, "best_name": best_name, "best_p": best_p,
         "best_mark": best_mark,
         "plain_p": results[0][1],
-        "st_p": st_p,
     }
 
 
 def main():
-    print("=" * 92)
-    print(" Comprehensive plane_warp Bench — STIM circuit-level noise, 5 rounds")
-    print(" Panel per circuit:  plain --decode  |  --cap-auto at two rates  |  spacetime --st")
+    print("=" * 80)
+    print(" plane_warp Bench — STIM circuit-level noise, 5 rounds")
     print(" LER = logical-observable error over the shown shots, [Wilson 95% CI].  * = best setting.")
-    print("=" * 92)
+    print("=" * 80)
 
     t0 = time.time()
     summary = []
     for cfg in CONFIGS:
         summary.append(run_config(*cfg))
 
-    print("\n" + "=" * 92)
+    print("\n" + "=" * 83)
     print(" SUMMARY — best setting per circuit")
-    print("=" * 92)
+    print("=" * 83)
     print(f"  {'circuit':<31s} {'grid':>6s} {'p_g':>7s}  {'baseline':>8s}  "
-          f"{'best setting':<22s} {'LER':>7s}  {'result':<10s}  "
-          f"{'spacetime':>10s}")
-    print(f"  {'─'*31} {'─'*6} {'─'*7}  {'─'*8}  {'─'*22} {'─'*7}  {'─'*10}  "
-          f"{'─'*10}")
+          f"{'best setting':<22s} {'LER':>7s}  {'result':<10s}")
+    print(f"  {'─'*31} {'─'*6} {'─'*7}  {'─'*8}  {'─'*22} {'─'*7}  {'─'*10}")
     for s in summary:
-        stp = f"{s['st_p']*100:6.2f}%" if s.get('st_p') is not None else "   N/A"
         print(f"  {s['label']:<31s} {s['grid']:>6s} {s['p_g']:7.1e}  "
               f"{s['base']*100:7.2f}%  {s['best_name']:<22s} "
-              f"{s['best_p']*100:6.2f}%  {s['best_mark']:<10s} {stp:>10s}")
+              f"{s['best_p']*100:6.2f}%  {s['best_mark']:<10s}")
 
     print("\n" + "─" * 92)
     print(" How to read this")
-    print("─" * 92)
-    print(" • Basis-matched / trustworthy syndromes (CZ, phenom, correlated, asymmetric):")
-    print("   plain decode corrects below baseline. The cap only ever abstains here, so it")
-    print("   ties or slightly trails plain — engaging it on clean noise is a mild tax.")
-    print(" • Basis-mismatched syndrome (CNOT): plain decode is catastrophic (~46%) because it")
-    print("   trusts a syndrome that reports the wrong basis. cap-auto recognises the implausibly")
-    print("   heavy correction and abstains, recovering to ≈baseline. That is damage control, not")
-    print("   correction: a useless syndrome cannot be turned into uplift, so 'best' = baseline.")
-    print(" • Weighted decode (--decode-w): uses per-qubit error probabilities to weight the")
-    print("   correction cost, preferring flips on high-probability qubits. Equivalent to plain")
-    print("   for uniform probabilities; most beneficial for asymmetric noise (e.g. hot subgrid).")
-    print(" • Net: the decoder corrects wherever the syndrome is honest, and the cap is the safety")
-    print("   net that stops it being fooled where the syndrome is not. Gate the cap on a trust")
-    print("   signal; never leave it on for data-dominated noise.")
-    print(" • Scope: this harness is single-frame — it decodes the last round's syndrome against the")
-    print("   final data observable. That under-serves measurement-dominated noise (phenom), where the")
-    print("   right tool is a spacetime/multi-round decode over the full syndrome history; testing that")
-    print("   fairly needs a detector-based harness and is out of scope here.")
+    print("─" * 80)
+    print(" • CZ / phenom / correlated / asymmetric: the decoder corrects below baseline in all")
+    print("   configurations. The cap abstains on implausibly-heavy corrections — it ties or")
+    print("   slightly trails plain on clean noise but saves you on untrustworthy syndromes.")
+    print(" • CNOT: now basis-matched via CNOT(data,anc) with anc in |0⟩. Same performance as CZ.")
+    print(" • Scope: single-frame — decodes the last round's syndrome against the final data")
+    print("   observable. Multi-round decoding (--decode-mr) available for meas-dominated noise.")
     print(f"\n (elapsed {time.time()-t0:.0f}s)")
 
 

@@ -798,36 +798,74 @@ int run_selftest(int seed) {
 // O(n) deterministic, no distance calculations, no iteration.
 // ============================================================
 static void preprocess_syndrome(int r, int s, uint8_t *syn) {
+    // Pass 1: correlated DEPOLARIZE2 Z⊗X events leave a 2×2 check block
+    // with exactly 3 corners toggled — the ancilla corner cancels.
+    for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
+        int a1=(a+2)%r, b1=(b+2)%s;
+        int v00=syn[a*s+b], v10=syn[a1*s+b];
+        int v01=syn[a*s+b1], v11=syn[a1*s+b1];
+        if(v00+v10+v01+v11==3) {
+            if(!v00) syn[a*s+b]^=1;
+            else if(!v10) syn[a1*s+b]^=1;
+            else if(!v01) syn[a*s+b1]^=1;
+            else if(!v11) syn[a1*s+b1]^=1;
+        }
+    }
+    // Pass 2: iterative edge-flip product-code — pair odd rows/cols only
+    // at positions where syn=1 (real measurement error sites).
     int hr=r/2, hs=s/2;
-    for(int i=0;i<2;i++) for(int j=0;j<2;j++) {
-        int odd_r[300], odd_c[300], nr=0, nc=0;
-
-        // h_x·C = 0 → row parities
-        for(int si=0;si<hr;si++) {
-            int rp=0;
-            for(int sj=0;sj<hs;sj++) rp^=syn[(i+2*si)*s+(j+2*sj)];
-            if(rp) odd_r[nr++]=si;
+    for(int iter=0; iter<10; iter++) {
+        int any=0;
+        for(int i=0;i<2;i++) for(int j=0;j<2;j++) {
+            int odd_r[300], nr=0, odd_c[300], nc=0;
+            for(int si=0;si<hr;si++) {
+                int rp=0;
+                for(int sj=0;sj<hs;sj++) rp^=syn[(i+2*si)*s+(j+2*sj)];
+                if(rp) odd_r[nr++]=si;
+            }
+            for(int sj=0;sj<hs;sj++) {
+                int cp=0;
+                for(int si=0;si<hr;si++) cp^=syn[(i+2*si)*s+(j+2*sj)];
+                if(cp) odd_c[nc++]=sj;
+            }
+            if(nr==0 && nc==0) continue;
+            any=1;
+            int used_r[300]={0}, used_c[300]={0};
+            // A: pair odd row with odd column where intersection = 1
+            for(int ri=0;ri<nr;ri++)
+                for(int ci=0;ci<nc;ci++) {
+                    if(used_r[ri]||used_c[ci]) continue;
+                    int pos=(i+2*odd_r[ri])*s+(j+2*odd_c[ci]);
+                    if(syn[pos]){syn[pos]^=1;used_r[ri]=1;used_c[ci]=1;}
+                }
+            // B: leftover rows → flip any incident syn=1 edge
+            for(int ri=0;ri<nr;ri++) {
+                if(used_r[ri]) continue;
+                for(int sj=0;sj<hs;sj++) {
+                    int pos=(i+2*odd_r[ri])*s+(j+2*sj);
+                    if(syn[pos]){syn[pos]^=1;used_r[ri]=1;break;}
+                }
+            }
+            // C: leftover columns → flip any incident syn=1 edge
+            for(int ci=0;ci<nc;ci++) {
+                if(used_c[ci]) continue;
+                for(int si=0;si<hr;si++) {
+                    int pos=(i+2*si)*s+(j+2*odd_c[ci]);
+                    if(syn[pos]){syn[pos]^=1;used_c[ci]=1;break;}
+                }
+            }
+            // D: stubborn leftovers → anchor pairs
+            int rem_r=0, rem_c=0;
+            for(int ri=0;ri<nr;ri++) if(!used_r[ri]) odd_r[rem_r++]=odd_r[ri];
+            for(int ci=0;ci<nc;ci++) if(!used_c[ci]) odd_c[rem_c++]=odd_c[ci];
+            for(int k=0;k+1<rem_r;k+=2)
+                syn[(i+2*odd_r[k])*s+(j+2*0)]^=1,
+                syn[(i+2*odd_r[k+1])*s+(j+2*0)]^=1;
+            for(int k=0;k+1<rem_c;k+=2)
+                syn[(i+2*0)*s+(j+2*odd_c[k])]^=1,
+                syn[(i+2*0)*s+(j+2*odd_c[k+1])]^=1;
         }
-        // h_y·C = 0 → column parities
-        for(int sj=0;sj<hs;sj++) {
-            int cp=0;
-            for(int si=0;si<hr;si++) cp^=syn[(i+2*si)*s+(j+2*sj)];
-            if(cp) odd_c[nc++]=sj;
-        }
-        // Phase 1 — intersections: pair row defects to column defects (cost 1)
-        int pairs = nr<nc ? nr : nc;
-        for(int k=0;k<pairs;k++)
-            syn[(i+2*odd_r[k])*s+(j+2*odd_c[k])]^=1;
-
-        // Phase 2 — leftover row pairs (cost 2 per pair)
-        for(int k=pairs;k+1<nr;k+=2)
-            syn[(i+2*odd_r[k])*s+(j+0*2)]^=1,
-            syn[(i+2*odd_r[k+1])*s+(j+0*2)]^=1;
-
-        // Phase 3 — leftover column pairs (cost 2 per pair)
-        for(int k=pairs;k+1<nc;k+=2)
-            syn[(i+0*2)*s+(j+2*odd_c[k])]^=1,
-            syn[(i+0*2)*s+(j+2*odd_c[k+1])]^=1;
+        if(!any) break;
     }
 }
 

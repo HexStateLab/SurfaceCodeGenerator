@@ -1255,6 +1255,23 @@ int main(int argc, char **argv) {
             fwrite(out,1,n,stdout); fflush(stdout);
             return 0;
         }
+        else if(!strcmp(argv[i],"--decode-persist")) {
+            // Multi-round: MV syndrome → solve_plane_5d with clean coarse targets
+            int n=r*s, rounds;
+            if (fread(&rounds,4,1,stdin)!=1 || rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
+            int *votes=calloc(n,sizeof(int)); if(!votes)return 1;
+            uint8_t syn[MAX_N];
+            for(int rnd=0;rnd<rounds;rnd++){
+                if(fread(syn,1,n,stdin)!=(size_t)n){free(votes);return 1;}
+                for(int q=0;q<n;q++)if(syn[q])votes[q]++;
+            }
+            uint8_t mv[MAX_N], dec[MAX_N];
+            for(int q=0;q<n;q++) mv[q]=(votes[q]>rounds/2);
+            free(votes);
+            solve_plane_5d(r,s,mv,dec);
+            fwrite(dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
         else if(!strcmp(argv[i],"--decode-mr")) {
             // Multi-round: stdin = round_count(u32) + round_count*N syndrome bytes
             // Majority vote across rounds → preprocess → decode

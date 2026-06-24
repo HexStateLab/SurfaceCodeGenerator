@@ -210,27 +210,44 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
         for(int c0=0; c0<2; c0++) {
             memset(E, 0, sz);
             E[SEC(0,0)] = c0;
-            // Forward-pass inverse: E[a+1][b+1]=S[a][b]^E[a][b]^E[a+1][b]^E[a][b+1]
             for(int a=0;a<hr-1;a++) for(int b=0;b<hs-1;b++)
                 E[SEC(a+1,b+1)] = S[SEC(a,b)] ^ E[SEC(a,b)] ^ E[SEC(a+1,b)] ^ E[SEC(a,b+1)];
-            // Column/row descent over the kernel (column/row flips)
-            for(;;) {
-                int chg=0;
-                for(int b=0;b<hs;b++) {
-                    double w0=0,w1=0;
-                    for(int a=0;a<hr;a++) { if(E[SEC(a,b)]) w0+=W[SEC(a,b)]; else w1+=W[SEC(a,b)]; }
-                    if(w1<w0) { for(int a=0;a<hr;a++) E[SEC(a,b)]^=1; chg=1; }
-                }
-                for(int a=0;a<hr;a++) {
-                    double w0=0,w1=0;
-                    for(int b=0;b<hs;b++) { if(E[SEC(a,b)]) w0+=W[SEC(a,b)]; else w1+=W[SEC(a,b)]; }
-                    if(w1<w0) { for(int b=0;b<hs;b++) E[SEC(a,b)]^=1; chg=1; }
-                }
-                if(!chg) break;
-            }
+            // Column/row descent -> local minimum. Macro avoids code dup.
+            #define SEC_RUN() do { \
+                for(;;) { \
+                    int _chg=0; \
+                    for(int _b=0;_b<hs;_b++) { \
+                        double _w0=0,_w1=0; \
+                        for(int _a=0;_a<hr;_a++){if(E[SEC(_a,_b)])_w0+=W[SEC(_a,_b)];else _w1+=W[SEC(_a,_b)];} \
+                        if(_w1<_w0){for(int _a=0;_a<hr;_a++)E[SEC(_a,_b)]^=1;_chg=1;} \
+                    } \
+                    for(int _a=0;_a<hr;_a++) { \
+                        double _w0=0,_w1=0; \
+                        for(int _b=0;_b<hs;_b++){if(E[SEC(_a,_b)])_w0+=W[SEC(_a,_b)];else _w1+=W[SEC(_a,_b)];} \
+                        if(_w1<_w0){for(int _b=0;_b<hs;_b++)E[SEC(_a,_b)]^=1;_chg=1;} \
+                    } \
+                    if(!_chg)break; \
+                } \
+            } while(0)
+            SEC_RUN();
             double wt=0;
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[SEC(a,b)]) wt+=W[SEC(a,b)];
             if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sz); }
+            // Systematic kernel restarts: try each individual row flip
+            // and column flip as a perturbation before descent.
+            for(int kk=0; kk<hr+hs; kk++) {
+                memset(E, 0, sz);
+                E[SEC(0,0)] = c0;
+                for(int a=0;a<hr-1;a++) for(int b=0;b<hs-1;b++)
+                    E[SEC(a+1,b+1)] = S[SEC(a,b)] ^ E[SEC(a,b)] ^ E[SEC(a+1,b)] ^ E[SEC(a,b+1)];
+                if(kk<hs) { for(int a=0;a<hr;a++) E[SEC(a,kk)]^=1; }
+                else      { int r=kk-hs; for(int b=0;b<hs;b++) E[SEC(r,b)]^=1; }
+                SEC_RUN();
+                wt=0;
+                for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[SEC(a,b)]) wt+=W[SEC(a,b)];
+                if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sz); }
+            }
+            #undef SEC_RUN
         }
         for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
             if(best_E[SEC(a,b)]) out[((si+2*a)%r)*s + ((sj+2*b)%s)] ^= 1;
@@ -798,8 +815,7 @@ int run_selftest(int seed) {
 // O(n) deterministic, no distance calculations, no iteration.
 // ============================================================
 static void preprocess_syndrome(int r, int s, uint8_t *syn) {
-    // Pass 1: correlated DEPOLARIZE2 Z⊗X events leave a 2×2 check block
-    // with exactly 3 corners toggled — the ancilla corner cancels.
+    // Pass 1: complete all sum=3 2×2 blocks to valid 4-bit data-error patterns
     for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
         int a1=(a+2)%r, b1=(b+2)%s;
         int v00=syn[a*s+b], v10=syn[a1*s+b];
@@ -811,7 +827,7 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
             else if(!v11) syn[a1*s+b1]^=1;
         }
     }
-    // Pass 2: iterative edge-flip product-code — pair odd rows/cols only
+    // Pass 2: iterative edge-flip — never touch data-error bits
     // at positions where syn=1 (real measurement error sites).
     int hr=r/2, hs=s/2;
     for(int iter=0; iter<10; iter++) {
@@ -831,27 +847,56 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
             if(nr==0 && nc==0) continue;
             any=1;
             int used_r[300]={0}, used_c[300]={0};
-            // A: pair odd row with odd column where intersection = 1
-            for(int ri=0;ri<nr;ri++)
-                for(int ci=0;ci<nc;ci++) {
-                    if(used_r[ri]||used_c[ci]) continue;
-                    int pos=(i+2*odd_r[ri])*s+(j+2*odd_c[ci]);
-                    if(syn[pos]){syn[pos]^=1;used_r[ri]=1;used_c[ci]=1;}
+            // A: pair odd rows/cols preferring intersections where the
+            // row and column have few syn=1 neighbours (isolated meas error).
+            for(int pi=0; pi<nr+nc; pi++) {
+                int best_r=-1, best_c=-1, best_score=999999;
+                for(int ri=0;ri<nr;ri++) {
+                    if(used_r[ri]) continue;
+                    for(int ci=0;ci<nc;ci++) {
+                        if(used_c[ci]) continue;
+                        int pos=(i+2*odd_r[ri])*s+(j+2*odd_c[ci]);
+                        if(!syn[pos]) continue;
+                        // Score: count syn=1 in this row and column (fewer = more isolated)
+                        int rnz=0, cnz=0;
+                        for(int tj=0;tj<hs;tj++) if(syn[(i+2*odd_r[ri])*s+(j+2*tj)]) rnz++;
+                        for(int ti=0;ti<hr;ti++) if(syn[(i+2*ti)*s+(j+2*odd_c[ci])]) cnz++;
+                        int score=rnz*cnz;
+                        if(score<best_score){best_score=score;best_r=ri;best_c=ci;}
+                    }
                 }
-            // B: leftover rows → flip any incident syn=1 edge
+                if(best_r<0) break;
+                int pos=(i+2*odd_r[best_r])*s+(j+2*odd_c[best_c]);
+                syn[pos]^=1; used_r[best_r]=1; used_c[best_c]=1;
+            }
+            // B: leftover rows — prefer syn=1 edges on rows with fewest neighbours
             for(int ri=0;ri<nr;ri++) {
                 if(used_r[ri]) continue;
+                int best_j=-1, best_rnz=999;
                 for(int sj=0;sj<hs;sj++) {
                     int pos=(i+2*odd_r[ri])*s+(j+2*sj);
-                    if(syn[pos]){syn[pos]^=1;used_r[ri]=1;break;}
+                    if(!syn[pos]) continue;
+                    int rnz=0;
+                    for(int tj=0;tj<hs;tj++) if(syn[(i+2*odd_r[ri])*s+(j+2*tj)]) rnz++;
+                    if(rnz<best_rnz){best_rnz=rnz;best_j=sj;}
+                }
+                if(best_j>=0){
+                    syn[(i+2*odd_r[ri])*s+(j+2*best_j)]^=1; used_r[ri]=1;
                 }
             }
-            // C: leftover columns → flip any incident syn=1 edge
+            // C: leftover columns — prefer syn=1 edges on columns with fewest neighbours
             for(int ci=0;ci<nc;ci++) {
                 if(used_c[ci]) continue;
+                int best_i=-1, best_cnz=999;
                 for(int si=0;si<hr;si++) {
                     int pos=(i+2*si)*s+(j+2*odd_c[ci]);
-                    if(syn[pos]){syn[pos]^=1;used_c[ci]=1;break;}
+                    if(!syn[pos]) continue;
+                    int cnz=0;
+                    for(int ti=0;ti<hr;ti++) if(syn[(i+2*ti)*s+(j+2*odd_c[ci])]) cnz++;
+                    if(cnz<best_cnz){best_cnz=cnz;best_i=si;}
+                }
+                if(best_i>=0){
+                    syn[(i+2*best_i)*s+(j+2*odd_c[ci])]^=1; used_c[ci]=1;
                 }
             }
             // D: stubborn leftovers → anchor pairs
@@ -944,6 +989,28 @@ int decode_alg(int r, int s, uint8_t *raw, uint8_t *dec) {
         }
     }
     return 1;
+}
+
+// Filter & decode: keep only sum=3 2×2 blocks where the SE corner (v11)
+// is the missing one. This is the signature of genuine (X+Y+XY) channel
+// events — the ancilla cancels the data error's own check at the SE corner.
+// Blocks missing other corners are coincidental overlaps, not correlated.
+static void decode_alg_filtered(int r, int s, uint8_t *raw_syn, uint8_t *dec) {
+    int n=r*s; memset(dec, 0, n);
+    uint8_t filt[MAX_N]; memset(filt, 0, n);
+    for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
+        int a1=(a+2)%r, b1=(b+2)%s;
+        int v00=raw_syn[a*s+b], v10=raw_syn[a1*s+b];
+        int v01=raw_syn[a*s+b1], v11=raw_syn[a1*s+b1];
+        // Only genuine events: SE corner (v11) is the missing (cancelled) one.
+        if(v00 && v10 && v01 && !v11) {
+            filt[a*s+b]=raw_syn[a*s+b];
+            filt[a1*s+b]=raw_syn[a1*s+b];
+            filt[a*s+b1]=raw_syn[a*s+b1];
+            filt[a1*s+b1]=raw_syn[a1*s+b1];
+        }
+    }
+    decode_alg(r, s, filt, dec);
 }
 
 // ---- Test ----
@@ -1053,15 +1120,23 @@ int main(int argc, char **argv) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            memcpy(syn, raw_syn, n);
             memset(total_dec, 0, n);
-            for(int pass=0;pass<10;pass++) {
+            // Step 1: (X+Y+XY)^-1 on raw syndrome — SE-corner filter.
+            decode_alg_filtered(r, s, raw_syn, dec);
+            for(int q=0;q<n;q++) total_dec[q] ^= dec[q];
+            // Step 2: residual = raw ⊕ (syndrome_of(alg_corr) & raw).
+            // The & raw prevents the alg correction's ancilla-corner
+            // restoration from appearing as a phantom 1 in the residual
+            // (which the edge-flip would then undo).
+            uint8_t guess_syn[MAX_N];
+            syndrome_of(r, s, total_dec, guess_syn);
+            for(int q=0;q<n;q++) syn[q] = raw_syn[q] ^ (guess_syn[q] & raw_syn[q]);
+            for(int pass=0;pass<5;pass++) {
                 preprocess_syndrome(r,s,syn);
                 solve_plane(r,s,syn,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
-                uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);
-                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^(guess_syn[q]&raw_syn[q]);
             }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;

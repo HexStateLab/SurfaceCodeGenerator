@@ -1422,8 +1422,6 @@ int main(int argc, char **argv) {
             for(int f=0;f<4;f++) free(Ec_arr[f]);
             free(all_rounds);
             return 0;
-        cleanup_persist:
-            for(int f=0;f<4;f++) free(coarse_votes[f]);
         fallback_single:
             // Fallback: single-round decode if multi-round setup fails
             { uint8_t dec[MAX_N]; solve_plane(r,s,raw_last,dec);

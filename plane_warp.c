@@ -183,39 +183,31 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
     for(int j=py^1;j<s;j+=2) p[i*s+j]^=e1;
 }
 
-static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out, int rounds, uint8_t *syn_3d);
+static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 
 // Coarse-scale saddle-point via C²: solve fine (1+X)(1+Y)·E=S and
 // coarse (1+Xc)(1+Yc)·Ec=Sc where Sc=C·S at stride 2. The constraint
 // is that E aggregated over 2×2 blocks must equal Ec. This couples
 // fine qubits within blocks that the fine kernel can't constrain.
-static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out, int rounds, uint8_t *syn_3d) {
+static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
     if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
-    // Multi-round averaged syndrome for cleaner coarse targets
-    uint8_t syn_avg[MAX_N]; memset(syn_avg,0,n);
-    if(syn_3d && rounds>1){
-        int *persist=calloc(n,sizeof(int));
-        for(int t=0;t<rounds;t++)for(int q=0;q<n;q++)if(syn_3d[t*n+q])persist[q]++;
-        for(int q=0;q<n;q++) syn_avg[q]=(persist[q]>=2);
-        free(persist);
-    } else memcpy(syn_avg,syn,n);
-
+    // 4 faces: offsets (0,0),(1,0),(0,1),(1,1) on shifted syndromes
     int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
     int hrc[4], hsc[4], nfaces=0;
-    uint8_t Ec_arr[4][MAX_N];
+    static uint8_t Ec_arr[4][MAX_N];
     for(int f=0;f<4;f++){
         hrc[f]=hr/2; hsc[f]=hs/2;
         if(hrc[f]<2||hsc[f]<2) continue;
-        uint8_t Sf[MAX_N];
+        static uint8_t Sf[MAX_N]; // shifted syndrome
         for(int i=0;i<r;i++)for(int j=0;j<s;j++)
-            Sf[i*s+j]=syn_avg[((i+dx[f])%r)*s+((j+dy[f])%s)];
-        uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc[f]*hsc[f]);
+            Sf[i*s+j]=syn[((i+dx[f])%r)*s+((j+dy[f])%s)];
+        static uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc[f]*hsc[f]);
         #define FCC(a,b) ((a)*hsc[f]+(b))
         for(int a=0;a<hrc[f];a++)for(int b=0;b<hsc[f];b++){
             int acc=0;
@@ -223,7 +215,7 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out, int rounds,
                 acc^=Sf[(2*a+da)*s+(2*b+db)];
             Sc[FCC(a,b)]=acc;
         }
-        uint8_t *Ec=Ec_arr[nfaces];memset(Ec,0,(size_t)hrc[f]*hsc[f]);
+        uint8_t *Ec=Ec_arr[nfaces]; memset(Ec,0,(size_t)hrc[f]*hsc[f]);
         for(int a=0;a<hrc[f]-1;a++)for(int b=0;b<hsc[f]-1;b++)
             Ec[FCC(a+1,b+1)]=Sc[FCC(a,b)]^Ec[FCC(a,b)]^Ec[FCC(a+1,b)]^Ec[FCC(a,b+1)];
         for(;;){int chg=0;
@@ -240,13 +232,14 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out, int rounds,
     if(nfaces==0){solve_plane(r,s,syn,out);return;}
 
     for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
-        uint8_t S[MAX_N],E[MAX_N];double W[MAX_N];memset(E,0,sz);
+        static uint8_t S[MAX_N],E[MAX_N]; static double W[MAX_N]; memset(E,0,sz);
         for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
             int q=((si+2*a)%r)*s+((sj+2*b)%s);
-            S[SEC(a,b)]=syn[q];W[SEC(a,b)]=cost_map[q];
+            S[SEC(a,b)]=syn[q]; W[SEC(a,b)]=cost_map[q];
         }
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
+        // Bundle cost: |E| + Σ_f |aggregate(E) ⊕ Ec_f|
         #define BCOST(E) ({ double c=0; \
             for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
             for(int _f=0;_f<nfaces;_f++){ \
@@ -257,13 +250,20 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out, int rounds,
               } \
             } c; })
         for(;;){int chg=0;
-            for(int b=0;b<hs;b++){double c0=BCOST(E);
+            for(int b=0;b<hs;b++){
+                double c0=BCOST(E);
                 for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}else chg=1;}
-            for(int a=0;a<hr;a++){double c0=BCOST(E);
+                if(BCOST(E)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}
+                else chg=1;
+            }
+            for(int a=0;a<hr;a++){
+                double c0=BCOST(E);
                 for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}else chg=1;}
-            if(!chg)break;}
+                if(BCOST(E)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}
+                else chg=1;
+            }
+            if(!chg)break;
+        }
         #undef BCOST
         int o=0;for(int i=0;i<sz;i++)if(E[i])o++;
         if(o>sz-o)for(int i=0;i<sz;i++)E[i]^=1;
@@ -282,8 +282,8 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     // Use flat 1D arrays indexed as [a*hs + b] — supports any hr,hs ≤ MAX_R/2
     #define SEC(a,b) ((a)*hs + (b))
     int sz = hr * hs;
-    uint8_t S[MAX_N], best_E[MAX_N], E[MAX_N];
-    double W[MAX_N], best_sec = 1e100;
+    static uint8_t S[MAX_N], best_E[MAX_N], E[MAX_N];
+    static double W[MAX_N]; double best_sec = 1e100;
 
     // 4 independent (1+x)(1+y) toric codes on the (hr)×(hs) torus.
     // Check: S[a][b] = E[a][b] ^ E[a+1][b] ^ E[a][b+1] ^ E[a+1][b+1]
@@ -1126,6 +1126,25 @@ int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
     g_fast=0;
     int selftest=0, scaling=0, scaling_trials=20000;
+    // Pass 1 — resolve grid size and decoder-affecting globals up front.
+    // The action handlers below (--decode, --decode-*, --cz, ...) read stdin and
+    // return from inside the dispatch loop, so r/s and the solver flags must be
+    // final BEFORE that loop runs. Resolving them only as we walk argv meant a
+    // size given AFTER the action flag (e.g. `--decode 8 8`) was silently
+    // ignored: the decoder kept the default 40x40, read the wrong byte count
+    // from stdin (a hang on a short syndrome), and sized n wrong. We skip the
+    // value of value-taking flags so a number like the 42 in `--seed 42` is not
+    // mistaken for a positional dimension.
+    for(int i=1;i<argc;i++) {
+        if(!strcmp(argv[i],"--seed")||!strcmp(argv[i],"--weight")||
+           !strcmp(argv[i],"--trials")) { if(i+1<argc) i++; }
+        else if(!strcmp(argv[i],"--cap")) { if(i+1<argc) g_weight_cap=atoi(argv[++i]); }
+        else if(!strcmp(argv[i],"--cap-auto")) { if(i+1<argc) g_cap_auto_rate=atof(argv[++i]); }
+        else if(!strcmp(argv[i],"--scaling")) { if(i+1<argc && argv[i+1][0]!='-') i++; }
+        else if(!strcmp(argv[i],"--fast")) g_fast=1;
+        else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
+        else if(argv[i][0]!='-'){ r=atoi(argv[i]); if(i+1<argc&&argv[i+1][0]!='-') s=atoi(argv[++i]); }
+    }
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--bench")) bench=1;
         else if(!strcmp(argv[i],"--seed")) seed=atoi(argv[++i]);
@@ -1140,27 +1159,19 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--cap")) g_weight_cap=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--cap-auto")) g_cap_auto_rate=atof(argv[++i]);
         else if(!strcmp(argv[i],"--decode") || !strcmp(argv[i],"--cz")) {
-            uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
-            int n=r*s, rounds=5;
-            uint8_t *syn_3d=malloc((size_t)n*rounds);
-            if(!syn_3d) return 1;
-            if (fread(syn_3d,1,n*rounds,stdin)!=(size_t)(n*rounds)) { free(syn_3d); return 1; }
-            // Last round for the fine pipeline
-            memcpy(raw_syn, syn_3d+(rounds-1)*n, n);
+            static uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
+            int n=r*s;
+            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
             memcpy(syn, raw_syn, n);
             memset(total_dec, 0, n);
-            uint8_t guess_syn[MAX_N];
             for(int pass=0;pass<10;pass++) {
                 preprocess_syndrome(r,s,syn);
-                solve_plane_5d(r,s,syn,dec, rounds, syn_3d);
+                solve_plane_5d(r,s,syn,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                static uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);
                 for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
             }
-            free(syn_3d);
-            fwrite(total_dec,1,n,stdout); fflush(stdout);
-            return 0;
-        }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
@@ -1263,6 +1274,23 @@ int main(int argc, char **argv) {
             fwrite(out,1,n,stdout); fflush(stdout);
             return 0;
         }
+        else if(!strcmp(argv[i],"--decode-persist")) {
+            // Multi-round: MV syndrome → solve_plane_5d with clean coarse targets
+            int n=r*s, rounds;
+            if (fread(&rounds,4,1,stdin)!=1 || rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
+            int *votes=calloc(n,sizeof(int)); if(!votes)return 1;
+            uint8_t syn[MAX_N];
+            for(int rnd=0;rnd<rounds;rnd++){
+                if(fread(syn,1,n,stdin)!=(size_t)n){free(votes);return 1;}
+                for(int q=0;q<n;q++)if(syn[q])votes[q]++;
+            }
+            uint8_t mv[MAX_N], dec[MAX_N];
+            for(int q=0;q<n;q++) mv[q]=(votes[q]>rounds/2);
+            free(votes);
+            solve_plane_5d(r,s,mv,dec);
+            fwrite(dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
         else if(!strcmp(argv[i],"--decode-mr")) {
             // Multi-round: stdin = round_count(u32) + round_count*N syndrome bytes
             // Majority vote across rounds → preprocess → decode
@@ -1343,3 +1371,11 @@ int main(int argc, char **argv) {
             uint8_t diff[MAX_N];
             for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
             if(is_stabilizer(r,s,diff)) {
+                uint8_t chk[MAX_N]; syndrome_of(r,s,dec,chk);
+                if(memcmp(chk,syn,n)==0) ok++;
+            }
+        }
+        printf("Weight-%d: %d/%d (%.1f%%)\n",weight,ok,trials,100.0*ok/trials);
+    }
+    return 0;
+}

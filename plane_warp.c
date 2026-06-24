@@ -201,10 +201,9 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
-    // 4 faces: offsets (0,0),(1,0),(0,1),(1,1) on shifted syndromes
     int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
     int hrc[4], hsc[4], nfaces=0;
-    uint8_t Ec_arr[4][MAX_N];
+    uint8_t *Ec_heap[4]={0}; // malloc'd per face
     for(int f=0;f<4;f++){
         hrc[f]=hr/2; hsc[f]=hs/2;
         if(hrc[f]<2||hsc[f]<2) continue;
@@ -219,7 +218,9 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
                 acc^=Sf[(2*a+da)*s+(2*b+db)];
             Sc[FCC(a,b)]=acc;
         }
-        uint8_t *Ec=Ec_arr[nfaces]; memset(Ec,0,(size_t)hrc[f]*hsc[f]);
+        uint8_t *Ec = malloc((size_t)hrc[f]*hsc[f]);
+        if(!Ec) continue;
+        Ec_heap[nfaces]=Ec; memset(Ec,0,(size_t)hrc[f]*hsc[f]);
         for(int a=0;a<hrc[f]-1;a++)for(int b=0;b<hsc[f]-1;b++)
             Ec[FCC(a+1,b+1)]=Sc[FCC(a,b)]^Ec[FCC(a,b)]^Ec[FCC(a+1,b)]^Ec[FCC(a,b+1)];
         for(;;){int chg=0;
@@ -250,7 +251,7 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
               for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
                 int agg=E[SEC(2*_a+0,2*_b+0)]^E[SEC(2*_a+1,2*_b+0)] \
                         ^E[SEC(2*_a+0,2*_b+1)]^E[SEC(2*_a+1,2*_b+1)]; \
-                if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=2.0; \
+                if(agg!=Ec_heap[_f][_a*hsc[_f]+_b]) c+=2.0; \
               } \
             } c; })
         for(;;){int chg=0;
@@ -275,6 +276,7 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
             out[((si+2*a)%r)*s+((sj+2*b)%s)]=E[SEC(a,b)];
     }
     #undef SEC
+    for(int f=0;f<4;f++) free(Ec_heap[f]);
 }
 
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {

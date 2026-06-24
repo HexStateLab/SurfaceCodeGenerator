@@ -192,14 +192,15 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 // fine qubits within blocks that the fine kernel can't constrain.
 // Variant: use precomputed Ec from coarse-level MV (--decode-persist).
 static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
-    uint8_t *Ec_arr[4], int hrc[4], int hsc[4], int nfaces, uint8_t *out) {
+    uint8_t *Ec_arr[4], int hrc[4], int hsc[4], int nfaces,
+    uint8_t *all_rounds, int rounds, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
     if(nfaces==0){solve_plane(r,s,syn,out);return;}
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
-    int K=nfaces>0?hr/hrc[0]:2; // block size from coarse grid dims
+    int K=nfaces>0?hr/hrc[0]:2;
     for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
         uint8_t S[MAX_N],E[MAX_N]; double W[MAX_N]; memset(E,0,sz);
         for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
@@ -210,6 +211,15 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
         #define BCOST(E) ({ double c=0; \
             for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
+            /* Multi-round temporal residual: Σ_t |S_t ⊕ C·E| */ \
+            if(all_rounds) for(int _t=0;_t<rounds;_t++){ \
+              uint8_t *St=all_rounds+_t*n; \
+              for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++){ \
+                int q=((si+2*_a)%r)*s+((sj+2*_b)%s); \
+                int ce=E[SEC(_a,_b)]^E[SEC((_a+1)%hr,_b)]^E[SEC(_a,(_b+1)%hs)]^E[SEC((_a+1)%hr,(_b+1)%hs)]; \
+                if(St[q]!=ce) c+=0.5; \
+              } \
+            } \
             for(int _f=0;_f<nfaces;_f++){ \
               for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
                 int agg=0; \
@@ -1343,9 +1353,11 @@ int main(int argc, char **argv) {
             }
             int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
             int *fine_votes=calloc(n,sizeof(int));
-            if(!fine_votes) goto cleanup_persist;
+            uint8_t *all_rounds=malloc((size_t)n*rounds);
+            if(!fine_votes||!all_rounds){free(fine_votes);free(all_rounds);goto fallback_single;}
             for(int rnd=0;rnd<rounds;rnd++){
-                if(fread(syn,1,n,stdin)!=(size_t)n){free(fine_votes);goto cleanup_persist;}
+                if(fread(syn,1,n,stdin)!=(size_t)n){free(fine_votes);free(all_rounds);goto fallback_single;}
+                memcpy(all_rounds+rnd*n,syn,n);
                 for(int q=0;q<n;q++) if(syn[q]) fine_votes[q]++;
                 // Accumulate coarse votes per face from this round
                 for(int f=0;f<4;f++){
@@ -1360,9 +1372,6 @@ int main(int argc, char **argv) {
                 }
                 if(rnd==rounds-1) memcpy(raw_last,syn,n);
             }
-            // Fine-grid MV for forward-pass (cleaner than raw_last)
-            uint8_t mv[MAX_N];
-            for(int q=0;q<n;q++) mv[q]=(fine_votes[q]>rounds/2);
             free(fine_votes);
             // Compute MV coarse solutions from accumulated votes
             uint8_t *Ec_arr[4]={0};
@@ -1397,20 +1406,21 @@ int main(int argc, char **argv) {
             }
             // Free accumulators
             for(int f=0;f<4;f++) free(coarse_votes[f]);
-            // 10-pass pipeline with precomputed Ec and MV forward-pass
-            memcpy(syn, mv, n);
+            // 10-pass pipeline: coarse targets from MV, fine from last round
+            memcpy(syn, raw_last, n);
             uint8_t dec[MAX_N], total_dec[MAX_N];
             memset(total_dec, 0, n);
             for(int pass=0;pass<10;pass++){
                 preprocess_syndrome(r,s,syn);
-                solve_plane_5d_with_ec(r,s,syn,Ec_arr,hrc_arr,hsc_arr,nfaces,dec);
+                solve_plane_5d_with_ec(r,s,syn,Ec_arr,hrc_arr,hsc_arr,nfaces,all_rounds,rounds,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
                 uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);
-                for(int q=0;q<n;q++) syn[q]=mv[q]^guess_syn[q];
+                for(int q=0;q<n;q++) syn[q]=raw_last[q]^guess_syn[q];
             }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             for(int f=0;f<4;f++) free(Ec_arr[f]);
+            free(all_rounds);
             return 0;
         cleanup_persist:
             for(int f=0;f<4;f++) free(coarse_votes[f]);

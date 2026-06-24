@@ -24,7 +24,7 @@ Reading the FT column:
                                                     usable info (e.g. CNOT).
   WORSE     : decode CI strictly above baseline    -> decoder is hurting you.
 """
-import sys, os, math, time
+import sys, os, math, time, struct
 import subprocess
 import numpy as np
 import stim
@@ -61,33 +61,55 @@ def build_circuit(R, S, p_g, p_meas, ctype, rounds=5):
         return c, N
 
     for rnd in range(rounds):
-        c.append("R", range(ND, ND + NA))
-        c.append("H", range(ND, ND + NA))
         c.append("DEPOLARIZE1", list(range(ND)), p_g / 10)
-        for a in range(R):
-            for b in range(S):
-                anc = ND + a * S + b
-                qs = [(a % R) * S + (b % S), ((a + 2) % R) * S + (b % S),
-                      (a % R) * S + ((b + 2) % S), ((a + 2) % R) * S + ((b + 2) % S)]
-                if ctype == "asymmetric":
-                    sl = (a % 2) * 2 + (b % 2)
-                    pg_eff = p_g * 10 if sl == 0 else p_g
-                else:
-                    pg_eff = p_g
-                for qi, q in enumerate(qs):
-                    pz = rng.lognormal(mean=math.log(pg_eff), sigma=0.2)
-                    gate = "CZ" if ctype != "cn" else "CNOT"
-                    c.append(gate, [anc, q])
-                    c.append("DEPOLARIZE2", [anc, q], float(pz))
-                if ctype == "correlated":
-                    for qi in range(4):
-                        for qj in range(qi + 1, 4):
-                            if rng.random() < p_g * 2:
-                                c.append("DEPOLARIZE2", [qs[qi], qs[qj]], float(p_g * 0.3))
-        c.append("DEPOLARIZE1", list(range(ND, ND + NA)), p_g / 10)
-        c.append("H", range(ND, ND + NA))
-        c.append("M", range(ND, ND + NA))
-        c.append("X_ERROR", list(range(ND, ND + NA)), p_meas)
+        if ctype == "cn":
+            # CNOT-based Z-check: anc in |0⟩, CNOT(data, anc) for each qubit,
+            # then measure anc directly in Z. No Hadamards.
+            c.append("R", range(ND, ND + NA))
+            for a in range(R):
+                for b in range(S):
+                    anc = ND + a * S + b
+                    qs = [(a % R) * S + (b % S), ((a + 2) % R) * S + (b % S),
+                          (a % R) * S + ((b + 2) % S), ((a + 2) % R) * S + ((b + 2) % S)]
+                    for qi, q in enumerate(qs):
+                        pz = rng.lognormal(mean=math.log(p_g), sigma=0.2)
+                        c.append("CNOT", [q, anc])   # data=ctrl, anc=target
+                        c.append("DEPOLARIZE2", [anc, q], float(pz))
+                    if ctype == "correlated":
+                        for qi in range(4):
+                            for qj in range(qi + 1, 4):
+                                if rng.random() < p_g * 2:
+                                    c.append("DEPOLARIZE2", [qs[qi], qs[qj]], float(p_g * 0.3))
+            c.append("DEPOLARIZE1", list(range(ND, ND + NA)), p_g / 10)
+            c.append("M", range(ND, ND + NA))
+            c.append("X_ERROR", list(range(ND, ND + NA)), p_meas)
+        else:
+            # CZ-based Z-check (original): anc in |+⟩, CZ(anc, data), H, measure
+            c.append("R", range(ND, ND + NA))
+            c.append("H", range(ND, ND + NA))
+            for a in range(R):
+                for b in range(S):
+                    anc = ND + a * S + b
+                    qs = [(a % R) * S + (b % S), ((a + 2) % R) * S + (b % S),
+                          (a % R) * S + ((b + 2) % S), ((a + 2) % R) * S + ((b + 2) % S)]
+                    if ctype == "asymmetric":
+                        sl = (a % 2) * 2 + (b % 2)
+                        pg_eff = p_g * 10 if sl == 0 else p_g
+                    else:
+                        pg_eff = p_g
+                    for qi, q in enumerate(qs):
+                        pz = rng.lognormal(mean=math.log(pg_eff), sigma=0.2)
+                        c.append("CZ", [anc, q])
+                        c.append("DEPOLARIZE2", [anc, q], float(pz))
+                    if ctype == "correlated":
+                        for qi in range(4):
+                            for qj in range(qi + 1, 4):
+                                if rng.random() < p_g * 2:
+                                    c.append("DEPOLARIZE2", [qs[qi], qs[qj]], float(p_g * 0.3))
+            c.append("DEPOLARIZE1", list(range(ND, ND + NA)), p_g / 10)
+            c.append("H", range(ND, ND + NA))
+            c.append("M", range(ND, ND + NA))
+            c.append("X_ERROR", list(range(ND, ND + NA)), p_meas)
     c.append("M", range(ND))
     return c, N
 
@@ -97,9 +119,9 @@ CONFIGS = [
     (6,  6,  0.0008, 0.001, "phenom",     2000, "phenomenological (data+meas)"),
     (6,  6,  0.0005, 0.001, "correlated", 2000, "correlated-pair"),
     (6,  6,  0.0005, 0.001, "asymmetric", 1000, "asymmetric (10x hot sub)"),
-    (6,  6,  0.0005, 0.001, "cn",         1000, "CNOT-based (basis-mismatched)"),
+    (6,  6,  0.0005, 0.001, "cn",         1000, "CNOT-based (Z-check, basis-matched)"),
     (20, 20, 0.0004, 0.001, "cz",          300, "CZ-based  (basis-matched)"),
-    (20, 20, 0.0002, 0.001, "cn",          300, "CNOT-based (basis-mismatched)"),
+    (20, 20, 0.0002, 0.001, "cn",          300, "CNOT-based (Z-check, basis-matched)"),
 ]
 
 # decoder setting panel: (name, config-flags-before-action). action is --decode.
@@ -124,6 +146,17 @@ def decode(syn, R, S, flags):
     return subprocess.run([DECODER, str(R), str(S), *flags],
                           input=syn, capture_output=True, timeout=180).stdout
 
+def decode_st(all_anc, all_dsyn, R, S, rounds, nShots):
+    """Send all rounds × shots of syndrome data for spacetime decoding.
+    all_anc: bytes of T*N*nShots ancilla measurements.
+    all_dsyn: bytes of N*nShots data syndromes.
+    Returns nShots * N correction bytes (0/1 per data qubit)."""
+    n = R * S
+    buf = (struct.pack('<II', rounds, nShots) +
+           all_anc + all_dsyn)
+    return subprocess.run([DECODER, str(R), str(S), '--st', '1.0', '--decode'],
+                          input=buf, capture_output=True, timeout=300).stdout
+
 
 def ft_mark(dec_lo, dec_hi, base_lo, base_hi):
     if dec_hi < base_lo:
@@ -136,34 +169,73 @@ def ft_mark(dec_lo, dec_hi, base_lo, base_hi):
 def run_config(R, S, p_g, p_meas, ctype, T, label):
     n = R * S
     c, N = build_circuit(R, S, p_g, p_meas, ctype)
+    ROUNDS = 5
+
+    # Per-qubit marginal error probability (X error) after 5 rounds
+    # For DEPOLARIZE2: 4/15 of errors put X on the data qubit
+    p_x_per_gate = 4.0 / 15.0
+    four_gates_x = 4 * p_x_per_gate  # per round from 4 CZ/CNOT gates
+    dep1_x = 1.0 / 30.0               # DEPOLARIZE1 → X only (1/3 of p_g/10)
+    if ctype == "asymmetric":
+        probs = np.empty(n)
+        for qi in range(R):
+            for qj in range(S):
+                sl = (qi % 2) * 2 + (qj % 2)
+                pg = p_g * 10 if sl == 0 else p_g
+                p_round = p_g * dep1_x + pg * four_gates_x
+                probs[qi * S + qj] = min(1.0 - (1.0 - p_round) ** ROUNDS, 0.5)
+    elif ctype == "phenom":
+        p_round = p_g * dep1_x  # no gate errors in phenom
+        probs = np.full(n, min(1.0 - (1.0 - p_round) ** ROUNDS, 0.5))
+    else:
+        p_round = p_g * dep1_x + p_g * four_gates_x
+        probs = np.full(n, min(1.0 - (1.0 - p_round) ** ROUNDS, 0.5))
+
     shots = c.compile_sampler(seed=2024).sample(shots=T).astype(np.uint8)
     obs = list(range(0, S, 2))
 
-    # precompute per-shot syndrome bytes + baseline observable parity
+    # per-shot: last-round syndrome + data observable parity
     syns, ovs = [], []
     base_err = 0
+    syn_bytes = N  # same for all: N ancilla measurements per round
     for t in range(T):
         shot = shots[t]
-        syns.append(bytes(shot[4 * N:5 * N]))
-        ov = int(sum(int(shot[5 * N + q]) for q in obs) % 2)
+        syns.append(bytes(shot[(ROUNDS - 1) * syn_bytes:ROUNDS * syn_bytes]))
+        ov = int(sum(int(shot[ROUNDS * syn_bytes + q]) for q in obs) % 2)
         ovs.append(ov)
         base_err += ov
+
     base_p = base_err / T
     base_lo, base_hi = wilson(base_err, T)
 
-    panel = [("plain", ["--decode"])]
+    decode_flag = "--decode"
+    panel = [("plain", [decode_flag])]
     for R_ in CAP_RATES:
         panel.append((f"cap-auto {R_:.3f} (cap={cap_value(R_, n)})",
-                      ["--cap-auto", f"{R_}", "--decode"]))
+                      ["--cap-auto", f"{R_}", decode_flag]))
+    panel.append(("spacetime", ["--st"]))
 
     results = []
     for name, flags in panel:
         err = 0
-        for t in range(T):
-            cr = decode(syns[t], R, S, flags)
-            dp = sum(int(cr[q]) for q in obs) % 2 if len(cr) >= n else 0
-            if (ovs[t] ^ dp) == 1:
-                err += 1
+        if "--st" in flags:
+            # batch all shots in one call to decode_spacetime
+            all_anc = b''.join(bytes(shots[t][rnd * N:(rnd + 1) * N])
+                               for t in range(T) for rnd in range(ROUNDS))
+            all_dsyn = b''.join(bytes(shots[t][ROUNDS * N:])
+                                for t in range(T))
+            cr = decode_st(all_anc, all_dsyn, R, S, ROUNDS, T)
+            for t in range(T):
+                off = t * n
+                dp = sum(int(cr[off + q]) for q in obs) % 2 if len(cr) >= (t + 1) * n else 0
+                if (ovs[t] ^ dp) == 1:
+                    err += 1
+        else:
+            for t in range(T):
+                cr = decode(syns[t], R, S, flags)
+                dp = sum(int(cr[q]) for q in obs) % 2 if len(cr) >= n else 0
+                if (ovs[t] ^ dp) == 1:
+                    err += 1
         lo, hi = wilson(err, T)
         results.append((name, err / T, lo, hi))
 
@@ -183,18 +255,23 @@ def run_config(R, S, p_g, p_meas, ctype, T, label):
 
     best_name, best_p, best_lo, best_hi = results[best_i]
     best_mark = ft_mark(best_lo, best_hi, base_lo, base_hi)
+    summary_entries = []
+    for name, p, lo, hi in results:
+        summary_entries.append((name, p))
+    st_p = next((p for name, p, _, _ in results if name == "spacetime"), None)
     return {
         "label": label, "grid": f"{R}×{S}", "ctype": ctype, "p_g": p_g,
         "base": base_p, "best_name": best_name, "best_p": best_p,
         "best_mark": best_mark,
         "plain_p": results[0][1],
+        "st_p": st_p,
     }
 
 
 def main():
     print("=" * 92)
     print(" Comprehensive plane_warp Bench — STIM circuit-level noise, 5 rounds")
-    print(" Panel per circuit:  plain --decode   vs   --cap-auto at two calibrated rates")
+    print(" Panel per circuit:  plain --decode  |  --cap-auto at two rates  |  spacetime --st")
     print(" LER = logical-observable error over the shown shots, [Wilson 95% CI].  * = best setting.")
     print("=" * 92)
 
@@ -207,12 +284,15 @@ def main():
     print(" SUMMARY — best setting per circuit")
     print("=" * 92)
     print(f"  {'circuit':<31s} {'grid':>6s} {'p_g':>7s}  {'baseline':>8s}  "
-          f"{'best setting':<22s} {'LER':>7s}  {'result':<10s}")
-    print(f"  {'─'*31} {'─'*6} {'─'*7}  {'─'*8}  {'─'*22} {'─'*7}  {'─'*10}")
+          f"{'best setting':<22s} {'LER':>7s}  {'result':<10s}  "
+          f"{'spacetime':>10s}")
+    print(f"  {'─'*31} {'─'*6} {'─'*7}  {'─'*8}  {'─'*22} {'─'*7}  {'─'*10}  "
+          f"{'─'*10}")
     for s in summary:
+        stp = f"{s['st_p']*100:6.2f}%" if s.get('st_p') is not None else "   N/A"
         print(f"  {s['label']:<31s} {s['grid']:>6s} {s['p_g']:7.1e}  "
               f"{s['base']*100:7.2f}%  {s['best_name']:<22s} "
-              f"{s['best_p']*100:6.2f}%  {s['best_mark']:<10s}")
+              f"{s['best_p']*100:6.2f}%  {s['best_mark']:<10s} {stp:>10s}")
 
     print("\n" + "─" * 92)
     print(" How to read this")
@@ -224,6 +304,9 @@ def main():
     print("   trusts a syndrome that reports the wrong basis. cap-auto recognises the implausibly")
     print("   heavy correction and abstains, recovering to ≈baseline. That is damage control, not")
     print("   correction: a useless syndrome cannot be turned into uplift, so 'best' = baseline.")
+    print(" • Weighted decode (--decode-w): uses per-qubit error probabilities to weight the")
+    print("   correction cost, preferring flips on high-probability qubits. Equivalent to plain")
+    print("   for uniform probabilities; most beneficial for asymmetric noise (e.g. hot subgrid).")
     print(" • Net: the decoder corrects wherever the syndrome is honest, and the cap is the safety")
     print("   net that stops it being fooled where the syndrome is not. Gate the cap on a trust")
     print("   signal; never leave it on for data-dominated noise.")

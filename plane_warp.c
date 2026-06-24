@@ -194,6 +194,10 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
     if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
+    // Check if any face will be active before allocating
+    { int any_face=0;
+      for(int f=0;f<4;f++){int hrc=hr/2,hsc=hs/2;if(hrc>=2&&hsc>=2)any_face=1;}
+      if(!any_face){solve_plane(r,s,syn,out);return;} }
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
@@ -1147,7 +1151,8 @@ int main(int argc, char **argv) {
             memset(total_dec, 0, n);
             for(int pass=0;pass<10;pass++) {
                 preprocess_syndrome(r,s,syn);
-                solve_plane_5d(r,s,syn,dec);
+                if(r/2>=4 && s/2>=4) solve_plane_5d(r,s,syn,dec);
+                else solve_plane(r,s,syn,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
                 uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);

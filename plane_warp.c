@@ -183,88 +183,87 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
     for(int j=py^1;j<s;j+=2) p[i*s+j]^=e1;
 }
 
-static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
+static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out, int rounds, uint8_t *syn_3d);
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 
 // Coarse-scale saddle-point via C²: solve fine (1+X)(1+Y)·E=S and
 // coarse (1+Xc)(1+Yc)·Ec=Sc where Sc=C·S at stride 2. The constraint
 // is that E aggregated over 2×2 blocks must equal Ec. This couples
 // fine qubits within blocks that the fine kernel can't constrain.
-static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
+static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out, int rounds, uint8_t *syn_3d) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
-    if(hr<1||hs<1){memset(out,0,n);return;}
+    if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
-    // Coarse grid: half-resolution. hrc=hr/2, hsc=hs/2.
-    int hrc=hr/2, hsc=hs/2;
-    if(hrc<1||hsc<1){solve_plane(r,s,syn,out);return;} // fallback
-    
-    for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
-        uint8_t S[MAX_N],E[MAX_N],E_c[MAX_N];
-        double W[MAX_N]; memset(E,0,sz); memset(E_c,0,hrc*hsc);
-        for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
-            int q=((si+2*a)%r)*s+((sj+2*b)%s);
-            S[SEC(a,b)]=syn[q]; W[SEC(a,b)]=cost_map[q];
-        }
-        // Coarse syndrome Sc = C·S at stride 2
-        uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc*hsc);
-        for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
+    // Multi-round averaged syndrome for cleaner coarse targets
+    uint8_t syn_avg[MAX_N]; memset(syn_avg,0,n);
+    if(syn_3d && rounds>1){
+        int *persist=calloc(n,sizeof(int));
+        for(int t=0;t<rounds;t++)for(int q=0;q<n;q++)if(syn_3d[t*n+q])persist[q]++;
+        for(int q=0;q<n;q++) syn_avg[q]=(persist[q]>=2);
+        free(persist);
+    } else memcpy(syn_avg,syn,n);
+
+    int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
+    int hrc[4], hsc[4], nfaces=0;
+    uint8_t Ec_arr[4][MAX_N];
+    for(int f=0;f<4;f++){
+        hrc[f]=hr/2; hsc[f]=hs/2;
+        if(hrc[f]<2||hsc[f]<2) continue;
+        uint8_t Sf[MAX_N];
+        for(int i=0;i<r;i++)for(int j=0;j<s;j++)
+            Sf[i*s+j]=syn_avg[((i+dx[f])%r)*s+((j+dy[f])%s)];
+        uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc[f]*hsc[f]);
+        #define FCC(a,b) ((a)*hsc[f]+(b))
+        for(int a=0;a<hrc[f];a++)for(int b=0;b<hsc[f];b++){
             int acc=0;
             for(int da=0;da<=1;da++)for(int db=0;db<=1;db++)
-                acc^=S[SEC(2*a+da,2*b+db)];
-            Sc[a*hsc+b]=acc;
+                acc^=Sf[(2*a+da)*s+(2*b+db)];
+            Sc[FCC(a,b)]=acc;
         }
-        // Solve coarse problem: (1+Xc)(1+Yc)·Ec = Sc on hrc×hsc grid
-        #define SECC(a,b) ((a)*hsc+(b))
-        for(int a=0;a<hrc-1;a++)for(int b=0;b<hsc-1;b++)
-            E_c[SECC(a+1,b+1)]=Sc[SECC(a,b)]^E_c[SECC(a,b)]^E_c[SECC(a+1,b)]^E_c[SECC(a,b+1)];
-        // Coarse descent
+        uint8_t *Ec=Ec_arr[nfaces];memset(Ec,0,(size_t)hrc[f]*hsc[f]);
+        for(int a=0;a<hrc[f]-1;a++)for(int b=0;b<hsc[f]-1;b++)
+            Ec[FCC(a+1,b+1)]=Sc[FCC(a,b)]^Ec[FCC(a,b)]^Ec[FCC(a+1,b)]^Ec[FCC(a,b+1)];
         for(;;){int chg=0;
-            for(int b=0;b<hsc;b++){
-                double w0=0,w1=0;
-                for(int a=0;a<hrc;a++){
-                    if(E_c[SECC(a,b)]) w0+=1.0; else w1+=1.0;
-                }
-                if(w1<w0){for(int a=0;a<hrc;a++)E_c[SECC(a,b)]^=1;chg=1;}
-            }
-            for(int a=0;a<hrc;a++){
-                double w0=0,w1=0;
-                for(int b=0;b<hsc;b++){
-                    if(E_c[SECC(a,b)]) w0+=1.0; else w1+=1.0;
-                }
-                if(w1<w0){for(int b=0;b<hsc;b++)E_c[SECC(a,b)]^=1;chg=1;}
-            }
-            if(!chg)break;
+            for(int b=0;b<hsc[f];b++){int w0=0,w1=0;
+                for(int a=0;a<hrc[f];a++){if(Ec[FCC(a,b)])w0++;else w1++;}
+                if(w1<w0){for(int a=0;a<hrc[f];a++)Ec[FCC(a,b)]^=1;chg=1;}}
+            for(int a=0;a<hrc[f];a++){int w0=0,w1=0;
+                for(int b=0;b<hsc[f];b++){if(Ec[FCC(a,b)])w0++;else w1++;}
+                if(w1<w0){for(int b=0;b<hsc[f];b++)Ec[FCC(a,b)]^=1;chg=1;}}
+            if(!chg)break;}
+        #undef FCC
+        nfaces++;
+    }
+    if(nfaces==0){solve_plane(r,s,syn,out);return;}
+
+    for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
+        uint8_t S[MAX_N],E[MAX_N];double W[MAX_N];memset(E,0,sz);
+        for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
+            int q=((si+2*a)%r)*s+((sj+2*b)%s);
+            S[SEC(a,b)]=syn[q];W[SEC(a,b)]=cost_map[q];
         }
-        #undef SECC
-        // Fine solution from forward-pass
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
-        // Bundle cost: |E| + λ·|aggregate(E) ⊕ E_c|
-        // aggregate(E)[a][b] = XOR of E over 2×2 block at (2a,2b)
         #define BCOST(E) ({ double c=0; \
-            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++) if(E[SEC(_a,_b)]) c+=W[SEC(_a,_b)]; \
-            for(int _a=0;_a<hrc;_a++)for(int _b=0;_b<hsc;_b++){ \
-                int agg=E[SEC(2*_a,2*_b)]^E[SEC(2*_a+1,2*_b)]^E[SEC(2*_a,2*_b+1)]^E[SEC(2*_a+1,2*_b+1)]; \
-                if(agg!=E_c[_a*hsc+_b]) c+=2.0; \
+            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
+            for(int _f=0;_f<nfaces;_f++){ \
+              for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
+                int agg=E[SEC(2*_a+0,2*_b+0)]^E[SEC(2*_a+1,2*_b+0)] \
+                        ^E[SEC(2*_a+0,2*_b+1)]^E[SEC(2*_a+1,2*_b+1)]; \
+                if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=2.0; \
+              } \
             } c; })
         for(;;){int chg=0;
-            for(int b=0;b<hs;b++){
-                double c0=BCOST(E);
+            for(int b=0;b<hs;b++){double c0=BCOST(E);
                 for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}
-                else chg=1;
-            }
-            for(int a=0;a<hr;a++){
-                double c0=BCOST(E);
+                if(BCOST(E)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}else chg=1;}
+            for(int a=0;a<hr;a++){double c0=BCOST(E);
                 for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}
-                else chg=1;
-            }
-            if(!chg)break;
-        }
+                if(BCOST(E)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}else chg=1;}
+            if(!chg)break;}
         #undef BCOST
         int o=0;for(int i=0;i<sz;i++)if(E[i])o++;
         if(o>sz-o)for(int i=0;i<sz;i++)E[i]^=1;

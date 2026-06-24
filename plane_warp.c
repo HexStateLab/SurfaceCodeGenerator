@@ -215,7 +215,7 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
                 int agg=0; \
                 for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
                     agg^=E[SEC(K*_a+da,K*_b+db)]; \
-                if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=2.0; \
+                if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=8.0; \
               } \
             } c; })
         for(;;){int chg=0;
@@ -311,7 +311,7 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
               for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
                 int agg=E[SEC(2*_a+0,2*_b+0)]^E[SEC(2*_a+1,2*_b+0)] \
                         ^E[SEC(2*_a+0,2*_b+1)]^E[SEC(2*_a+1,2*_b+1)]; \
-                if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=2.0; \
+                if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=8.0; \
               } \
             } c; })
         for(;;){int chg=0;
@@ -1325,7 +1325,7 @@ int main(int argc, char **argv) {
             int n=r*s, rounds;
             if (fread(&rounds,4,1,stdin)!=1 || rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
             // Stream rounds: accumulate coarse-level votes per face
-            uint8_t syn[MAX_N], raw_last[MAX_N];
+            uint8_t syn[MAX_N], raw_last[MAX_N]; memset(syn,0,n);
             int hr=r/2, hs=s/2;
             int K=2; while(hr%K==0&&hs%K==0) K++; // first non-divisor creates boundary
             int nfaces=0, hrc_arr[4], hsc_arr[4];
@@ -1341,9 +1341,19 @@ int main(int argc, char **argv) {
                 if(!coarse_votes[f]){for(int g=0;g<f;g++)free(coarse_votes[g]);goto fallback_single;}
                 nfaces++;
             }
+            // Read and store all rounds for iterative MV refinement
+            uint8_t *all_rounds=malloc((size_t)n*rounds);
+            if(!all_rounds) goto fallback_single;
+            int rnd;
+            for(rnd=0;rnd<rounds;rnd++){
+                if(fread(all_rounds+rnd*n,1,n,stdin)!=(size_t)n) break;
+                if(rnd==rounds-1) memcpy(raw_last,all_rounds+rnd*n,n);
+            }
+            if(rnd<rounds){free(all_rounds);goto fallback_single;}
+            // Initial coarse votes from raw rounds
             int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
-            for(int rnd=0;rnd<rounds;rnd++){
-                if(fread(syn,1,n,stdin)!=(size_t)n){goto cleanup_persist;}
+            for(rnd=0;rnd<rounds;rnd++){
+                uint8_t *rdat=all_rounds+rnd*n;
                 // Accumulate coarse votes per face from this round
                 for(int f=0;f<4;f++){
                     if(!coarse_votes[f]) continue;
@@ -1351,7 +1361,7 @@ int main(int argc, char **argv) {
                     for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
                         int acc=0;
                         for(int da=0;da<K;da++)for(int db=0;db<K;db++)
-                            acc^=syn[(((K*a+da+dx[f])%r)*s+((K*b+db+dy[f])%s))];
+                            acc^=rdat[(((K*a+da+dx[f])%r)*s+((K*b+db+dy[f])%s))];
                         if(acc) v[a*hsc+b]++;
                     }
                 }
@@ -1394,19 +1404,57 @@ int main(int argc, char **argv) {
             memcpy(syn, raw_last, n);
             uint8_t dec[MAX_N], total_dec[MAX_N];
             memset(total_dec, 0, n);
-            for(int pass=0;pass<10;pass++){
+            memcpy(syn, raw_last, n);
+            uint8_t guess_syn[MAX_N];
+            for(int pass=0;pass<15;pass++){
+                // Recompute Ec from current residual MV (adapts as errors are removed)
+                if(pass>0){
+                    memset(coarse_votes[0],0,coarse_sz[0]*sizeof(int)*4);
+                    uint8_t tmp[MAX_N];
+                    for(rnd=0;rnd<rounds;rnd++){
+                        for(int q=0;q<n;q++) tmp[q]=all_rounds[rnd*n+q]^guess_syn[q];
+                        for(int f=0;f<4;f++){
+                            if(!coarse_votes[f]) continue;
+                            int hrc=hrc_arr[f], hsc=hsc_arr[f], *v=coarse_votes[f];
+                            for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
+                                int acc=0;
+                                for(int da=0;da<K;da++)for(int db=0;db<K;db++)
+                                    acc^=tmp[(((K*a+da+dx[f])%r)*s+((K*b+db+dy[f])%s))];
+                                if(acc) v[a*hsc+b]++;
+                            }
+                        }
+                    }
+                    // Rebuild Ec from updated coarse votes
+                    for(int f=0;f<4;f++){
+                        if(!Ec_arr[f]) continue;
+                        int hrc=hrc_arr[f], hsc=hsc_arr[f];
+                        uint8_t *Ec=Ec_arr[f]; int *v=coarse_votes[f];
+                        #define FCC2(a,b) ((a)*hsc+(b))
+                        for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++)
+                            Ec[FCC2(a,b)]=(v[FCC2(a,b)]>rounds/2)?1:0;
+                        for(int a=0;a<hrc-1;a++)for(int b=0;b<hsc-1;b++)
+                            Ec[FCC2(a+1,b+1)]=Ec[FCC2(a,b)]^Ec[FCC2(a+1,b)]^Ec[FCC2(a,b+1)]^((v[FCC2(a,b)]>rounds/2)?1:0);
+                        for(;;){int chg=0;
+                            for(int b=0;b<hsc;b++){int w0=0,w1=0;
+                                for(int a=0;a<hrc;a++){if(Ec[FCC2(a,b)])w0++;else w1++;}
+                                if(w1<w0){for(int a=0;a<hrc;a++)Ec[FCC2(a,b)]^=1;chg=1;}}
+                            for(int a=0;a<hrc;a++){int w0=0,w1=0;
+                                for(int b=0;b<hsc;b++){if(Ec[FCC2(a,b)])w0++;else w1++;}
+                                if(w1<w0){for(int b=0;b<hsc;b++)Ec[FCC2(a,b)]^=1;chg=1;}}
+                            if(!chg)break;}
+                        #undef FCC2
+                    }
+                }
                 preprocess_syndrome(r,s,syn);
                 solve_plane_5d_with_ec(r,s,syn,Ec_arr,hrc_arr,hsc_arr,nfaces,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
-                uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);
                 for(int q=0;q<n;q++) syn[q]=raw_last[q]^guess_syn[q];
             }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             for(int f=0;f<4;f++) free(Ec_arr[f]);
+            free(all_rounds);
             return 0;
-        cleanup_persist:
-            for(int f=0;f<4;f++) free(coarse_votes[f]);
         fallback_single:
             // Fallback: single-round decode if multi-round setup fails
             { uint8_t dec[MAX_N]; solve_plane(r,s,raw_last,dec);

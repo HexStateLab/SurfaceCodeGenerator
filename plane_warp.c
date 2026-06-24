@@ -200,14 +200,17 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     // 4 faces: offsets (0,0),(1,0),(0,1),(1,1) on shifted syndromes
     int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
     int hrc[4], hsc[4], nfaces=0;
-    uint8_t Ec_arr[4][MAX_N];
+    uint8_t *Ec_arr[4]={0};
     for(int f=0;f<4;f++){
         hrc[f]=hr/2; hsc[f]=hs/2;
         if(hrc[f]<2||hsc[f]<2) continue;
-        uint8_t Sf[MAX_N]; // shifted syndrome
+        int fsize=(int)((size_t)hrc[f]*hsc[f]);
+        if(fsize<1||fsize>MAX_N) continue;
+        uint8_t *Sf=malloc((size_t)r*s); uint8_t *Sc=malloc((size_t)fsize);
+        if(!Sf||!Sc){free(Sf);free(Sc);continue;}
         for(int i=0;i<r;i++)for(int j=0;j<s;j++)
             Sf[i*s+j]=syn[((i+dx[f])%r)*s+((j+dy[f])%s)];
-        uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc[f]*hsc[f]);
+        memset(Sc,0,(size_t)fsize);
         #define FCC(a,b) ((a)*hsc[f]+(b))
         for(int a=0;a<hrc[f];a++)for(int b=0;b<hsc[f];b++){
             int acc=0;
@@ -215,7 +218,9 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
                 acc^=Sf[(2*a+da)*s+(2*b+db)];
             Sc[FCC(a,b)]=acc;
         }
-        uint8_t *Ec=Ec_arr[nfaces]; memset(Ec,0,(size_t)hrc[f]*hsc[f]);
+        uint8_t *Ec=malloc((size_t)hrc[f]*hsc[f]);
+        if(!Ec){free(Sf);free(Sc);continue;}
+        Ec_arr[nfaces]=Ec; memset(Ec,0,(size_t)hrc[f]*hsc[f]);
         for(int a=0;a<hrc[f]-1;a++)for(int b=0;b<hsc[f]-1;b++)
             Ec[FCC(a+1,b+1)]=Sc[FCC(a,b)]^Ec[FCC(a,b)]^Ec[FCC(a+1,b)]^Ec[FCC(a,b+1)];
         for(;;){int chg=0;
@@ -227,6 +232,7 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
                 if(w1<w0){for(int b=0;b<hsc[f];b++)Ec[FCC(a,b)]^=1;chg=1;}}
             if(!chg)break;}
         #undef FCC
+        free(Sf); free(Sc);
         nfaces++;
     }
     if(nfaces==0){solve_plane(r,s,syn,out);return;}
@@ -271,6 +277,7 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
             out[((si+2*a)%r)*s+((sj+2*b)%s)]=E[SEC(a,b)];
     }
     #undef SEC
+    for(int f=0;f<4;f++) free(Ec_arr[f]);
 }
 
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {

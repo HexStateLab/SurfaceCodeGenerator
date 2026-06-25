@@ -904,13 +904,25 @@ int run_selftest(int seed) {
 // O(n) deterministic, no distance calculations, no iteration.
 // ============================================================
 static void preprocess_syndrome(int r, int s, uint8_t *syn) {
-    // Pass 1: correlated DEPOLARIZE2 Z⊗X events leave a 2×2 check block
-    // with exactly 3 corners toggled — the ancilla corner cancels.
+    // Pass 1: face-qualified 3-corner completion
+    // Only fill the 4th corner if the 2×2 block is ISOLATED — surrounded
+    // by zeros in the 8 flanking positions. High-density clusters are
+    // dominated by noise, not clean DEPOLARIZE2 structure.
     for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
         int a1=(a+2)%r, b1=(b+2)%s;
         int v00=syn[a*s+b], v10=syn[a1*s+b];
         int v01=syn[a*s+b1], v11=syn[a1*s+b1];
         if(v00+v10+v01+v11==3) {
+            // Face qualifier: check 8 external neighbors of the 2×2 block.
+            // Above/below rows, left/right columns at ±2 offset.
+            int a2=(a+4)%r, a_1=(a-2+r)%r;
+            int b2=(b+4)%s, b_1=(b-2+s)%s;
+            int isolated = 1;
+            isolated &= !syn[a_1*s+b] && !syn[a_1*s+b1];   // above
+            isolated &= !syn[a2*s+b] && !syn[a2*s+b1];     // below
+            isolated &= !syn[a*s+b_1] && !syn[a1*s+b_1];   // left
+            isolated &= !syn[a*s+b2] && !syn[a1*s+b2];     // right
+            if(!isolated) continue;
             if(!v00) syn[a*s+b]^=1;
             else if(!v10) syn[a1*s+b]^=1;
             else if(!v01) syn[a*s+b1]^=1;
@@ -1274,7 +1286,7 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--decode-soft")) {
             // Adaptive syndrome cleanup: majority-vote for low-reliability ancillas
             int n=r*s, rounds;
-            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>32){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *all=malloc((size_t)rounds*n);
             if(!all) return 1;
             for(int rnd=0;rnd<rounds;rnd++){
@@ -1313,7 +1325,7 @@ int main(int argc, char **argv) {
         }
         else if(!strcmp(argv[i],"--decode-persist")) {
             int n=r*s, rounds;
-            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>32){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *per_round=malloc((size_t)rounds*n);
             if(!per_round){fprintf(stderr,"alloc fail\n");return 1;}
             for(int rnd=0;rnd<rounds;rnd++){
@@ -1335,7 +1347,7 @@ int main(int argc, char **argv) {
                 }
                 memcpy(dec_round+rnd*n,acc,n);
             }
-            // Per-cell consensus: correct in ≥ rounds-1 rounds
+            // Per-cell consensus: correct in > rounds/3 rounds
             uint8_t consensus[MAX_N]; memset(consensus,0,n);
             for(int q=0;q<n;q++){
                 int cnt=0;
@@ -1349,7 +1361,7 @@ int main(int argc, char **argv) {
             uint8_t cons_syn[MAX_N]; syndrome_of(r,s,consensus,cons_syn);
             uint8_t residual[MAX_N];
             for(int q=0;q<n;q++)residual[q]=raw_last[q]^cons_syn[q];
-            // Phase 2: pipeline decode the residual, accumulate into consensus
+            // Phase 2: pipeline decode the residual (15 passes with preprocessing)
             uint8_t total[MAX_N]; memcpy(total,consensus,n);
             memcpy(syn,residual,n);
             for(int pass=0;pass<15;pass++){
@@ -1366,7 +1378,7 @@ int main(int argc, char **argv) {
             // Majority-vote of per-round corrections (suppresses measurement noise)
             uint8_t dec[MAX_N], total[MAX_N], syn_r[MAX_N];
             int n=r*s, rounds;
-            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>32){fprintf(stderr,"bad rounds\n");return 1;}
             memset(total,0,n);
             for(int rnd=0;rnd<rounds;rnd++){
                 if(fread(syn_r,1,n,stdin)!=(size_t)n){fprintf(stderr,"short read\n");return 1;}
@@ -1389,7 +1401,7 @@ int main(int argc, char **argv) {
             // Majority vote across rounds → preprocess → decode
             uint8_t syn[MAX_N], mv_syn[MAX_N], dec[MAX_N];
             int n=r*s, rounds;
-            if (fread(&rounds,4,1,stdin)!=1 || rounds<2 || rounds>16) { fprintf(stderr,"bad rounds\n"); return 1; }
+            if (fread(&rounds,4,1,stdin)!=1 || rounds<2 || rounds>32) { fprintf(stderr,"bad rounds\n"); return 1; }
             int *votes = calloc(n, sizeof(int));
             if(!votes) return 1;
             for(int rnd=0;rnd<rounds;rnd++) {

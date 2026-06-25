@@ -452,6 +452,7 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[SEC(a,b)]) wt+=W[SEC(a,b)];
             if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sz); }
         }
+        #ifndef NO_LOGICAL_ENUM
         for(int log=0;log<4;log++) {
             memcpy(E, best_E, sz);
             if(log & 1) for(int b=0;b<hs;b++) E[SEC(0,b)] ^= 1;
@@ -461,6 +462,7 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[SEC(a,b)]) wt+=W[SEC(a,b)];
             if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sz); }
         }
+        #endif
         for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
             if(best_E[SEC(a,b)]) out[((si+2*a)%r)*s + ((sj+2*b)%s)] ^= 1;
     }
@@ -644,7 +646,9 @@ static void kernel_enum_block(int m, int n, uint8_t *out) {
         // and keep the best, to avoid local minima.
         uint8_t base[MAX_N]; memcpy(base,out,(size_t)m*n);
         int best_wt = m*n+1; uint8_t best[MAX_N];
-        for(int restart=0; restart<64; restart++) {
+        int nrestart = 64;
+        if(m+n > 40) nrestart = m+n > 80 ? 512 : 256;
+        for(int restart=0; restart<nrestart; restart++) {
             uint8_t tmp[MAX_N]; memcpy(tmp,base,(size_t)m*n);
             // Randomize row mask for diversity (first restart keeps original)
             if(restart > 0) {
@@ -736,30 +740,45 @@ static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s; cost_init(n); memset(out,0,n);
     int gr = (r & 1) ? 1 : 2, gc = (s & 1) ? 1 : 2;
     int Lr = r/gr, Lc = s/gc;
-    uint8_t *SB=malloc((size_t)Lr*Lc), *EB=malloc((size_t)Lr*Lc);
-    if(!SB||!EB){ free(SB); free(EB); return 0; }
+    uint8_t *SB=malloc((size_t)Lr*Lc), *EB=malloc((size_t)Lr*Lc), *best_E=malloc((size_t)Lr*Lc);
+    if(!SB||!EB||!best_E){ free(SB); free(EB); free(best_E); return 0; }
+    double *W=malloc((size_t)Lr*Lc*sizeof(double));
+    if(!W){ free(SB); free(EB); free(best_E); return 0; }
+    double best_wt=1e100;
     for(int cr=0; cr<gr; cr++) for(int cc=0; cc<gc; cc++) {
         // Gather this parity class in stride-2 walk order: old (cr+2tr, cc+2tc).
-        for(int tr=0; tr<Lr; tr++) for(int tc=0; tc<Lc; tc++)
-            SB[tr*Lc+tc] = syn[((cr+2*tr)%r)*s + ((cc+2*tc)%s)];
-        // Repair the block's metachecks (row/col sums) first. This is the
-        // single-shot step AND a soundness precondition here: it guarantees the
-        // block syndrome is in the image, so the row0=col0=0 recurrence below
-        // closes around the torus seam exactly. No-op on clean syndromes.
+        for(int tr=0; tr<Lr; tr++) for(int tc=0; tc<Lc; tc++) {
+            int q = ((cr+2*tr)%r)*s + ((cc+2*tc)%s);
+            SB[tr*Lc+tc] = syn[q];
+            W[tr*Lc+tc] = cost_map[q];
+        }
         metacheck_repair_block(Lr, Lc, SB);
-        // ---- sound adjacent-toric block solve ----
-        // Block check (verified): S(A,B) = E(A,B)^E(A+1,B)^E(A,B+1)^E(A+1,B+1).
-        // Invert with row0=col0=0 boundary:
-        //   E[a][b] = S[a-1][b-1] ^ E[a-1][b] ^ E[a][b-1] ^ E[a-1][b-1]  (a,b>=1)
-        // then take minimum weight over the kernel (full row / full col flips).
-        memset(EB,0,(size_t)Lr*Lc);
-        for(int a=1;a<Lr;a++) for(int b=1;b<Lc;b++)
-            EB[a*Lc+b] = SB[(a-1)*Lc+(b-1)] ^ EB[(a-1)*Lc+b] ^ EB[a*Lc+(b-1)] ^ EB[(a-1)*Lc+(b-1)];
-        kernel_enum_block(Lr, Lc, EB);
+        best_wt = 1e100;
+        memset(best_E,0,(size_t)Lr*Lc);
+        for(int c0=0; c0<2; c0++) {
+            memset(EB,0,(size_t)Lr*Lc);
+            EB[0] = c0;
+            for(int a=1;a<Lr;a++) for(int b=1;b<Lc;b++)
+                EB[a*Lc+b] = SB[(a-1)*Lc+(b-1)] ^ EB[(a-1)*Lc+b] ^ EB[a*Lc+(b-1)] ^ EB[(a-1)*Lc+(b-1)];
+            kernel_enum_block(Lr, Lc, EB);
+            double wt=0; for(int q=0;q<Lr*Lc;q++) if(EB[q]) wt+=W[q];
+            if(wt < best_wt) { best_wt = wt; memcpy(best_E, EB, (size_t)Lr*Lc); }
+        }
+        // 4-logical sector enumeration on best_E
+        #ifndef NO_LOGICAL_ENUM
+        for(int log=0;log<4;log++) {
+            memcpy(EB, best_E, (size_t)Lr*Lc);
+            if(log & 1) for(int b=0;b<Lc;b++) EB[b] ^= 1;
+            if(log & 2) for(int a=0;a<Lr;a++) EB[a*Lc] ^= 1;
+            blk_descent(Lr, Lc, EB, W);
+            double wt=0; for(int q=0;q<Lr*Lc;q++) if(EB[q]) wt+=W[q];
+            if(wt < best_wt) { best_wt = wt; memcpy(best_E, EB, (size_t)Lr*Lc); }
+        }
+        #endif
         for(int tr=0; tr<Lr; tr++) for(int tc=0; tc<Lc; tc++)
-            out[((cr+2*tr)%r)*s + ((cc+2*tc)%s)] = EB[tr*Lc+tc];
+            if(best_E[tr*Lc+tc]) out[((cr+2*tr)%r)*s + ((cc+2*tc)%s)] ^= 1;
     }
-    free(SB); free(EB);
+    free(SB); free(EB); free(best_E); free(W);
     int cap = effective_cap(n);
     if(cap > 0) { int f=0; for(int q=0;q<n;q++) f+=out[q]; if(f>cap){ memset(out,0,n); return 0; } }
     return 1;

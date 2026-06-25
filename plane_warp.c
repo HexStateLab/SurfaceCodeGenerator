@@ -26,6 +26,16 @@ static int g_fast = 0;
 // Exposed so the verification suite can A/B it directly against
 // identical syndromes to prove it's strictly non-regressive.
 int g_escape_enabled = 1;
+// Single-shot metacheck repair toggle — on by default. Each of the 4
+// (1+x)(1+y) toric blocks carries its own metachecks (every block-syndrome
+// row-sum and column-sum must be even — these span ker(H^T)). A measurement
+// fault that flips one syndrome bit violates exactly one metarow + one
+// metacol, so the block can repair a corrupted syndrome in a SINGLE round,
+// before data decoding, instead of relying on cross-round voting. A genuine
+// data-error syndrome always satisfies the metachecks, so this pass is a
+// strict no-op on clean syndromes (the exhaustive weight-k tests are
+// unaffected); it only acts when the syndrome itself is corrupted.
+int g_singleshot = 1;
 // Correction-weight cap (in flips). 0 = disabled (no ceiling). When set, the
 // decoder ABSTAINS — returns the empty correction — on any shot whose best
 // correction exceeds the cap. Rationale: on a code whose typical error is
@@ -185,6 +195,9 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
 
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
+static void metacheck_repair_block(int hr, int hs, uint8_t *S); // single-shot fwd
+static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out); // odd-grid fwd
+static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out);      // adjacent-toric fwd
 
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out);
@@ -196,6 +209,10 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
 static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
+    // 5d face decomposition is even-only (same parity-split assumption as
+    // solve_plane); odd grids have no 4-block structure, so defer to the
+    // parity-general decoder via solve_plane.
+    if((r & 1) || (s & 1)) { solve_plane(r,s,syn,out); return; }
     if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
@@ -248,6 +265,8 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
             int q=((si+2*a)%r)*s+((sj+2*b)%s);
             S[SEC(a,b)]=syn[q]; W[SEC(a,b)]=cost_map[q];
         }
+        // Single-shot: repair this block's syndrome (S[a*hs+b]==S[SEC(a,b)]).
+        if(g_singleshot) metacheck_repair_block(hr,hs,S);
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
         // Bundle cost: |E| + Σ_f |aggregate(E) ⊕ Ec_f|
@@ -286,7 +305,42 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
     for(int f=0;f<4;f++) free(Ec_arr[f]);
 }
 
+// ---- Single-shot metacheck repair for one (1+x)(1+y) toric block ----
+// Block syndrome S is laid out as S[a*hs + b]. The block's metachecks are:
+//   for every row a:  XOR_b S[a][b] == 0
+//   for every col b:  XOR_a S[a][b] == 0
+// (full-row / full-column indicators are exactly ker(H^T) of (1+x)(1+y).)
+// An isolated measurement fault at S[a][b] lights up metarow a and metacol b,
+// so violated rows/cols localise the corrupted bits. We repair in place by
+// pairing violated rows with violated cols (each S[a][b] flip clears one of
+// each — the isolated-fault case, exactly). Leftover same-type violations
+// come in pairs (the row and column metacheck families share one global
+// parity), and are cleared two at a time through a shared line; that always
+// restores metacheck consistency. Any residual mislocation when two faults
+// collide on a line is the known weakness of 2D metachecks, not a soundness
+// bug — the post-repair syndrome is always a valid (metacheck-consistent)
+// block syndrome, so the downstream decode stays exact.
+static void metacheck_repair_block(int hr, int hs, uint8_t *S) {
+    int rbad[MAX_R], cbad[MAX_S], nr=0, nc=0;
+    for(int a=0;a<hr;a++){ int p=0; for(int b=0;b<hs;b++) p^=S[a*hs+b]; if(p) rbad[nr++]=a; }
+    for(int b=0;b<hs;b++){ int p=0; for(int a=0;a<hr;a++) p^=S[a*hs+b]; if(p) cbad[nc++]=b; }
+    if(nr==0 && nc==0) return;                 // already metacheck-consistent
+    int k = nr<nc ? nr : nc;
+    for(int i=0;i<k;i++) S[rbad[i]*hs + cbad[i]] ^= 1;   // clear paired row+col
+    int c0 = nc ? cbad[0] : 0;                 // shared column for row leftovers
+    for(int i=k; i+1<nr; i+=2){ S[rbad[i]*hs+c0]^=1; S[rbad[i+1]*hs+c0]^=1; }
+    int r0 = nr ? rbad[0] : 0;                 // shared row for column leftovers
+    for(int j=k; j+1<nc; j+=2){ S[r0*hs+cbad[j]]^=1; S[r0*hs+cbad[j+1]]^=1; }
+}
+
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
+    // The 4-toric-code parity split below is only valid when r and s are even:
+    // stride-2 then partitions each axis into two cycles of length r/2, s/2.
+    // On an ODD axis gcd(2,L)=1, so stride-2 is a single L-cycle and no such
+    // split exists — the assumptions below (hr=r/2, si in {0,1}) silently drop
+    // index L-1 and impose a non-existent block structure, producing unsound
+    // corrections. Route odd grids through the parity-general decoder instead.
+    if((r & 1) || (s & 1)) return solve_plane_general(r, s, syn, out);
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
     if(hr < 1 || hs < 1) return 0;
@@ -312,6 +366,9 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             S[SEC(a,b)] = syn[q];
             W[SEC(a,b)] = cost_map[q];
         }
+        // Single-shot: repair measurement faults in this block's syndrome
+        // (S is contiguous as S[a*hs+b] == S[SEC(a,b)]) before decoding.
+        if(g_singleshot) metacheck_repair_block(hr, hs, S);
         for(int c0=0; c0<2; c0++) {
             memset(E, 0, sz);
             E[SEC(0,0)] = c0;
@@ -517,19 +574,89 @@ static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
     return best;
 }
 
-// Recursive decomposition: split r x s into its 4 independent
-// (r/2) x (s/2) parity-class blocks, solve each at the lower grid
-// dimension, recombine. Falls back to solve_plane if r or s is odd
-// (no parity split exists in that case).
+// ============================================================
+// PARITY-GENERAL DECODER — correct for any r,s (even, odd, or mixed).
+//
+// The stride-2 plus check H = (1+x^2)(1+y^2) partitions each axis by
+// the stride-2 walk. An axis of length L splits into g = gcd(2,L)
+// independent cycles (g=2 if L even, g=1 if L odd), each of length
+// L/g, and along each cycle "+2" becomes "+1" — i.e. each (row-cycle,
+// col-cycle) block is exactly a standard adjacent (1+x)(1+y) toric
+// code of size (Lr)x(Lc), which solve_block_step1 decodes soundly.
+//
+// Even x even reproduces the original 4 blocks of (r/2)x(s/2); odd x
+// odd is a SINGLE r x s block; mixed parity gives 2 blocks. The walk
+// order (cr+2*tr, cc+2*tc) mod (r,s) keeps the recurrence local. This
+// is the same decomposition the rest of the file relies on, generalised
+// off the even-only assumption so odd grids decode correctly instead of
+// silently dropping the last index.
+// ============================================================
+static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out) {
+    int n=r*s; cost_init(n); memset(out,0,n);
+    int gr = (r & 1) ? 1 : 2, gc = (s & 1) ? 1 : 2;
+    int Lr = r/gr, Lc = s/gc;
+    uint8_t *SB=malloc((size_t)Lr*Lc), *EB=malloc((size_t)Lr*Lc);
+    if(!SB||!EB){ free(SB); free(EB); return 0; }
+    for(int cr=0; cr<gr; cr++) for(int cc=0; cc<gc; cc++) {
+        // Gather this parity class in stride-2 walk order: old (cr+2tr, cc+2tc).
+        for(int tr=0; tr<Lr; tr++) for(int tc=0; tc<Lc; tc++)
+            SB[tr*Lc+tc] = syn[((cr+2*tr)%r)*s + ((cc+2*tc)%s)];
+        // Repair the block's metachecks (row/col sums) first. This is the
+        // single-shot step AND a soundness precondition here: it guarantees the
+        // block syndrome is in the image, so the row0=col0=0 recurrence below
+        // closes around the torus seam exactly. No-op on clean syndromes.
+        metacheck_repair_block(Lr, Lc, SB);
+        // ---- sound adjacent-toric block solve ----
+        // Block check (verified): S(A,B) = E(A,B)^E(A+1,B)^E(A,B+1)^E(A+1,B+1).
+        // Invert with row0=col0=0 boundary:
+        //   E[a][b] = S[a-1][b-1] ^ E[a-1][b] ^ E[a][b-1] ^ E[a-1][b-1]  (a,b>=1)
+        // then take minimum weight over the kernel (full row / full col flips).
+        memset(EB,0,(size_t)Lr*Lc);
+        for(int a=1;a<Lr;a++) for(int b=1;b<Lc;b++)
+            EB[a*Lc+b] = SB[(a-1)*Lc+(b-1)] ^ EB[(a-1)*Lc+b] ^ EB[a*Lc+(b-1)] ^ EB[(a-1)*Lc+(b-1)];
+        for(;;){ int chg=0;
+            for(int b=0;b<Lc;b++){ int w0=0,w1=0;
+                for(int a=0;a<Lr;a++){ if(EB[a*Lc+b]) w0++; else w1++; }
+                if(w1<w0){ for(int a=0;a<Lr;a++) EB[a*Lc+b]^=1; chg=1; } }
+            for(int a=0;a<Lr;a++){ int w0=0,w1=0;
+                for(int b=0;b<Lc;b++){ if(EB[a*Lc+b]) w0++; else w1++; }
+                if(w1<w0){ for(int b=0;b<Lc;b++) EB[a*Lc+b]^=1; chg=1; } }
+            if(!chg) break;
+        }
+        for(int tr=0; tr<Lr; tr++) for(int tc=0; tc<Lc; tc++)
+            out[((cr+2*tr)%r)*s + ((cc+2*tc)%s)] = EB[tr*Lc+tc];
+    }
+    free(SB); free(EB);
+    int cap = effective_cap(n);
+    if(cap > 0) { int f=0; for(int q=0;q<n;q++) f+=out[q]; if(f>cap){ memset(out,0,n); return 0; } }
+    return 1;
+}
 // Full decoder: 4 logical sectors × sub-lattice decompose × cross-boundary descent
 int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s;
     if(r%2 || s%2) return solve_plane(r,s,syn,out);
     int hr=r/2, hs=s/2;
+    // Single-shot: repair the raw syndrome's 4 toric sub-blocks ONCE, up
+    // front, before the logical-coset injection below. Doing it here (not
+    // inside the lop loop) keeps measurement-fault repair separate from the
+    // deliberate logical-operator syndrome flips, which the metachecks would
+    // otherwise mistake for faults. Repairs into a local copy, leaving the
+    // caller's syndrome buffer untouched.
+    uint8_t syn_ss[MAX_N]; memcpy(syn_ss,syn,n);
+    if(g_singleshot) {
+        uint8_t ss_sub[MAX_N];
+        for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+                ss_sub[a*hs+b]=syn_ss[(2*a+px)*s+(2*b+py)];
+            metacheck_repair_block(hr,hs,ss_sub);
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+                syn_ss[(2*a+px)*s+(2*b+py)]=ss_sub[a*hs+b];
+        }
+    }
     uint8_t best_full[MAX_N]; double best_full_wt=n+1.0;
     // 4 logical sectors: I, X_L, Z_L, X_L·Z_L
     for(int lop=0; lop<4; lop++) {
-        uint8_t syn_mod[MAX_N]; memcpy(syn_mod,syn,n);
+        uint8_t syn_mod[MAX_N]; memcpy(syn_mod,syn_ss,n);
         // Inject logical: flip boundary syndromes (rows 0,r-2 for X; cols 0,s-2 for Z)
         if(lop&1) for(int j=0;j<s;j++) { syn_mod[j]^=1; syn_mod[((r-2)%r)*s+j]^=1; }
         if(lop&2) for(int i=0;i<r;i++) { syn_mod[i*s]^=1; syn_mod[i*s+((s-2)%s)]^=1; }

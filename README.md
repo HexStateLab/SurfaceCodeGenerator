@@ -152,10 +152,12 @@ leaving a **2×2 block of checks with exactly 3 of 4 corners toggled**:
 The missing corner is always the ancilla position. The three remaining
 corners uniquely identify which of the four data qubits was affected.
 
-**Pass 1 — 2×2 block scan:** iterate over every grid position (a,b)
-with stride-1, check the 2×2 block at (a,b), (a+2,b), (a,b+2),
-(a+2,b+2). When exactly 3 corners are set, add the missing 4th —
-completing the data-error pattern so solve_plane decodes it exactly.
+**Pass 1 — 2×2 block scan (face-qualified):** iterate over every grid
+position (a,b) with stride-1, check the 2×2 block at (a,b), (a+2,b),
+(a,b+2), (a+2,b+2). When exactly 3 corners are set AND the 8 flanking
+positions outside the block are all zero (isolated block), add the
+missing 4th corner. The face qualifier prevents the rule from firing
+in noisy clusters where it would add incorrect syndrome bits.
 
 **Pass 2 — iterative edge-flip:** for remaining odd-parity rows and
 columns, flip syndrome bits only at positions where the bit is already 1
@@ -204,6 +206,39 @@ preprocessor), standalone data errors (solve_plane), or invisible
 3. residual = raw ⊕ H·corr     re-compute, re-preprocess
 4. repeat until convergence    (5 passes)
 ```
+
+### Multi-Round Temporal Decoding — `--decode-persist`
+
+Reads all measurement rounds from stdin (u32 round-count header + N bytes
+per round). The decoder uses a two-phase consensus + residual pipeline:
+
+1. **Phase 1 — independent round decode:** run `solve_plane_layered`
+   (3-pass) on each round independently.
+2. **Phase 2 — consensus target:** for each cell, if the same value
+   appears in > rounds/3 of the round decodings, adopt it as the
+   consensus. Otherwise leave it zero.
+3. **Phase 3 — residual pipeline:** compute the residual syndrome =
+   last-round raw syndrome XOR syndrome(consensus). Run a 15-pass
+   `solve_plane_layered` pipeline on the residual.
+4. **Output:** consensus XOR pipeline result.
+
+The threshold > rounds/3 beats both strict unanimity (rounds-1) and
+majority (> rounds/2). A 3-pass per-round decode + 15-pass pipeline
+outperforms all other pass-count combinations tested.
+
+### Preprocessor — Face-Qualified Block Completion
+
+The face qualifier (`is_block_isolated`) checks that the 8 positions
+surrounding a 2×2 block are all zero before applying the 3-corner rule.
+This eliminates false-positive syndrome insertions in high-noise regions
+and is critical for both decoders:
+
+| Decoder | Without qualifier | With qualifier |
+|---------|-----------------|---------------|
+| `--decode` | 2.6% | **0.6%** |
+| `--decode-persist` | 0.9% | **0.2%** |
+
+14×14 grid, pg=0.1, pm=0.01, 4000 shots.
 
 ## Polynomial Construction
 
@@ -265,8 +300,15 @@ gcc -std=gnu11 -O3 -o plane_warp plane_warp.c -lm
 # Decode a syndrome
 ./plane_warp r s --decode < syndrome.bin > correction.bin
 
-# Benchmarks
+# Multi-round temporal decode (5 rounds, binary: u32 count + N bytes each)
+./plane_warp r s --decode-persist < multi_round.bin > correction.bin
+
+# Benchmarks (single-round, CZ circuit)
 python3 bench.py
+
+# Persist vs plain benchmarks (CZ circuit, configurable grid/shots/noise)
+python3 bench_persist.py --grid 14 --shots 4000 --pg 0.1 --pm 0.01
+python3 bench_persist.py --range 6 16 2 --shots 2000 --pg 0.05 --pm 0.01
 ```
 
 ## Decoder Flags
@@ -275,11 +317,45 @@ python3 bench.py
 |------|-------------|
 | `--decode` | Full pipeline: preprocess + ML solver + residual loop |
 | `--decode-cn` | CNOT circuit (same Z-check pipeline as `--decode`) |
+| `--decode-persist` | Multi-round temporal decode (consensus-initialized residual pipeline, 3+15 passes) |
 | `--decode-alg` | Algebraic (X+Y+XY)⁻¹ inverse only (pure correlated channel) |
 | `--decode-np` | solve_plane only, no preprocessor |
 | `--cap N` | Abstain if correction exceeds N flips |
 | `--cap-auto R` | Auto-cap from per-qubit error rate R |
 | `--selftest` | Verification suite |
+
+## Persistence Decoder Performance
+
+Multi-round temporal decoding (`--decode-persist`) vs plain single-round
+decoding at circuit-level CZ noise, 5 rounds, 2000 shots per config.
+Face-qualified preprocessor enabled for both decoders.
+
+### pg=0.05, pm=0.01 (moderate NISQ noise)
+
+| Grid | Baseline LER | Plain LER | Persist LER |
+|------|-------------|-----------|-------------|
+| 6×6 | 4.8% | 0.90% | **0.90%** |
+| 8×8 | 6.0% | 0.65% | 0.90% |
+| 10×10 | 7.5% | 0.15% | **0.00%** |
+| 12×12 | 8.6% | 0.35% | **0.10%** |
+| 14×14 | 11.1% | 0.25% | **0.05%** |
+| 16×16 | 10.2% | 0.15% | **0.05%** |
+
+### pg=0.1, pm=0.01 (high noise)
+
+| Grid | Baseline LER | Plain LER | Persist LER |
+|------|-------------|-----------|-------------|
+| 6×6 | 8.6% | 1.85% | **1.80%** |
+| 8×8 | 11.5% | 2.85% | 3.05% |
+| 10×10 | 13.4% | 0.40% | **0.15%** |
+| 12×12 | 14.8% | 0.40% | **0.25%** |
+| 14×14 | 18.6% | 0.80% | **0.25%** |
+| 16×16 | 20.4% | 0.75% | **0.35%** |
+
+Persist consistently matches or improves on plain at 10×10 and larger,
+with the biggest gains at 14×14 (0.25% vs 0.80% at pg=0.1 — a 69%
+reduction). At 8×8 and smaller the limited code distance gives no
+persist advantage. Throughput: ~55–65 shots/s (both decoders combined).
 
 ## License
 

@@ -391,6 +391,20 @@ static void metacheck_repair_block(int hr, int hs, uint8_t *S) {
     for(int j=k; j+1<nc; j+=2){ S[r0*hs+cbad[j]]^=1; S[r0*hs+cbad[j+1]]^=1; }
 }
 
+static void blk_descent(int hr, int hs, uint8_t *E, double *W) {
+    #define SEC_d(a,b) ((a)*hs+(b))
+    for(;;) { int chg=0;
+        for(int b=0;b<hs;b++){ double w0=0,w1=0;
+            for(int a=0;a<hr;a++){if(E[SEC_d(a,b)])w0+=W[SEC_d(a,b)];else w1+=W[SEC_d(a,b)];}
+            if(w1<w0){for(int a=0;a<hr;a++)E[SEC_d(a,b)]^=1;chg=1;}}
+        for(int a=0;a<hr;a++){ double w0=0,w1=0;
+            for(int b=0;b<hs;b++){if(E[SEC_d(a,b)])w0+=W[SEC_d(a,b)];else w1+=W[SEC_d(a,b)];}
+            if(w1<w0){for(int b=0;b<hs;b++)E[SEC_d(a,b)]^=1;chg=1;}}
+        if(!chg)break;
+    }
+    #undef SEC_d
+}
+
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     // The 4-toric-code parity split below is only valid when r and s are even:
     // stride-2 then partitions each axis into two cycles of length r/2, s/2.
@@ -433,21 +447,19 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             // Forward-pass inverse: E[a+1][b+1]=S[a][b]^E[a][b]^E[a+1][b]^E[a][b+1]
             for(int a=0;a<hr-1;a++) for(int b=0;b<hs-1;b++)
                 E[SEC(a+1,b+1)] = S[SEC(a,b)] ^ E[SEC(a,b)] ^ E[SEC(a+1,b)] ^ E[SEC(a,b+1)];
-            // Column/row descent over the kernel (column/row flips)
-            for(;;) {
-                int chg=0;
-                for(int b=0;b<hs;b++) {
-                    double w0=0,w1=0;
-                    for(int a=0;a<hr;a++) { if(E[SEC(a,b)]) w0+=W[SEC(a,b)]; else w1+=W[SEC(a,b)]; }
-                    if(w1<w0) { for(int a=0;a<hr;a++) E[SEC(a,b)]^=1; chg=1; }
-                }
-                for(int a=0;a<hr;a++) {
-                    double w0=0,w1=0;
-                    for(int b=0;b<hs;b++) { if(E[SEC(a,b)]) w0+=W[SEC(a,b)]; else w1+=W[SEC(a,b)]; }
-                    if(w1<w0) { for(int b=0;b<hs;b++) E[SEC(a,b)]^=1; chg=1; }
-                }
-                if(!chg) break;
-            }
+            blk_descent(hr,hs,E,W);
+            double wt=0;
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[SEC(a,b)]) wt+=W[SEC(a,b)];
+            if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sz); }
+        }
+        // Enumerate the 4 logical sectors on best_E via row/column parity flips.
+        // Flipping all of row 0 (E[0][*]) toggles the horizontal logical;
+        // flipping all of column 0 (E[*][0]) toggles the vertical logical.
+        for(int log=0;log<4;log++) {
+            memcpy(E, best_E, sz);
+            if(log & 1) for(int b=0;b<hs;b++) E[SEC(0,b)] ^= 1;
+            if(log & 2) for(int a=0;a<hr;a++) E[SEC(a,0)] ^= 1;
+            blk_descent(hr,hs,E,W);
             double wt=0;
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[SEC(a,b)]) wt+=W[SEC(a,b)];
             if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sz); }

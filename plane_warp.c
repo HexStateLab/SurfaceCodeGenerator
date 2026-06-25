@@ -16,9 +16,6 @@
 // Fast stride-2 torus wrap: avoids % division
 #define WRAP2(x, dim) ((x) >= 2 ? (x) - 2 : (x) + (dim) - 2)
 
-// Adaptive corner: run one pass of threshold decoder (>=3 of 4 checks fire)
-// to get a rough error estimate, then use its centroid. O(n), much tighter
-// than raw syndrome centroid for multi-cluster errors.
 // Adaptive corner: threshold-guided centroid. Fast O(n), no alternating iteration.
 // Use --fast flag to enable. Default: full 156D nullspace alternating optimization.
 static int g_fast = 0;
@@ -65,21 +62,47 @@ static int effective_cap(int n) {
 // ---- Decode cost: uniform => Hamming weight (min flips). ----
 static double cost_map[MAX_N];
 static void cost_init(int n) { for(int q=0;q<n;q++) cost_map[q]=1.0; }
+
+// Circular statistics mapping for torus centroid
 void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
-    int sx=0, sy=0, count=0;
+    double sum_sin_x = 0, sum_cos_x = 0;
+    double sum_sin_y = 0, sum_cos_y = 0;
+    int count = 0;
+    
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
         int hits=0;
         for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
             hits += syn[((qi-di+r)%r)*s + ((qj-dj+s)%s)];
-        if(hits >= 3) { sx+=qi; sy+=qj; count++; }
+        
+        if(hits >= 3) {
+            double theta_x = (2.0 * M_PI * qi) / r;
+            double theta_y = (2.0 * M_PI * qj) / s;
+            sum_sin_x += sin(theta_x); sum_cos_x += cos(theta_x);
+            sum_sin_y += sin(theta_y); sum_cos_y += cos(theta_y);
+            count++;
+        }
     }
+    
     if(count==0) {
         for(int ci=0;ci<r;ci++) for(int cj=0;cj<s;cj++)
-            if(syn[ci*s+cj]) { sx+=ci; sy+=cj; count++; }
+            if(syn[ci*s+cj]) { 
+                double theta_x = (2.0 * M_PI * ci) / r;
+                double theta_y = (2.0 * M_PI * cj) / s;
+                sum_sin_x += sin(theta_x); sum_cos_x += cos(theta_x);
+                sum_sin_y += sin(theta_y); sum_cos_y += cos(theta_y);
+                count++; 
+            }
     }
     if(count==0) { *cx=0; *cy=0; return; }
-    *cx = (((sx + count/2) / count) & ~1) % r;
-    *cy = (((sy + count/2) / count) & ~1) % s;
+
+    double angle_x = atan2(sum_sin_x, sum_cos_x);
+    double angle_y = atan2(sum_sin_y, sum_cos_y);
+    if(angle_x < 0) angle_x += 2.0 * M_PI;
+    if(angle_y < 0) angle_y += 2.0 * M_PI;
+
+    *cx = ((int)round((angle_x * r) / (2.0 * M_PI))) & ~1;
+    *cy = ((int)round((angle_y * s) / (2.0 * M_PI))) & ~1;
+    *cx %= r; *cy %= s;
 }
 
 // Fast solver: adaptive corner + 16 nullspace XOR. No alternating optimization.
@@ -199,7 +222,6 @@ static void metacheck_repair_block(int hr, int hs, uint8_t *S); // single-shot f
 static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out); // odd-grid fwd
 static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out);      // adjacent-toric fwd
 
-static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out);
 
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
@@ -505,21 +527,30 @@ static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
     for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
         if(sub_syn[a*hs+b]) defects[nd++]=a*hs+b;
     if(nd==0) return;  // no errors
-    if(nd>30) {  // too many defects, fall back to sweep directly
+    
+    if(nd>15) {  // Fallback to deterministic sweep if DP is too expensive
         memset(sub_out,0,n);
-        // Copy syndrome to base via recurrence, then sweep
         uint8_t base[MAX_N]; memset(base,0,n);
-        for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) {
-            if(a==0||b==0) continue;
+        
+        // Randomize the anchor for the sweep rather than hardcoding (0,0)
+        int anchor_a = rand() % hr;
+        int anchor_b = rand() % hs;
+        
+        for(int ri=0; ri<hr; ri++) for(int rj=0; rj<hs; rj++) {
+            if(ri==0 || rj==0) continue;
+            int a = (anchor_a + ri) % hr;
+            int b = (anchor_b + rj) % hs;
             int ca=(a-1+hr)%hr, cb=(b-1+hs)%hs, ck=ca*hs+cb;
-            base[a*hs+b]=sub_syn[ck]^base[((a-1+hr)%hr)*hs+b]
-                                      ^base[a*hs+((b-1+hs)%hs)]
-                                      ^base[((a-1+hr)%hr)*hs+((b-1+hs)%hs)];
+            base[a*hs+b] = sub_syn[ck] 
+                           ^ base[ca*hs+b] 
+                           ^ base[a*hs+cb] 
+                           ^ base[ca*hs+cb];
         }
         memcpy(sub_out,base,n);
         blk_sweep(hr,hs,sub_out,0);
         return;
     }
+    
     // Compute all-pairs shortest distances on torus
     int dist[256][256];
     for(int i=0;i<nd;i++) for(int j=0;j<nd;j++) {
@@ -528,7 +559,7 @@ static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
         int dx=abs(ai-aj), dy=abs(bi-bj);
         dist[i][j]=(dx<hr-dx?dx:hr-dx)+(dy<hs-dy?dy:hs-dy);
     }
-    // DP over subsets for minimum-weight perfect matching (nd <= 30, 2^15=32K max)
+    // DP over subsets for minimum-weight perfect matching (nd <= 15, 2^15=32K max)
     int half=1<<nd, dp[32768];
     for(int m=0;m<half;m++) dp[m]=9999;
     dp[0]=0;
@@ -572,31 +603,48 @@ static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
 
 // Post-process a (1+x)(1+y) toric-block correction by enumerating all
 // kernel elements (row/col flips) to find the globally minimum-weight
-// correction with the same syndrome.  Exhaustive for m <= 12 (4096 row
-// masks); no-op otherwise.
+// correction with the same syndrome.
 static void kernel_enum_block(int m, int n, uint8_t *out) {
-    if(m > 12) return;
-    int best_rmask=0, best_cmask=0, best_wt=m*n+1;
-    for(int rmask=0; rmask<(1<<m); rmask++) {
-        int cmask=0, wt=0;
-        for(int b=0;b<n;b++) {
-            int ones=0;
-            for(int a=0;a<m;a++) if(out[a*n+b] ^ ((rmask>>a)&1)) ones++;
-            if(ones > m-ones) { cmask |= (1<<b); wt += m-ones; }
-            else wt += ones;
+    if(m <= 12) {
+        // Exhaustive enumeration for small kernels
+        int best_rmask=0, best_cmask=0, best_wt=m*n+1;
+        for(int rmask=0; rmask<(1<<m); rmask++) {
+            int cmask=0, wt=0;
+            for(int b=0;b<n;b++) {
+                int ones=0;
+                for(int a=0;a<m;a++) if(out[a*n+b] ^ ((rmask>>a)&1)) ones++;
+                if(ones > m-ones) { cmask |= (1<<b); wt += m-ones; }
+                else wt += ones;
+            }
+            if(wt < best_wt) { best_wt=wt; best_rmask=rmask; best_cmask=cmask; }
         }
-        if(wt < best_wt) { best_wt=wt; best_rmask=rmask; best_cmask=cmask; }
-    }
-    if(best_wt >= m*n) return;
-    for(int a=0;a<m;a++) for(int b=0;b<n;b++) {
-        int flip = ((best_rmask>>a)&1) ^ ((best_cmask>>b)&1);
-        if(flip) out[a*n+b] ^= 1;
+        if(best_wt >= m*n) return;
+        for(int a=0;a<m;a++) for(int b=0;b<n;b++) {
+            int flip = ((best_rmask>>a)&1) ^ ((best_cmask>>b)&1);
+            if(flip) out[a*n+b] ^= 1;
+        }
+    } else {
+        // Fallback: Greedy Iterative Descent for large grids
+        for(;;) {
+            int chg=0;
+            for(int b=0;b<n;b++) {
+                int w0=0, w1=0;
+                for(int a=0;a<m;a++) { if(out[a*n+b]) w0++; else w1++; }
+                if(w1 < w0) { for(int a=0;a<m;a++) out[a*n+b]^=1; chg=1; }
+            }
+            for(int a=0;a<m;a++) {
+                int w0=0, w1=0;
+                for(int b=0;b<n;b++) { if(out[a*n+b]) w0++; else w1++; }
+                if(w1 < w0) { for(int b=0;b<n;b++) out[a*n+b]^=1; chg=1; }
+            }
+            if(!chg) break;
+        }
     }
 }
 
 static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
     int sz=m*n;
-    // Use MWPM for all sizes (DP up to 30 defects, sweep fallback)
+    // Use MWPM for all sizes (DP up to 15 defects, sweep fallback)
     if(sz <= 40000) {  // always use MWPM
         solve_mwpm(m,n,S,out);
         // Verify syndrome

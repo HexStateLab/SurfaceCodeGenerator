@@ -261,16 +261,17 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
               } \
             } c; })
         for(;;){int chg=0;
-            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++){
+            for(int b=0;b<hs;b++){
                 double c0=BCOST(E);
-                for(int aa=0;aa<hr;aa++)E[SEC(aa,b)]^=1;
-                for(int bb=0;bb<hs;bb++)E[SEC(a,bb)]^=1;
-                E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){
-                    for(int aa=0;aa<hr;aa++)E[SEC(aa,b)]^=1;
-                    for(int bb=0;bb<hs;bb++)E[SEC(a,bb)]^=1;
-                    E[SEC(a,b)]^=1;
-                } else chg=1;
+                for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;
+                if(BCOST(E)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}
+                else chg=1;
+            }
+            for(int a=0;a<hr;a++){
+                double c0=BCOST(E);
+                for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;
+                if(BCOST(E)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}
+                else chg=1;
             }
             if(!chg)break;
         }
@@ -317,29 +318,105 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             // Forward-pass inverse: E[a+1][b+1]=S[a][b]^E[a][b]^E[a+1][b]^E[a][b+1]
             for(int a=0;a<hr-1;a++) for(int b=0;b<hs-1;b++)
                 E[SEC(a+1,b+1)] = S[SEC(a,b)] ^ E[SEC(a,b)] ^ E[SEC(a+1,b)] ^ E[SEC(a,b+1)];
-            // Column/row descent over the kernel (column/row flips),
-            // using 2D cross operators: flip column b AND row a together.
-            // The cross pattern toggles an entire row+col minus their
-            // intersection, creating surface-code-like local patches
-            // instead of torus-wide line flips.
+            // Boundary fixup: adjust E[0][*] and E[*][0] so H·E = S at every position.
+            // After the forward pass, interior checks are exact; boundary checks at
+            // last row (hr-1, b) and last column (a, hs-1) may not match. Iteratively
+            // flip boundary bits to zero out the residual.
+            for(int biter=0; biter<hr+hs+4; biter++) {
+                // Check boundary at last row: H·E[hr-1][b] for b in [0,hs-2]
+                int fixed=1;
+                for(int b=0;b<hs-1;b++) {
+                    int syn_b = S[SEC(hr-1,b)]
+                        ^ E[SEC(hr-1,b)] ^ E[SEC(0,b)]
+                        ^ E[SEC(hr-1,b+1)] ^ E[SEC(0,b+1)];
+                    if(syn_b) { // mismatch at (hr-1, b)
+                        // Flip E[0][b+1] — this is the degree of freedom
+                        // that also toggles E[0][b+1] directly in the check
+                        // AND propagates through the recurrence.
+                        // To keep interior exact, re-run forward pass.
+                        E[SEC(0,b+1)] ^= 1;
+                        fixed = 0;
+                        // Re-propagate: changing E[0][b+1] affects all
+                        // interior values E[a+1][b+1], E[a+2][b+2], ...
+                        for(int a=b+1;a<hs-1;a++) {
+                            for(int i=0;i<hr-1;i++) {
+                                int r=i+1, c=a;
+                                if(r>=hr||c>=hs) continue;
+                                E[SEC(r,c)] = S[SEC(r-1,c-1)]
+                                    ^ E[SEC(r-1,c-1)] ^ E[SEC(r,c-1)]
+                                    ^ E[SEC(r-1,c)];
+                            }
+                        }
+                    }
+                }
+                // Check boundary at last column: H·E[a][hs-1] for a in [0,hr-2]
+                for(int a=0;a<hr-1;a++) {
+                    int syn_b = S[SEC(a,hs-1)]
+                        ^ E[SEC(a,hs-1)] ^ E[SEC(a+1,hs-1)]
+                        ^ E[SEC(a,0)] ^ E[SEC(a+1,0)];
+                    if(syn_b) {
+                        E[SEC(a+1,0)] ^= 1;
+                        fixed = 0;
+                        for(int i=a+1;i<hr-1;i++) {
+                            for(int j=0;j<hs-1;j++) {
+                                int r=i+1, c=j+1;
+                                if(r>=hr||c>=hs) continue;
+                                E[SEC(r,c)] = S[SEC(r-1,c-1)]
+                                    ^ E[SEC(r-1,c-1)] ^ E[SEC(r,c-1)]
+                                    ^ E[SEC(r-1,c)];
+                            }
+                        }
+                    }
+                }
+                // Check bottom-right corner
+                int syn_c = S[SEC(hr-1,hs-1)]
+                    ^ E[SEC(hr-1,hs-1)] ^ E[SEC(0,hs-1)]
+                    ^ E[SEC(hr-1,0)] ^ E[SEC(0,0)];
+                if(syn_c) {
+                    // Flipping either E[0][hs-1] or E[hr-1][0] could fix it.
+                    // Try both; pick the one with less weight impact after propagation.
+                    double w_pre = 0;
+                    for(int qi=0;qi<sz;qi++) if(E[qi]) w_pre += W[qi];
+                    // Try flip E[0][hs-1]
+                    uint8_t E_save[sz]; memcpy(E_save,E,sz);
+                    E[SEC(0,hs-1)] ^= 1;
+                    for(int j=0;j<hs-1;j++) {
+                        for(int i=0;i<hr-1;i++) E[SEC(i+1,j+1)] = S[SEC(i,j)]
+                            ^ E[SEC(i,j)] ^ E[SEC(i+1,j)] ^ E[SEC(i,j+1)];
+                    }
+                    double w1 = 0;
+                    for(int qi=0;qi<sz;qi++) if(E[qi]) w1 += W[qi];
+                    // Try flip E[hr-1][0]
+                    uint8_t E_save2[sz]; memcpy(E_save2,E_save,sz);
+                    memcpy(E,E_save,sz);
+                    E[SEC(hr-1,0)] ^= 1;
+                    for(int i=0;i<hr-1;i++) {
+                        for(int j=0;j<hs-1;j++) E[SEC(i+1,j+1)] = S[SEC(i,j)]
+                            ^ E[SEC(i,j)] ^ E[SEC(i+1,j)] ^ E[SEC(i,j+1)];
+                    }
+                    double w2 = 0;
+                    for(int qi=0;qi<sz;qi++) if(E[qi]) w2 += W[qi];
+                    if(w1 <= w2) memcpy(E,E_save2,sz); // restore the better one
+                    fixed = 0;
+                }
+                if(fixed) break;
+                // Re-run full forward pass after boundary changes
+                for(int i=0;i<hr-1;i++) for(int j=0;j<hs-1;j++)
+                    E[SEC(i+1,j+1)] = S[SEC(i,j)]
+                        ^ E[SEC(i,j)] ^ E[SEC(i+1,j)] ^ E[SEC(i,j+1)];
+            }
+            // Column/row descent over the kernel (column/row flips)
             for(;;) {
                 int chg=0;
-                for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) {
-                    double w0=0;
-                    for(int aa=0;aa<hr;aa++) w0+=E[SEC(aa,b)]?W[SEC(aa,b)]:0;
-                    for(int bb=0;bb<hs;bb++) if(bb!=b) w0+=E[SEC(a,bb)]?W[SEC(a,bb)]:0;
-                    // Apply cross: flip column b and row a
-                    for(int aa=0;aa<hr;aa++) E[SEC(aa,b)]^=1;
-                    for(int bb=0;bb<hs;bb++) E[SEC(a,bb)]^=1;
-                    E[SEC(a,b)]^=1; // intersection was flipped twice → undo
-                    double w1=0;
-                    for(int aa=0;aa<hr;aa++) w1+=E[SEC(aa,b)]?W[SEC(aa,b)]:0;
-                    for(int bb=0;bb<hs;bb++) if(bb!=b) w1+=E[SEC(a,bb)]?W[SEC(a,bb)]:0;
-                    if(w1>=w0) { // revert
-                        for(int aa=0;aa<hr;aa++) E[SEC(aa,b)]^=1;
-                        for(int bb=0;bb<hs;bb++) E[SEC(a,bb)]^=1;
-                        E[SEC(a,b)]^=1;
-                    } else chg=1;
+                for(int b=0;b<hs;b++) {
+                    double w0=0,w1=0;
+                    for(int a=0;a<hr;a++) { if(E[SEC(a,b)]) w0+=W[SEC(a,b)]; else w1+=W[SEC(a,b)]; }
+                    if(w1<w0) { for(int a=0;a<hr;a++) E[SEC(a,b)]^=1; chg=1; }
+                }
+                for(int a=0;a<hr;a++) {
+                    double w0=0,w1=0;
+                    for(int b=0;b<hs;b++) { if(E[SEC(a,b)]) w0+=W[SEC(a,b)]; else w1+=W[SEC(a,b)]; }
+                    if(w1<w0) { for(int b=0;b<hs;b++) E[SEC(a,b)]^=1; chg=1; }
                 }
                 if(!chg) break;
             }

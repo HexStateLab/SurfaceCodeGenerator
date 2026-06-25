@@ -186,64 +186,6 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 
-// Coarse-scale saddle-point via C²: solve fine (1+X)(1+Y)·E=S and
-// coarse (1+Xc)(1+Yc)·Ec=Sc where Sc=C·S at stride 2. The constraint
-// is that E aggregated over 2×2 blocks must equal Ec. This couples
-// fine qubits within blocks that the fine kernel can't constrain.
-// Variant: use precomputed Ec from coarse-level MV (--decode-persist).
-static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
-    uint8_t *Ec_arr[4], int hrc[4], int hsc[4], int nfaces, uint8_t *out) {
-    int n=r*s; cost_init(n);
-    int hr=r/2, hs=s/2;
-    if(nfaces==0){solve_plane(r,s,syn,out);return;}
-    memset(out,0,n);
-    #define SEC(a,b) ((a)*hs+(b))
-    int sz=hr*hs;
-    int K=nfaces>0?hr/hrc[0]:2; // block size from coarse grid dims
-    for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
-        uint8_t S[MAX_N],E[MAX_N]; double W[MAX_N]; memset(E,0,sz);
-        for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
-            int q=((si+2*a)%r)*s+((sj+2*b)%s);
-            S[SEC(a,b)]=syn[q]; W[SEC(a,b)]=cost_map[q];
-        }
-        for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
-            E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
-        #define BCOST(E,fidx) ({ double c=0; \
-            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
-            if(fidx<nfaces){ \
-              int _f=fidx; \
-              for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
-                int agg=0; \
-                for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
-                    agg^=E[SEC(K*_a+da,K*_b+db)]; \
-                if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=2.0; \
-              } \
-            } c; })
-        int fidx=si+2*sj;
-        for(;;){int chg=0;
-            for(int b=0;b<hs;b++){
-                double c0=BCOST(E,fidx);
-                for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;
-                if(BCOST(E,fidx)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}
-                else chg=1;
-            }
-            for(int a=0;a<hr;a++){
-                double c0=BCOST(E,fidx);
-                for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;
-                if(BCOST(E,fidx)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}
-                else chg=1;
-            }
-            if(!chg)break;
-        }
-        #undef BCOST
-        int o=0;for(int i=0;i<sz;i++)if(E[i])o++;
-        if(o>sz-o)for(int i=0;i<sz;i++)E[i]^=1;
-        for(int a=0;a<hr;a++)for(int b=0;b<hs;b++)
-            out[((si+2*a)%r)*s+((sj+2*b)%s)]=E[SEC(a,b)];
-    }
-    #undef SEC
-}
-
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out);
 
@@ -298,8 +240,10 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
     }
     if(nfaces==0){solve_plane(r,s,syn,out);return;}
 
+    uint8_t *S=calloc(MAX_N,1), *E=calloc(MAX_N,1); double *W=calloc(MAX_N,sizeof(double));
+    if(!S||!E||!W){free(S);free(E);free(W);for(int f=0;f<4;f++)free(Ec_arr[f]);return;}
     for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
-        uint8_t S[MAX_N],E[MAX_N]; double W[MAX_N]; memset(E,0,sz);
+        memset(E,0,sz);
         for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
             int q=((si+2*a)%r)*s+((sj+2*b)%s);
             S[SEC(a,b)]=syn[q]; W[SEC(a,b)]=cost_map[q];
@@ -337,6 +281,7 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
         for(int a=0;a<hr;a++)for(int b=0;b<hs;b++)
             out[((si+2*a)%r)*s+((sj+2*b)%s)]=E[SEC(a,b)];
     }
+    free(S); free(E); free(W);
     #undef SEC
     for(int f=0;f<4;f++) free(Ec_arr[f]);
 }
@@ -350,8 +295,10 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     // Use flat 1D arrays indexed as [a*hs + b] — supports any hr,hs ≤ MAX_R/2
     #define SEC(a,b) ((a)*hs + (b))
     int sz = hr * hs;
-    uint8_t S[MAX_N], best_E[MAX_N], E[MAX_N];
-    double W[MAX_N], best_sec = 1e100;
+    uint8_t *S=calloc(MAX_N,1), *best_E=calloc(MAX_N,1), *E=calloc(MAX_N,1);
+    double *W=calloc(MAX_N,sizeof(double));
+    double best_sec = 1e100;
+    if(!S||!best_E||!E||!W){free(S);free(best_E);free(E);free(W);return 0;}
 
     // 4 independent (1+x)(1+y) toric codes on the (hr)×(hs) torus.
     // Check: S[a][b] = E[a][b] ^ E[a+1][b] ^ E[a][b+1] ^ E[a+1][b+1]
@@ -394,6 +341,7 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             if(best_E[SEC(a,b)]) out[((si+2*a)%r)*s + ((sj+2*b)%s)] ^= 1;
     }
     #undef SEC
+    free(S); free(best_E); free(E); free(W);
     int cap = effective_cap(n);
     if(cap > 0) {
         int flips=0; for(int q=0;q<n;q++) flips+=out[q];
@@ -1323,101 +1271,118 @@ int main(int argc, char **argv) {
             fwrite(out,1,n,stdout); fflush(stdout);
             return 0;
         }
-        else if(!strcmp(argv[i],"--decode-persist")) {
+        else if(!strcmp(argv[i],"--decode-soft")) {
+            // Adaptive syndrome cleanup: majority-vote for low-reliability ancillas
             int n=r*s, rounds;
-            if (fread(&rounds,4,1,stdin)!=1 || rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
-            // Stream rounds: accumulate coarse-level votes per face
-            uint8_t syn[MAX_N], raw_last[MAX_N];
-            int hr=r/2, hs=s/2;
-            int K=2; while(hr%K==0&&hs%K==0) K++; // first non-divisor creates boundary
-            int nfaces=0, hrc_arr[4], hsc_arr[4];
-            { int any=0; for(int f=0;f<4;f++){int hrc=hr/K,hsc=hs/K;if(hrc>=1&&hsc>=1)any=1;}
-              if(!any) goto fallback_single; }
-            // Per-face coarse vote accumulators
-            int *coarse_votes[4]={0}; int coarse_sz[4]={0};
-            for(int f=0;f<4;f++){
-                hrc_arr[f]=hr/K; hsc_arr[f]=hs/K;
-                if(hrc_arr[f]<1||hsc_arr[f]<1) continue;
-                coarse_sz[f]=hrc_arr[f]*hsc_arr[f];
-                coarse_votes[f]=calloc(coarse_sz[f],sizeof(int));
-                if(!coarse_votes[f]){for(int g=0;g<f;g++)free(coarse_votes[g]);goto fallback_single;}
-                nfaces++;
-            }
-            int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
+            uint8_t *all=malloc((size_t)rounds*n);
+            if(!all) return 1;
             for(int rnd=0;rnd<rounds;rnd++){
-                if(fread(syn,1,n,stdin)!=(size_t)n){goto cleanup_persist;}
-                // Accumulate coarse votes per sector: decimate syndrome into hr×hs
-                // then aggregate K×K blocks of the sector grid
-                for(int f=0;f<4;f++){
-                    if(!coarse_votes[f]) continue;
-                    int hrc=hrc_arr[f], hsc=hsc_arr[f], *v=coarse_votes[f];
-                    int si=dx[f], sj=dy[f];
-                    for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
-                        int acc=0;
-                        for(int da=0;da<K;da++)for(int db=0;db<K;db++){
-                            int aa=K*a+da, bb=K*b+db;
-                            int q=((si+2*aa)%r)*s+((sj+2*bb)%s);
-                            acc^=syn[q];
-                        }
-                        if(acc) v[a*hsc+b]++;
-                    }
-                }
-                if(rnd==rounds-1) memcpy(raw_last,syn,n);
+                if(fread(all+rnd*n,1,n,stdin)!=(size_t)n){free(all);return 1;}
             }
-            // Compute MV coarse solutions from accumulated votes
-            uint8_t *Ec_arr[4]={0};
-            for(int f=0;f<4;f++){
-                if(!coarse_votes[f]) continue;
-                int sz=coarse_sz[f], hrc=hrc_arr[f], hsc=hsc_arr[f];
-                Ec_arr[f]=malloc(sz); if(!Ec_arr[f]) continue;
-                uint8_t *Ec=Ec_arr[f]; int *v=coarse_votes[f];
-                #define FCC(a,b) ((a)*hsc+(b))
-                // MV coarse syndrome Sc
-                for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
-                    uint8_t bit=(v[FCC(a,b)]>rounds/2)?1:0;
-                    // Forward-pass to get Ec from Sc
-                    if(a>0||b>0) continue; // use recurrence below
-                    Ec[FCC(a,b)]=bit;
-                }
-                // Recurrence: Ec[a+1][b+1] = Sc[a][b] ^ Ec[a][b] ^ Ec[a+1][b] ^ Ec[a][b+1]
-                for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++)
-                    Ec[FCC(a,b)]=(v[FCC(a,b)]>rounds/2)?1:0;
-                for(int a=0;a<hrc-1;a++)for(int b=0;b<hsc-1;b++)
-                    Ec[FCC(a+1,b+1)]=Ec[FCC(a,b)]^Ec[FCC(a+1,b)]^Ec[FCC(a,b+1)]^((v[FCC(a,b)]>rounds/2)?1:0);
-                // Coarse descent
-                for(;;){int chg=0;
-                    for(int b=0;b<hsc;b++){int w0=0,w1=0;
-                        for(int a=0;a<hrc;a++){if(Ec[FCC(a,b)])w0++;else w1++;}
-                        if(w1<w0){for(int a=0;a<hrc;a++)Ec[FCC(a,b)]^=1;chg=1;}}
-                    for(int a=0;a<hrc;a++){int w0=0,w1=0;
-                        for(int b=0;b<hsc;b++){if(Ec[FCC(a,b)])w0++;else w1++;}
-                        if(w1<w0){for(int b=0;b<hsc;b++)Ec[FCC(a,b)]^=1;chg=1;}}
-                    if(!chg)break;}
-                #undef FCC
+            // Compute per-ancilla reliability and majority-vote syndrome
+            uint8_t mv_syn[MAX_N]={0};
+            int *cnt=calloc(n,sizeof(int));
+            for(int r=0;r<rounds;r++) for(int q=0;q<n;q++) if(all[r*n+q]) cnt[q]++;
+            int thresh=rounds/2+1;
+            for(int q=0;q<n;q++) if(cnt[q]>=thresh) mv_syn[q]=1;
+            uint8_t raw_last[MAX_N];
+            memcpy(raw_last, all+(rounds-1)*n, n);
+            free(all);
+            // Adaptive blend: keep last-round value for high-reliability ancillas,
+            // fall back to majority vote for low-reliability ones
+            for(int q=0;q<n;q++){
+                if(cnt[q]>=rounds-1) {} // keep raw_last[q] (high reliability → trust last round)
+                else if(cnt[q]<=1) raw_last[q]=mv_syn[q]; // low reliability → use MV
+                // else: medium reliability → keep last round (do nothing)
             }
-            // Free accumulators
-            for(int f=0;f<4;f++) free(coarse_votes[f]);
-            // 10-pass pipeline with precomputed Ec from coarse-level MV
+            free(cnt);
+            // 10-pass pipeline with cleaned syndrome
+            uint8_t syn[MAX_N], dec[MAX_N], total[MAX_N];
             memcpy(syn, raw_last, n);
-            uint8_t dec[MAX_N], total_dec[MAX_N];
-            memset(total_dec, 0, n);
+            memset(total,0,n);
             for(int pass=0;pass<10;pass++){
                 preprocess_syndrome(r,s,syn);
-                solve_plane_5d_with_ec(r,s,syn,Ec_arr,hrc_arr,hsc_arr,nfaces,dec);
-                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
-                uint8_t guess_syn[MAX_N];
-                syndrome_of(r,s,total_dec,guess_syn);
-                for(int q=0;q<n;q++) syn[q]=raw_last[q]^guess_syn[q];
+                solve_plane(r,s,syn,dec);
+                for(int q=0;q<n;q++) total[q]^=dec[q];
+                uint8_t gs[MAX_N]; syndrome_of(r,s,total,gs);
+                for(int q=0;q<n;q++) syn[q]=raw_last[q]^gs[q];
             }
-            fwrite(total_dec,1,n,stdout); fflush(stdout);
-            for(int f=0;f<4;f++) free(Ec_arr[f]);
+            fwrite(total,1,n,stdout); fflush(stdout);
             return 0;
-        cleanup_persist:
-            for(int f=0;f<4;f++) free(coarse_votes[f]);
-        fallback_single:
-            // Fallback: single-round decode if multi-round setup fails
-            { uint8_t dec[MAX_N]; solve_plane(r,s,raw_last,dec);
-              fwrite(dec,1,n,stdout); fflush(stdout); return 0; }
+        }
+        else if(!strcmp(argv[i],"--decode-persist")) {
+            int n=r*s, rounds;
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
+            uint8_t *per_round=malloc((size_t)rounds*n);
+            if(!per_round){fprintf(stderr,"alloc fail\n");return 1;}
+            for(int rnd=0;rnd<rounds;rnd++){
+                if(fread(per_round+rnd*n,1,n,stdin)!=(size_t)n){free(per_round);return 1;}
+            }
+            // Phase 1: 3-pass decode each round, build consensus correction
+            uint8_t *dec_round=malloc((size_t)rounds*n);
+            if(!dec_round){free(per_round);return 1;}
+            uint8_t syn[MAX_N], dec[MAX_N], acc[MAX_N], res[MAX_N];
+            for(int rnd=0;rnd<rounds;rnd++){
+                memcpy(syn,per_round+rnd*n,n);
+                memset(acc,0,n); memcpy(res,syn,n);
+                for(int pass=0;pass<3;pass++){
+                    preprocess_syndrome(r,s,res);
+                    solve_plane_layered(r,s,res,dec);
+                    for(int q=0;q<n;q++)acc[q]^=dec[q];
+                    syndrome_of(r,s,acc,res);
+                    for(int q=0;q<n;q++)res[q]^=syn[q];
+                }
+                memcpy(dec_round+rnd*n,acc,n);
+            }
+            // Per-cell consensus: correct in ≥ rounds-1 rounds
+            uint8_t consensus[MAX_N]; memset(consensus,0,n);
+            for(int q=0;q<n;q++){
+                int cnt=0;
+                for(int r=0;r<rounds;r++)if(dec_round[r*n+q])cnt++;
+                if(cnt*3>rounds)consensus[q]=1;
+            }
+            free(dec_round);
+            // Compute residual: last-round syndrome XOR syndrome of consensus
+            uint8_t raw_last[MAX_N]; memcpy(raw_last,per_round+(rounds-1)*n,n);
+            free(per_round);
+            uint8_t cons_syn[MAX_N]; syndrome_of(r,s,consensus,cons_syn);
+            uint8_t residual[MAX_N];
+            for(int q=0;q<n;q++)residual[q]=raw_last[q]^cons_syn[q];
+            // Phase 2: pipeline decode the residual, accumulate into consensus
+            uint8_t total[MAX_N]; memcpy(total,consensus,n);
+            memcpy(syn,residual,n);
+            for(int pass=0;pass<15;pass++){
+                preprocess_syndrome(r,s,syn);
+                solve_plane_layered(r,s,syn,dec);
+                for(int q=0;q<n;q++)total[q]^=dec[q];
+                syndrome_of(r,s,total,syn);
+                for(int q=0;q<n;q++)syn[q]^=raw_last[q];
+            }
+            fwrite(total,1,n,stdout);fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-mv")) {
+            // Majority-vote of per-round corrections (suppresses measurement noise)
+            uint8_t dec[MAX_N], total[MAX_N], syn_r[MAX_N];
+            int n=r*s, rounds;
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
+            memset(total,0,n);
+            for(int rnd=0;rnd<rounds;rnd++){
+                if(fread(syn_r,1,n,stdin)!=(size_t)n){fprintf(stderr,"short read\n");return 1;}
+                uint8_t residual[MAX_N]; memcpy(residual,syn_r,n);
+                uint8_t acc[MAX_N]; memset(acc,0,n);
+                for(int pass=0;pass<5;pass++){
+                    preprocess_syndrome(r,s,residual);
+                    solve_plane(r,s,residual,dec);
+                    for(int q=0;q<n;q++) acc[q]^=dec[q];
+                    uint8_t gs[MAX_N]; syndrome_of(r,s,acc,gs);
+                    for(int q=0;q<n;q++) residual[q]=syn_r[q]^gs[q];
+                }
+                for(int q=0;q<n;q++) total[q]^=acc[q];
+            }
+            fwrite(total,1,n,stdout); fflush(stdout);
+            return 0;
         }
         else if(!strcmp(argv[i],"--decode-mr")) {
             // Multi-round: stdin = round_count(u32) + round_count*N syndrome bytes

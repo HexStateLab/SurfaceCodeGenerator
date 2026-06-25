@@ -261,17 +261,16 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
               } \
             } c; })
         for(;;){int chg=0;
-            for(int b=0;b<hs;b++){
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++){
                 double c0=BCOST(E);
-                for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}
-                else chg=1;
-            }
-            for(int a=0;a<hr;a++){
-                double c0=BCOST(E);
-                for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}
-                else chg=1;
+                for(int aa=0;aa<hr;aa++)E[SEC(aa,b)]^=1;
+                for(int bb=0;bb<hs;bb++)E[SEC(a,bb)]^=1;
+                E[SEC(a,b)]^=1;
+                if(BCOST(E)>=c0){
+                    for(int aa=0;aa<hr;aa++)E[SEC(aa,b)]^=1;
+                    for(int bb=0;bb<hs;bb++)E[SEC(a,bb)]^=1;
+                    E[SEC(a,b)]^=1;
+                } else chg=1;
             }
             if(!chg)break;
         }

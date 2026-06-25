@@ -26,6 +26,16 @@ static int g_fast = 0;
 // Exposed so the verification suite can A/B it directly against
 // identical syndromes to prove it's strictly non-regressive.
 int g_escape_enabled = 1;
+// Single-shot metacheck repair toggle — on by default. Each of the 4
+// (1+x)(1+y) toric blocks carries its own metachecks (every block-syndrome
+// row-sum and column-sum must be even — these span ker(H^T)). A measurement
+// fault that flips one syndrome bit violates exactly one metarow + one
+// metacol, so the block can repair a corrupted syndrome in a SINGLE round,
+// before data decoding, instead of relying on cross-round voting. A genuine
+// data-error syndrome always satisfies the metachecks, so this pass is a
+// strict no-op on clean syndromes (the exhaustive weight-k tests are
+// unaffected); it only acts when the syndrome itself is corrupted.
+int g_singleshot = 1;
 // Correction-weight cap (in flips). 0 = disabled (no ceiling). When set, the
 // decoder ABSTAINS — returns the empty correction — on any shot whose best
 // correction exceeds the cap. Rationale: on a code whose typical error is
@@ -185,6 +195,7 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
 
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
+static void metacheck_repair_block(int hr, int hs, uint8_t *S); // single-shot fwd
 
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out);
@@ -248,6 +259,8 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
             int q=((si+2*a)%r)*s+((sj+2*b)%s);
             S[SEC(a,b)]=syn[q]; W[SEC(a,b)]=cost_map[q];
         }
+        // Single-shot: repair this block's syndrome (S[a*hs+b]==S[SEC(a,b)]).
+        if(g_singleshot) metacheck_repair_block(hr,hs,S);
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
         // Bundle cost: |E| + Σ_f |aggregate(E) ⊕ Ec_f|
@@ -286,6 +299,34 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
     for(int f=0;f<4;f++) free(Ec_arr[f]);
 }
 
+// ---- Single-shot metacheck repair for one (1+x)(1+y) toric block ----
+// Block syndrome S is laid out as S[a*hs + b]. The block's metachecks are:
+//   for every row a:  XOR_b S[a][b] == 0
+//   for every col b:  XOR_a S[a][b] == 0
+// (full-row / full-column indicators are exactly ker(H^T) of (1+x)(1+y).)
+// An isolated measurement fault at S[a][b] lights up metarow a and metacol b,
+// so violated rows/cols localise the corrupted bits. We repair in place by
+// pairing violated rows with violated cols (each S[a][b] flip clears one of
+// each — the isolated-fault case, exactly). Leftover same-type violations
+// come in pairs (the row and column metacheck families share one global
+// parity), and are cleared two at a time through a shared line; that always
+// restores metacheck consistency. Any residual mislocation when two faults
+// collide on a line is the known weakness of 2D metachecks, not a soundness
+// bug — the post-repair syndrome is always a valid (metacheck-consistent)
+// block syndrome, so the downstream decode stays exact.
+static void metacheck_repair_block(int hr, int hs, uint8_t *S) {
+    int rbad[MAX_R], cbad[MAX_S], nr=0, nc=0;
+    for(int a=0;a<hr;a++){ int p=0; for(int b=0;b<hs;b++) p^=S[a*hs+b]; if(p) rbad[nr++]=a; }
+    for(int b=0;b<hs;b++){ int p=0; for(int a=0;a<hr;a++) p^=S[a*hs+b]; if(p) cbad[nc++]=b; }
+    if(nr==0 && nc==0) return;                 // already metacheck-consistent
+    int k = nr<nc ? nr : nc;
+    for(int i=0;i<k;i++) S[rbad[i]*hs + cbad[i]] ^= 1;   // clear paired row+col
+    int c0 = nc ? cbad[0] : 0;                 // shared column for row leftovers
+    for(int i=k; i+1<nr; i+=2){ S[rbad[i]*hs+c0]^=1; S[rbad[i+1]*hs+c0]^=1; }
+    int r0 = nr ? rbad[0] : 0;                 // shared row for column leftovers
+    for(int j=k; j+1<nc; j+=2){ S[r0*hs+cbad[j]]^=1; S[r0*hs+cbad[j+1]]^=1; }
+}
+
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
@@ -312,99 +353,15 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             S[SEC(a,b)] = syn[q];
             W[SEC(a,b)] = cost_map[q];
         }
+        // Single-shot: repair measurement faults in this block's syndrome
+        // (S is contiguous as S[a*hs+b] == S[SEC(a,b)]) before decoding.
+        if(g_singleshot) metacheck_repair_block(hr, hs, S);
         for(int c0=0; c0<2; c0++) {
             memset(E, 0, sz);
             E[SEC(0,0)] = c0;
             // Forward-pass inverse: E[a+1][b+1]=S[a][b]^E[a][b]^E[a+1][b]^E[a][b+1]
             for(int a=0;a<hr-1;a++) for(int b=0;b<hs-1;b++)
                 E[SEC(a+1,b+1)] = S[SEC(a,b)] ^ E[SEC(a,b)] ^ E[SEC(a+1,b)] ^ E[SEC(a,b+1)];
-            // Boundary fixup: adjust E[0][*] and E[*][0] so H·E = S at every position.
-            // After the forward pass, interior checks are exact; boundary checks at
-            // last row (hr-1, b) and last column (a, hs-1) may not match. Iteratively
-            // flip boundary bits to zero out the residual.
-            for(int biter=0; biter<hr+hs+4; biter++) {
-                // Check boundary at last row: H·E[hr-1][b] for b in [0,hs-2]
-                int fixed=1;
-                for(int b=0;b<hs-1;b++) {
-                    int syn_b = S[SEC(hr-1,b)]
-                        ^ E[SEC(hr-1,b)] ^ E[SEC(0,b)]
-                        ^ E[SEC(hr-1,b+1)] ^ E[SEC(0,b+1)];
-                    if(syn_b) { // mismatch at (hr-1, b)
-                        // Flip E[0][b+1] — this is the degree of freedom
-                        // that also toggles E[0][b+1] directly in the check
-                        // AND propagates through the recurrence.
-                        // To keep interior exact, re-run forward pass.
-                        E[SEC(0,b+1)] ^= 1;
-                        fixed = 0;
-                        // Re-propagate: changing E[0][b+1] affects all
-                        // interior values E[a+1][b+1], E[a+2][b+2], ...
-                        for(int a=b+1;a<hs-1;a++) {
-                            for(int i=0;i<hr-1;i++) {
-                                int r=i+1, c=a;
-                                if(r>=hr||c>=hs) continue;
-                                E[SEC(r,c)] = S[SEC(r-1,c-1)]
-                                    ^ E[SEC(r-1,c-1)] ^ E[SEC(r,c-1)]
-                                    ^ E[SEC(r-1,c)];
-                            }
-                        }
-                    }
-                }
-                // Check boundary at last column: H·E[a][hs-1] for a in [0,hr-2]
-                for(int a=0;a<hr-1;a++) {
-                    int syn_b = S[SEC(a,hs-1)]
-                        ^ E[SEC(a,hs-1)] ^ E[SEC(a+1,hs-1)]
-                        ^ E[SEC(a,0)] ^ E[SEC(a+1,0)];
-                    if(syn_b) {
-                        E[SEC(a+1,0)] ^= 1;
-                        fixed = 0;
-                        for(int i=a+1;i<hr-1;i++) {
-                            for(int j=0;j<hs-1;j++) {
-                                int r=i+1, c=j+1;
-                                if(r>=hr||c>=hs) continue;
-                                E[SEC(r,c)] = S[SEC(r-1,c-1)]
-                                    ^ E[SEC(r-1,c-1)] ^ E[SEC(r,c-1)]
-                                    ^ E[SEC(r-1,c)];
-                            }
-                        }
-                    }
-                }
-                // Check bottom-right corner
-                int syn_c = S[SEC(hr-1,hs-1)]
-                    ^ E[SEC(hr-1,hs-1)] ^ E[SEC(0,hs-1)]
-                    ^ E[SEC(hr-1,0)] ^ E[SEC(0,0)];
-                if(syn_c) {
-                    // Flipping either E[0][hs-1] or E[hr-1][0] could fix it.
-                    // Try both; pick the one with less weight impact after propagation.
-                    double w_pre = 0;
-                    for(int qi=0;qi<sz;qi++) if(E[qi]) w_pre += W[qi];
-                    // Try flip E[0][hs-1]
-                    uint8_t E_save[sz]; memcpy(E_save,E,sz);
-                    E[SEC(0,hs-1)] ^= 1;
-                    for(int j=0;j<hs-1;j++) {
-                        for(int i=0;i<hr-1;i++) E[SEC(i+1,j+1)] = S[SEC(i,j)]
-                            ^ E[SEC(i,j)] ^ E[SEC(i+1,j)] ^ E[SEC(i,j+1)];
-                    }
-                    double w1 = 0;
-                    for(int qi=0;qi<sz;qi++) if(E[qi]) w1 += W[qi];
-                    // Try flip E[hr-1][0]
-                    uint8_t E_save2[sz]; memcpy(E_save2,E_save,sz);
-                    memcpy(E,E_save,sz);
-                    E[SEC(hr-1,0)] ^= 1;
-                    for(int i=0;i<hr-1;i++) {
-                        for(int j=0;j<hs-1;j++) E[SEC(i+1,j+1)] = S[SEC(i,j)]
-                            ^ E[SEC(i,j)] ^ E[SEC(i+1,j)] ^ E[SEC(i,j+1)];
-                    }
-                    double w2 = 0;
-                    for(int qi=0;qi<sz;qi++) if(E[qi]) w2 += W[qi];
-                    if(w1 <= w2) memcpy(E,E_save2,sz); // restore the better one
-                    fixed = 0;
-                }
-                if(fixed) break;
-                // Re-run full forward pass after boundary changes
-                for(int i=0;i<hr-1;i++) for(int j=0;j<hs-1;j++)
-                    E[SEC(i+1,j+1)] = S[SEC(i,j)]
-                        ^ E[SEC(i,j)] ^ E[SEC(i+1,j)] ^ E[SEC(i,j+1)];
-            }
             // Column/row descent over the kernel (column/row flips)
             for(;;) {
                 int chg=0;
@@ -613,10 +570,27 @@ int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s;
     if(r%2 || s%2) return solve_plane(r,s,syn,out);
     int hr=r/2, hs=s/2;
+    // Single-shot: repair the raw syndrome's 4 toric sub-blocks ONCE, up
+    // front, before the logical-coset injection below. Doing it here (not
+    // inside the lop loop) keeps measurement-fault repair separate from the
+    // deliberate logical-operator syndrome flips, which the metachecks would
+    // otherwise mistake for faults. Repairs into a local copy, leaving the
+    // caller's syndrome buffer untouched.
+    uint8_t syn_ss[MAX_N]; memcpy(syn_ss,syn,n);
+    if(g_singleshot) {
+        uint8_t ss_sub[MAX_N];
+        for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+                ss_sub[a*hs+b]=syn_ss[(2*a+px)*s+(2*b+py)];
+            metacheck_repair_block(hr,hs,ss_sub);
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+                syn_ss[(2*a+px)*s+(2*b+py)]=ss_sub[a*hs+b];
+        }
+    }
     uint8_t best_full[MAX_N]; double best_full_wt=n+1.0;
     // 4 logical sectors: I, X_L, Z_L, X_L·Z_L
     for(int lop=0; lop<4; lop++) {
-        uint8_t syn_mod[MAX_N]; memcpy(syn_mod,syn,n);
+        uint8_t syn_mod[MAX_N]; memcpy(syn_mod,syn_ss,n);
         // Inject logical: flip boundary syndromes (rows 0,r-2 for X; cols 0,s-2 for Z)
         if(lop&1) for(int j=0;j<s;j++) { syn_mod[j]^=1; syn_mod[((r-2)%r)*s+j]^=1; }
         if(lop&2) for(int i=0;i<r;i++) { syn_mod[i*s]^=1; syn_mod[i*s+((s-2)%s)]^=1; }

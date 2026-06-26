@@ -34,11 +34,15 @@ print(f"  Match: {match}")
 # -- Test 2: with injected errors
 print("\n=== Test 2: Error injection on data qubits ===")
 def inject_errors(qc, r, s, error_positions):
-    """Apply X gates to inject Z errors at given (i,j) positions."""
+    """Insert X gates at position 0 to inject Z errors before extraction."""
+    from qiskit import QuantumCircuit
+    new_qc = QuantumCircuit(*qc.qregs, *qc.cregs)
     n_data = r * s
     for i, j in error_positions:
-        qc.x(i * s + j)
-    return qc
+        new_qc.x(i * s + j)
+    for inst in qc.data:
+        new_qc._append(inst)
+    return new_qc
 
 # Inject 2 errors: one at (0,0), one at (1,2)
 errors = [(0,0), (1,2)]

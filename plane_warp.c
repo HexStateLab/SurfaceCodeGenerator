@@ -226,6 +226,33 @@ static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out);      // ad
 
 static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out);
 
+// Canonicalize a correction by removing kernel freedom of the (1+x²)(1+y²) check.
+// Each of the 4 parity sub-lattices is a (1+u)(1+v) toric block whose kernel
+// consists of row flips and column flips within that sub-lattice.
+// Canonical form: sub-lattice row 0 = 0, sub-lattice column 0 = 0.
+static void canonicalize(int r, int s, uint8_t *corr) {
+    if((r & 1) || (s & 1)) return;
+    int hr = r/2, hs = s/2;
+    for(int si=0; si<2; si++) for(int sj=0; sj<2; sj++) {
+        int r0 = si;
+        for(int b=0; b<hs; b++) {
+            int c0 = sj + 2*b;
+            if(corr[r0 * s + c0]) {
+                for(int a=0; a<hr; a++)
+                    corr[(si + 2*a) * s + c0] ^= 1;
+            }
+        }
+        int c0 = sj;
+        for(int a=1; a<hr; a++) {
+            int rr = si + 2*a;
+            if(corr[rr * s + c0]) {
+                for(int b=0; b<hs; b++)
+                    corr[rr * s + (sj + 2*b)] ^= 1;
+            }
+        }
+    }
+}
+
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     solve_plane_5d_mv(r, s, syn, syn, out);
 }
@@ -1724,6 +1751,7 @@ int main(int argc, char **argv) {
                     syndrome_of(r,s,p1_acc,p1_res);
                     for(int q=0;q<n;q++) p1_res[q]^=diff[q];
                 }
+                canonicalize(r, s, p1_acc);
                 memcpy(delta+c*n,p1_acc,n);
             }
             free(diff); free(p1_acc); free(p1_res); free(p1_dec);
@@ -1739,6 +1767,7 @@ int main(int argc, char **argv) {
                 syndrome_of(r,s,base,p2_res);
                 for(int q=0;q<n;q++) p2_res[q]^=per_round[0*n+q];
             }
+            canonicalize(r, s, base);
             free(p2_res); free(p2_dec);
             // Phase 3: forward‑accumulate deltas from round 0 to build all corr_c
             uint8_t *corr=calloc((size_t)rounds*n,1);

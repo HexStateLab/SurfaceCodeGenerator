@@ -1694,15 +1694,14 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-tesseract")) {
-            // 4D tesseract decoder with proper W-axis rotation.
-            // Dimensions: r×s (spatial) × R (rounds/z) × P (slices/w).
-            // The (1+z)(1+w) recurrence:
-            //   delta_c = solve_2D(syn_c ⊕ syn_{c+1})  (W-rotation: data error falls out)
-            //   abs_c   = solve_2D(syn_c)              (absolute decode, has data + noise)
-            //   base = abs_{mid} where mid=R/2          (middle round, min noise propagation)
-            //   corr_c = base ⊕ ⊕_{k=min(c,mid)}^{max(c,mid)-1} delta_k
-            // Noise at round m affects ONLY corr_m (delta_m and delta_{m-1} cancel in
-            // other rounds). Consensus across all R corr values suppresses the noise.
+            // 4D tesseract decoder — temporal-diff chain with round‑0 base.
+            // syn_c = syndrome at round c = H * acc_c ⊕ n_c
+            // delta_c = solve_2D(syn_c ⊕ syn_{c+1})   — W‑axis rotation
+            // base_0 = solve_2D(syn_0)                — round 0: ~0 data errors
+            // corr_c = base_0 ⊕ ⊕_{k=0}^{c-1} delta_k
+            //        ≈ acc_c ⊕ n_c                    (intermediate noise cancels)
+            // Noise n_m appears ONLY in corr_m.  Base‑0 noise n_0 cancels through
+            // the chain (n_0 ⊕ n_0 = 0 from delta_0).  Consensus suppresses noise.
             int n=r*s, rounds;
             if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *per_round=malloc((size_t)rounds*n);
@@ -1710,12 +1709,11 @@ int main(int argc, char **argv) {
             for(int rnd=0;rnd<rounds;rnd++){
                 if(fread(per_round+rnd*n,1,n,stdin)!=(size_t)n){free(per_round);return 1;}
             }
-            // Phase 1: decode each diff syndrome  syn_c ⊕ syn_{c+1}  (W-axis rotation)
-            // Diffs are sparse (measurement noise only), so use solve_plane (not layered).
+            // Phase 1: temporal diffs — decode syn_c ⊕ syn_{c+1}
             uint8_t *delta=calloc((size_t)(rounds-1)*n,1);
             if(!delta){free(per_round);return 1;}
             uint8_t *diff=malloc(n), *p1_acc=malloc(n), *p1_res=malloc(n), *p1_dec=malloc(n);
-            if(!diff||!p1_acc||!p1_res||!p1_dec){free(delta);free(per_round);free(diff);free(p1_acc);free(p1_res);free(p1_dec);return 1;}
+            if(!diff||!p1_acc||!p1_res||!p1_dec){free(per_round);free(delta);free(diff);free(p1_acc);free(p1_res);free(p1_dec);return 1;}
             for(int c=0;c<rounds-1;c++){
                 for(int q=0;q<n;q++) diff[q]=per_round[c*n+q]^per_round[(c+1)*n+q];
                 memset(p1_acc,0,n); memcpy(p1_res,diff,n);
@@ -1729,59 +1727,47 @@ int main(int argc, char **argv) {
                 memcpy(delta+c*n,p1_acc,n);
             }
             free(diff); free(p1_acc); free(p1_res); free(p1_dec);
-            // Phase 2: decode middle round's absolute syndrome (base)
-            int mid=rounds/2;
+            // Phase 2: base at round 0 (~0 data errors, only measurement noise)
             uint8_t *base=malloc(n), *p2_res=malloc(n), *p2_dec=malloc(n);
             if(!base||!p2_res||!p2_dec){free(base);free(p2_res);free(p2_dec);free(delta);free(per_round);return 1;}
-            memcpy(p2_res,per_round+mid*n,n);
+            memcpy(p2_res,per_round+0*n,n);
             memset(base,0,n);
             for(int pass=0;pass<5;pass++){
                 preprocess_syndrome(r,s,p2_res);
                 solve_plane_layered(r,s,p2_res,p2_dec);
                 for(int q=0;q<n;q++) base[q]^=p2_dec[q];
                 syndrome_of(r,s,base,p2_res);
-                for(int q=0;q<n;q++) p2_res[q]^=per_round[mid*n+q];
+                for(int q=0;q<n;q++) p2_res[q]^=per_round[0*n+q];
             }
             free(p2_res); free(p2_dec);
-            // Phase 3: build per-round corrections from base ± deltas
+            // Phase 3: forward‑accumulate deltas from round 0 to build all corr_c
             uint8_t *corr=calloc((size_t)rounds*n,1);
-            if(!corr){free(delta);free(per_round);return 1;}
-            memcpy(corr+mid*n,base,n);
-            // Propagate forward from mid to later rounds
-            uint8_t *acc=malloc(n);
-            if(!acc){free(corr);free(delta);free(per_round);return 1;}
-            memcpy(acc,base,n);
-            for(int c=mid;c<rounds-1;c++){
-                for(int q=0;q<n;q++) acc[q]^=delta[c*n+q];
-                memcpy(corr+(c+1)*n,acc,n);
+            if(!corr){free(base);free(delta);free(per_round);return 1;}
+            memcpy(corr,base,n);
+            for(int c=0;c<rounds-1;c++){
+                for(int q=0;q<n;q++) corr[(c+1)*n+q]=corr[c*n+q]^delta[c*n+q];
             }
-            // Propagate backward from mid to earlier rounds
-            memcpy(acc,base,n);
-            for(int c=mid-1;c>=0;c--){
-                for(int q=0;q<n;q++) acc[q]^=delta[c*n+q];
-                memcpy(corr+c*n,acc,n);
-            }
-            free(acc); free(delta);
-            // Phase 4: consensus across rounds (noise at round m affects only corr_m)
+            free(delta);
+            // Phase 4: consensus
             uint8_t *consensus=calloc(n,1);
-            if(!consensus){free(corr);free(per_round);return 1;}
+            if(!consensus){free(corr);free(base);free(per_round);return 1;}
             for(int q=0;q<n;q++){
                 int cnt=0;
                 for(int c=0;c<rounds;c++) if(corr[c*n+q]) cnt++;
                 if(cnt*3>rounds) consensus[q]=1;
             }
             free(corr);
-            // Phase 5: residual decode of last-round syndrome
+            // Phase 5: residual decode of last‑round syndrome
             uint8_t *raw_last=malloc(n);
             uint8_t *cons_syn=calloc(n,1);
             uint8_t *residual=malloc(n);
             uint8_t *syn2=malloc(n), *dec2=malloc(n), *total=malloc(n);
             if(!raw_last||!cons_syn||!residual||!syn2||!dec2||!total){
                 free(consensus);free(raw_last);free(cons_syn);free(residual);
-                free(syn2);free(dec2);free(total);free(per_round);return 1;
+                free(syn2);free(dec2);free(total);free(base);free(per_round);return 1;
             }
             memcpy(raw_last,per_round+(rounds-1)*n,n);
-            free(per_round);
+            free(per_round); free(base);
             syndrome_of(r,s,consensus,cons_syn);
             for(int q=0;q<n;q++) residual[q]=raw_last[q]^cons_syn[q];
             memcpy(total,consensus,n);

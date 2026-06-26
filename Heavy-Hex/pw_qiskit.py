@@ -277,10 +277,8 @@ def heavy_hex_flag_layout(r, s):
             edges.add((d3, anc1))
             edges.add((d4, anc1))
 
-    # Connect the two ancillas of each stabilizer (for readout/timing)
-    for i in range(r):
-        for j in range(s):
-            edges.add((anc_maps[(i, j, 0)], anc_maps[(i, j, 1)]))
+    # No edge between ancillas: the XOR anc0 ^ anc1 is done classically
+    # Each ancilla has degree exactly 2 (native on heavy-hex degree-2 nodes)
 
     return data_map, anc_maps, list(edges), total_q
 

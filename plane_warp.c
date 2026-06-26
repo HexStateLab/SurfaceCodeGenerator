@@ -1592,7 +1592,7 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--decode-soft")) {
             // Adaptive syndrome cleanup: majority-vote for low-reliability ancillas
             int n=r*s, rounds;
-            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>32){fprintf(stderr,"bad rounds\n");return 1;}
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *all=malloc((size_t)rounds*n);
             if(!all) return 1;
             for(int rnd=0;rnd<rounds;rnd++){
@@ -1631,7 +1631,7 @@ int main(int argc, char **argv) {
         }
         else if(!strcmp(argv[i],"--decode-persist")) {
             int n=r*s, rounds;
-            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>32){fprintf(stderr,"bad rounds\n");return 1;}
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *per_round=malloc((size_t)rounds*n);
             if(!per_round){fprintf(stderr,"alloc fail\n");return 1;}
             for(int rnd=0;rnd<rounds;rnd++){
@@ -1640,24 +1640,25 @@ int main(int argc, char **argv) {
             // Phase 1: 3-pass decode each round (parallel), build consensus correction
             uint8_t *dec_round=malloc((size_t)rounds*n);
             if(!dec_round){free(per_round);return 1;}
-            // Per-round thread data
-            struct { int r,s,n,rnd; uint8_t *per_round,*dec_round; } td[32];
-            pthread_t th[32];
+            // Per-round thread data (heap-allocated to support rounds > 32)
+            struct persist_round_args *td=malloc((size_t)rounds*sizeof(struct persist_round_args));
+            pthread_t *th=malloc((size_t)rounds*sizeof(pthread_t));
+            if(!td||!th){free(per_round);free(dec_round);free(td);free(th);return 1;}
             pthread_attr_t attr;
             pthread_attr_init(&attr);
-            pthread_attr_setstacksize(&attr, 8*1024*1024); // 8MB stack per thread
+            pthread_attr_setstacksize(&attr, 8*1024*1024);
             for(int rnd=0;rnd<rounds;rnd++){
                 td[rnd].r=r; td[rnd].s=s; td[rnd].n=n;
                 td[rnd].rnd=rnd; td[rnd].per_round=per_round; td[rnd].dec_round=dec_round;
             }
-            // Spawn threads (one per round)
-            for(int rnd=0;rnd<rounds;rnd++) {
+            for(int rnd=0;rnd<rounds;rnd++)
                 pthread_create(&th[rnd], &attr, run_persist_round, &td[rnd]);
-            }
             for(int rnd=0;rnd<rounds;rnd++) pthread_join(th[rnd], NULL);
             pthread_attr_destroy(&attr);
+            free(td); free(th);
             // Per-cell consensus: correct in > rounds/3 rounds
-            uint8_t consensus[MAX_N]; memset(consensus,0,n);
+            uint8_t *consensus=calloc(n,1);
+            if(!consensus){free(dec_round);free(per_round);return 1;}
             for(int q=0;q<n;q++){
                 int cnt=0;
                 for(int r=0;r<rounds;r++)if(dec_round[r*n+q])cnt++;
@@ -1665,13 +1666,19 @@ int main(int argc, char **argv) {
             }
             free(dec_round);
             // Compute residual: last-round syndrome XOR syndrome of consensus
-            uint8_t raw_last[MAX_N]; memcpy(raw_last,per_round+(rounds-1)*n,n);
+            uint8_t *raw_last=malloc(n);
+            if(!raw_last){free(consensus);free(per_round);return 1;}
+            memcpy(raw_last,per_round+(rounds-1)*n,n);
             free(per_round);
-            uint8_t cons_syn[MAX_N]; syndrome_of(r,s,consensus,cons_syn);
-            uint8_t residual[MAX_N];
+            uint8_t *cons_syn=calloc(n,1);
+            uint8_t *residual=malloc(n);
+            uint8_t *syn2=malloc(n), *dec2=malloc(n), *total=malloc(n);
+            if(!cons_syn||!residual||!syn2||!dec2||!total){
+                free(consensus);free(raw_last);free(cons_syn);free(residual);
+                free(syn2);free(dec2);free(total);return 1;
+            }
+            syndrome_of(r,s,consensus,cons_syn);
             for(int q=0;q<n;q++)residual[q]=raw_last[q]^cons_syn[q];
-            // Phase 2: pipeline decode the residual (15 passes with preprocessing)
-            uint8_t syn2[MAX_N], dec2[MAX_N], total[MAX_N];
             memcpy(total,consensus,n);
             memcpy(syn2,residual,n);
             for(int pass=0;pass<15;pass++){
@@ -1682,6 +1689,8 @@ int main(int argc, char **argv) {
                 for(int q=0;q<n;q++)syn2[q]^=raw_last[q];
             }
             fwrite(total,1,n,stdout);fflush(stdout);
+            free(consensus);free(raw_last);free(cons_syn);free(residual);
+            free(syn2);free(dec2);free(total);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-tesseract")) {
@@ -1695,7 +1704,7 @@ int main(int argc, char **argv) {
             // Noise at round m affects ONLY corr_m (delta_m and delta_{m-1} cancel in
             // other rounds). Consensus across all R corr values suppresses the noise.
             int n=r*s, rounds;
-            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>32){fprintf(stderr,"bad rounds\n");return 1;}
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *per_round=malloc((size_t)rounds*n);
             if(!per_round){fprintf(stderr,"alloc fail\n");return 1;}
             for(int rnd=0;rnd<rounds;rnd++){
@@ -1705,31 +1714,35 @@ int main(int argc, char **argv) {
             // Diffs are sparse (measurement noise only), so use solve_plane (not layered).
             uint8_t *delta=calloc((size_t)(rounds-1)*n,1);
             if(!delta){free(per_round);return 1;}
+            uint8_t *diff=malloc(n), *p1_acc=malloc(n), *p1_res=malloc(n), *p1_dec=malloc(n);
+            if(!diff||!p1_acc||!p1_res||!p1_dec){free(delta);free(per_round);free(diff);free(p1_acc);free(p1_res);free(p1_dec);return 1;}
             for(int c=0;c<rounds-1;c++){
-                uint8_t diff[MAX_N], acc[MAX_N], res[MAX_N], dec[MAX_N];
                 for(int q=0;q<n;q++) diff[q]=per_round[c*n+q]^per_round[(c+1)*n+q];
-                memset(acc,0,n); memcpy(res,diff,n);
+                memset(p1_acc,0,n); memcpy(p1_res,diff,n);
                 for(int pass=0;pass<5;pass++){
-                    preprocess_syndrome(r,s,res);
-                    solve_plane(r,s,res,dec);
-                    for(int q=0;q<n;q++) acc[q]^=dec[q];
-                    syndrome_of(r,s,acc,res);
-                    for(int q=0;q<n;q++) res[q]^=diff[q];
+                    preprocess_syndrome(r,s,p1_res);
+                    solve_plane(r,s,p1_res,p1_dec);
+                    for(int q=0;q<n;q++) p1_acc[q]^=p1_dec[q];
+                    syndrome_of(r,s,p1_acc,p1_res);
+                    for(int q=0;q<n;q++) p1_res[q]^=diff[q];
                 }
-                memcpy(delta+c*n,acc,n);
+                memcpy(delta+c*n,p1_acc,n);
             }
+            free(diff); free(p1_acc); free(p1_res); free(p1_dec);
             // Phase 2: decode middle round's absolute syndrome (base)
             int mid=rounds/2;
-            uint8_t base[MAX_N], res[MAX_N], dec[MAX_N];
-            memcpy(res,per_round+mid*n,n);
+            uint8_t *base=malloc(n), *p2_res=malloc(n), *p2_dec=malloc(n);
+            if(!base||!p2_res||!p2_dec){free(base);free(p2_res);free(p2_dec);free(delta);free(per_round);return 1;}
+            memcpy(p2_res,per_round+mid*n,n);
             memset(base,0,n);
             for(int pass=0;pass<5;pass++){
-                preprocess_syndrome(r,s,res);
-                solve_plane_layered(r,s,res,dec);
-                for(int q=0;q<n;q++) base[q]^=dec[q];
-                syndrome_of(r,s,base,res);
-                for(int q=0;q<n;q++) res[q]^=per_round[mid*n+q];
+                preprocess_syndrome(r,s,p2_res);
+                solve_plane_layered(r,s,p2_res,p2_dec);
+                for(int q=0;q<n;q++) base[q]^=p2_dec[q];
+                syndrome_of(r,s,base,p2_res);
+                for(int q=0;q<n;q++) p2_res[q]^=per_round[mid*n+q];
             }
+            free(p2_res); free(p2_dec);
             // Phase 3: build per-round corrections from base ± deltas
             uint8_t *corr=calloc((size_t)rounds*n,1);
             if(!corr){free(delta);free(per_round);return 1;}
@@ -1789,7 +1802,7 @@ int main(int argc, char **argv) {
             // Majority-vote of per-round corrections (suppresses measurement noise)
             uint8_t dec[MAX_N], total[MAX_N], syn_r[MAX_N];
             int n=r*s, rounds;
-            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>32){fprintf(stderr,"bad rounds\n");return 1;}
+            if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             memset(total,0,n);
             for(int rnd=0;rnd<rounds;rnd++){
                 if(fread(syn_r,1,n,stdin)!=(size_t)n){fprintf(stderr,"short read\n");return 1;}
@@ -1812,7 +1825,7 @@ int main(int argc, char **argv) {
             // Majority vote across rounds → preprocess → decode
             uint8_t syn[MAX_N], mv_syn[MAX_N], dec[MAX_N];
             int n=r*s, rounds;
-            if (fread(&rounds,4,1,stdin)!=1 || rounds<2 || rounds>32) { fprintf(stderr,"bad rounds\n"); return 1; }
+            if (fread(&rounds,4,1,stdin)!=1 || rounds<2 || rounds>4096) { fprintf(stderr,"bad rounds\n"); return 1; }
             int *votes = calloc(n, sizeof(int));
             if(!votes) return 1;
             for(int rnd=0;rnd<rounds;rnd++) {

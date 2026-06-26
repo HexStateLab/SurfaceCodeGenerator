@@ -390,6 +390,10 @@ def main():
                     help='list available QPUs (name, qubits, queue depth) and exit')
     ap.add_argument('--dry-run', action='store_true',
                     help='transpile only, print stats, do not submit')
+    ap.add_argument('--save-basis', action='store_true',
+                    help='save linear basis (syndrome,correction pairs) to ~/.planewarp_clean/basis.npz')
+    ap.add_argument('--load-basis', type=str, default=None, metavar='PATH',
+                    help='pre-load linear basis from .npz file (skips warm-up)')
     opts = ap.parse_args()
 
     if opts.clean_stats:
@@ -404,6 +408,8 @@ def main():
     rounds = opts.rounds      # syndrome extraction rounds
     shots = opts.shots        # shots per job
     postselect = opts.postselect
+    save_basis = opts.save_basis
+    load_basis = opts.load_basis
     strict = opts.strict      # 0 = off, >0 = syndrome-weight threshold
     use_buffer = opts.buffer  # buffer-plane routing via spare qubits
     share_pairs = opts.share_pairs  # share weight-2 pair measurements across plaquettes
@@ -555,8 +561,8 @@ def main():
     and_all = all_syn.all(axis=1).astype(np.uint8)   # (shots, r, s): AND over rounds, vectorized
     raw_errors = 0
     and_errors = 0
-    ens_errors = 0      # ensemble decoder — total shots where ALL methods failed
-    ens_gain = 0        # shots rescued by ensemble (AND failed, ensemble passed)
+    ens_errors = 0      # shots where ALL methods failed
+    ens_gain = 0        # shots rescued by exhaustive fallback
     total_corr_and = 0
     single_err = 0
     post_clean = 0
@@ -622,6 +628,19 @@ def main():
     basis_syn = []    # list of (r,s) arrays (linearly independent syndrome vectors)
     basis_corr = []   # list of (r,s) arrays (corresponding verified corrections)
     basis_used = 0   # shots decoded from basis
+    basis_violations = 0  # is_stabilizer failures on basis-decoded shots (should be 0)
+
+    # Pre-load basis from file if requested
+    if load_basis:
+        bp = Path(load_basis)
+        if not bp.exists():
+            print(f"  Basis file not found: {load_basis}", file=sys.stderr)
+            sys.exit(1)
+        bd = np.load(bp)
+        for i in range(len(bd['syn'])):
+            basis_syn.append(np.asarray(bd['syn'][i], dtype=np.uint8))
+            basis_corr.append(np.asarray(bd['corr'][i], dtype=np.uint8))
+        print(f"  Pre-loaded basis: {len(basis_syn)} / {r * s} syndrome-space dims")
 
     for idx in range(n_shots):
         # Method 1: raw tesseract
@@ -641,10 +660,13 @@ def main():
             # Try linear basis decoder before falling back to ensemble
             if len(basis_syn) > 0:
                 ens_corr, in_span = pw.decode_linear_basis(basis_syn, basis_corr, and_all[idx])
-                if in_span and pw.is_stabilizer(ens_corr):
-                    correction = ens_corr
-                    and_ok = True
-                    basis_used += 1
+                if in_span:
+                    if pw.is_stabilizer(ens_corr):
+                        correction = ens_corr
+                        and_ok = True
+                        basis_used += 1
+                    else:
+                        basis_violations += 1
             if not and_ok:
                 # Method 3: exhaustive — try per-round, AND, OR, majority + flips
                 ens_corr, ens_ok = decode_exhaustive(all_syn[idx], pw, r, s, max_flips=12)
@@ -705,6 +727,14 @@ def main():
         print(f"  Clean shots saved: {fname}  ({len(clean_corrections)} corrections"
               f"{', ' + str(len(strict_corrections)) + ' strict' if strict else ''})")
 
+    if save_basis and len(basis_syn) > 0:
+        bpath = CLEAN_DIR / 'basis.npz'
+        np.savez_compressed(bpath,
+            syn=np.array(basis_syn, dtype=np.uint8),
+            corr=np.array(basis_corr, dtype=np.uint8),
+            r=r, s=s)
+        print(f"  Basis saved: {bpath}  ({len(basis_syn)} entries)")
+
     print(f"\n=== Heron r2 results ===")
     print(f"  Grid:           {r}×{s}")
     print(f"  Logical qubits: {2 * r + 2 * s - 4}")
@@ -717,7 +747,8 @@ def main():
     ens_ler = ens_errors / n_shots
     print(f"  Final LER:      {ens_ler:.4f}   (AND + basis + exhaustive)")
     print(f"  Basis size:     {len(basis_syn)} / {r * s} syndrome-space dims")
-    print(f"  Basis decodes:  {basis_used} / {n_shots} shots decoded via linear basis")
+    print(f"  Basis decodes:  {basis_used} / {n_shots} shots decoded via linear basis"
+          + (f"  ({basis_violations} is_stabilizer violations — should be 0)" if basis_violations else ""))
     print(f"  Exhaustive gain: {ens_gain} / {n_shots} shots rescued by exhaustive fallback")
     if single_ler is not None:
         print(f"  Single-obs LER: {single_ler:.4f}   (logical Z on row-0 cols {','.join(map(str,LOGICAL_OBS))})")

@@ -9,11 +9,17 @@ the sub-lattice parity needed to identify which of the 2^24 cosets was decoded.
 
 Usage:
   export IBM_QUANTUM_TOKEN='your_token'
-  python3 deploy_heron.py                        # single run
+  python3 deploy_heron.py                        # single run (interactive backend chooser)
+  python3 deploy_heron.py --list-backends        # show available QPUs + queue depth, exit
+  python3 deploy_heron.py --backend ibm_kyiv     # submit to a named QPU (no prompt)
   python3 deploy_heron.py --postselect           # save clean shots
   python3 deploy_heron.py --shots 1000 --postselect
   python3 deploy_heron.py --postselect --strict  # + reject high-syndrome shots pre-decode
   python3 deploy_heron.py --clean-stats          # aggregate all clean runs
+
+When run interactively with no --backend, the script lists every operational QPU
+(>=156 qubits) with its pending-job queue and prompts you to choose; Enter selects
+the least-busy one. Piped/non-interactive runs auto-pick least-busy so they never block.
 
 Saves job ID to ~/.planewarp_jobs.json.
 Press Ctrl+C after submission to detach.
@@ -233,6 +239,89 @@ def clean_stats():
     print(f"  Archive: {CLEAN_DIR}")
 
 
+def candidate_backends(service, min_qubits=156):
+    """Operational, non-simulator backends with >= min_qubits."""
+    try:
+        pool = service.backends(min_num_qubits=min_qubits, simulator=False, operational=True)
+    except TypeError:
+        # Older runtime without these kwargs: filter manually so a >=min_qubits
+        # simulator can't be silently selected.
+        pool = [b for b in service.backends()
+                if getattr(b, "num_qubits", 0) >= min_qubits
+                and not getattr(getattr(b, "configuration", lambda: None)(), "simulator", False)]
+    return [b for b in pool if getattr(b, "num_qubits", 0) >= min_qubits]
+
+
+def backend_rows(backends):
+    """Fetch (backend, qubits, pending_jobs, status_msg) for each, tolerating errors."""
+    rows = []
+    for b in backends:
+        pending, msg = None, "operational"
+        try:
+            st = b.status()
+            pending = getattr(st, "pending_jobs", None)
+            if not getattr(st, "operational", True):
+                msg = "OFFLINE"
+        except Exception:
+            msg = "status unavailable"
+        rows.append((b, b.num_qubits, pending, msg))
+    return rows
+
+
+def print_backend_table(rows):
+    print(f"\n{'#':>2}  {'Backend':<22}{'Qubits':>7}{'Queue':>7}  Status")
+    print(f"{'-'*2}  {'-'*22}{'-'*7}{'-'*7}  {'-'*18}")
+    for idx, (b, nq, pending, msg) in enumerate(rows):
+        q = "?" if pending is None else str(pending)
+        print(f"{idx:>2}  {b.name:<22}{nq:>7}{q:>7}  {msg}")
+
+
+def select_backend(service, opts, min_qubits=156):
+    """Resolve which backend to use from --backend / --list-backends / interactive prompt."""
+    candidates = candidate_backends(service, min_qubits)
+    if not candidates:
+        print(f"No operational backend (>= {min_qubits} qubits) found.", file=sys.stderr)
+        sys.exit(1)
+
+    # Explicit name wins, and is the scriptable path.
+    if getattr(opts, "backend", None):
+        for b in candidates:
+            if b.name == opts.backend:
+                return b
+        try:
+            return service.backend(opts.backend)   # allow names outside the >=156 filter
+        except Exception:
+            print(f"Backend '{opts.backend}' not found. Available candidates:", file=sys.stderr)
+            print_backend_table(backend_rows(candidates))
+            sys.exit(1)
+
+    rows = backend_rows(candidates)
+
+    if getattr(opts, "list_backends", False):
+        print_backend_table(rows)
+        sys.exit(0)
+
+    # Default = least busy (fewest pending jobs; unknown queue sorts last).
+    default_idx = min(range(len(rows)),
+                      key=lambda i: (rows[i][2] is None, rows[i][2] if rows[i][2] is not None else 0))
+
+    # Non-interactive (piped/CI): don't block, take the least-busy default.
+    if not sys.stdin.isatty():
+        chosen = candidates[default_idx]
+        print(f"Non-interactive: auto-selected least-busy backend {chosen.name}.")
+        return chosen
+
+    print_backend_table(rows)
+    while True:
+        raw = input(f"\nSelect backend [0-{len(rows)-1}] "
+                    f"(Enter = {default_idx}: {candidates[default_idx].name}, least busy): ").strip()
+        if raw == "":
+            return candidates[default_idx]
+        if raw.isdigit() and 0 <= int(raw) < len(rows):
+            return candidates[int(raw)]
+        print("  Invalid selection — enter a row number or press Enter for the default.")
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Deploy (1+x²)(1+y²) flag-qubit QEC on Heron r2")
@@ -253,6 +342,10 @@ def main():
                     help='measure each weight-2 vertical pair once and reassemble '
                          'plaquettes classically: CZ/round 4*r*s->2*r*s (direct) or '
                          '8*r*s->2*r*s (vs buffer), half the ancillas, identical syndrome')
+    ap.add_argument('--backend', '-b', type=str, default=None, metavar='NAME',
+                    help='submit to this backend by name (skips the interactive chooser)')
+    ap.add_argument('--list-backends', action='store_true',
+                    help='list available QPUs (name, qubits, queue depth) and exit')
     ap.add_argument('--dry-run', action='store_true',
                     help='transpile only, print stats, do not submit')
     opts = ap.parse_args()
@@ -282,20 +375,7 @@ def main():
 
     # ---------- pick backend ----------
     service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
-    try:
-        pool = service.backends(min_num_qubits=156, simulator=False, operational=True)
-    except TypeError:
-        # Older runtime without these kwargs: filter manually so a >=156-qubit
-        # simulator can't be silently selected.
-        pool = [b for b in service.backends()
-                if getattr(b, "num_qubits", 0) >= 156
-                and not getattr(getattr(b, "configuration", lambda: None)(), "simulator", False)]
-    candidates = [b for b in pool if getattr(b, "num_qubits", 0) >= 156]
-    if not candidates:
-        print("No operational Heron-class backend (>=156 qubits) found.", file=sys.stderr)
-        sys.exit(1)
-    candidates.sort(key=lambda b: b.num_qubits)
-    backend = candidates[0]
+    backend = select_backend(service, opts, min_qubits=156)
     print(f"Backend: {backend.name} ({backend.num_qubits} qubits)")
 
     # ---------- build ----------

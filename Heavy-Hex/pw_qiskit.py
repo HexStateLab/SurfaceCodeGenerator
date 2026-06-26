@@ -162,6 +162,34 @@ class PlaneWarp:
         corr = np.frombuffer(p.stdout, dtype=np.uint8).reshape(r, s)
         return corr
 
+    def decode_linear_basis(self, syns, corrs, new_syn):
+        """Linear basis decoder via the C binary.
+
+        syns, corrs — lists of (r,s) numpy uint8 arrays (verified pairs).
+                      Must be non-empty.
+        new_syn     — (r,s) numpy uint8 array, the syndrome to decode.
+
+        Returns (correction, ok) where ok is True if new_syn was in the span.
+        """
+        if not syns:
+            return np.zeros_like(new_syn), False
+        r, s = syns[0].shape
+        nn = r * s
+        n = len(syns)
+        buf = struct.pack('<I', n)
+        for k in range(n):
+            buf += syns[k].tobytes()
+            buf += corrs[k].tobytes()
+        buf += new_syn.tobytes()
+        import subprocess
+        exe = os.path.join(_lib_dir, "plane_warp")
+        p = subprocess.run([exe, str(r), str(s), "--decode-basis"],
+                           input=buf, capture_output=True)
+        if len(p.stdout) != nn:
+            return np.zeros((r, s), dtype=np.uint8), False
+        corr = np.frombuffer(p.stdout, dtype=np.uint8).reshape(r, s)
+        return corr, p.returncode == 0
+
 
 # =========================================================================
 # Qiskit circuit builder for the (1+x^2)(1+y^2) code

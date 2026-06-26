@@ -230,7 +230,7 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
 // Each of the 4 parity sub-lattices is a (1+u)(1+v) toric block whose kernel
 // consists of row flips and column flips within that sub-lattice.
 // Canonical form: sub-lattice row 0 = 0, sub-lattice column 0 = 0.
-static void canonicalize(int r, int s, uint8_t *corr) {
+void canonicalize(int r, int s, uint8_t *corr) {
     if((r & 1) || (s & 1)) return;
     int hr = r/2, hs = s/2;
     for(int si=0; si<2; si++) for(int sj=0; sj<2; sj++) {
@@ -1209,7 +1209,7 @@ int run_selftest(int seed) {
 // Since ∑R ≡ ∑C (mod 2), leftovers always come in even counts.
 // O(n) deterministic, no distance calculations, no iteration.
 // ============================================================
-static void preprocess_syndrome(int r, int s, uint8_t *syn) {
+void preprocess_syndrome(int r, int s, uint8_t *syn) {
     // Pass 1: face-qualified 3-corner completion
     // Only fill the 4th corner if the 2×2 block is ISOLATED — surrounded
     // by zeros in the 8 flanking positions. High-density clusters are

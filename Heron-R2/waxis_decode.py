@@ -139,7 +139,69 @@ class WaxisDecoder:
         self._lib.solve_plane_layered(self.r, self.s,
             syn.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
             out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)))
+        out = self._min_weight_kernel(out)
         return out
+
+    def _min_weight_kernel(self, corr):
+        """Find minimum-weight correction across all 4 logical sectors.
+
+        1. For each sector (Z1,Z2) ∈ {0,1}², switch the C correction into that
+           sector by flipping row 0 (toggles Z_L1) and/or column 0 (toggles Z_L2).
+        2. Within each sector, enumerate sub-lattice kernel elements to find the
+           minimum-weight representative.
+        3. Return the global minimum across all sectors.
+        """
+        r, s = self.r, self.s
+        hr, hs = r // 2, s // 2
+        n = r * s
+
+        best = corr.copy()
+        best_wt = best.sum()
+
+        for target_z1 in (0, 1):
+            for target_z2 in (0, 1):
+                # Start from C correction, determine current sector
+                cur = corr.copy()
+                cur_z1 = cur[0, :].sum() % 2
+                cur_z2 = cur[:, 0].sum() % 2
+
+                # Switch to target sector
+                if cur_z1 != target_z1:
+                    cur[0, :] ^= 1  # flip row 0 toggles Z_L1
+                if cur_z2 != target_z2:
+                    cur[:, 0] ^= 1  # flip column 0 toggles Z_L2
+
+                # Now minimize weight within this sector via sub-lattice kernel
+                for px in range(2):
+                    for py in range(2):
+                        sl = cur[px::2, py::2].copy()
+                        best_sl = sl.copy()
+                        best_sl_wt = sl.sum()
+
+                        # Enumerate all 2^(hr+hs) row/col mask combos
+                        for rmask in range(1 << hr):
+                            for cmask in range(1 << hs):
+                                temp = sl.copy()
+                                for ri in range(hr):
+                                    if rmask & (1 << ri):
+                                        temp[ri, :] ^= 1
+                                for ci in range(hs):
+                                    if cmask & (1 << ci):
+                                        temp[:, ci] ^= 1
+                                wt = temp.sum()
+                                if wt < best_sl_wt:
+                                    best_sl_wt = wt
+                                    best_sl = temp.copy()
+
+                        cur[px::2, py::2] = best_sl
+
+                # Track global minimum
+                wt = cur.sum()
+                if wt < best_wt:
+                    best_wt = wt
+                    best = cur.copy()
+
+        return best
 
     def _forward_eliminate(self, ws, wc):
         """RREF forward-eliminate. Modifies ws, wc in-place."""
@@ -169,6 +231,7 @@ class WaxisDecoder:
         out = np.zeros(nn, dtype=np.uint8)
         for b in range(n):
             if coeffs[b]: out ^= self._basis_corr[b]
+        out = self._min_weight_kernel(out.reshape(self.r, self.s)).reshape(-1)
         return out
 
     def _decompose_with_residual(self, syn):

@@ -594,6 +594,7 @@ def main():
         rounds_4d = np.stack([all_syn[idx, c] for c in range(rounds - proj_rounds, rounds)])
         C, ok = pw.project_decode(basis_syn, basis_corr, rounds_4d)
         if ok:
+            C = pw.refine_min_weight(C)
             decode_ok += 1
             decode_corr[idx] = C
             decoded_mask[idx] = True

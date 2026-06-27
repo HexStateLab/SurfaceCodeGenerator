@@ -389,6 +389,8 @@ def main():
                     help='transpile only, print stats, do not submit')
     ap.add_argument('--check-job', type=str, default=None, metavar='JOB_ID',
                     help='check status and queue position of a submitted job, then exit')
+    ap.add_argument('--load-basis', type=str, default=None, metavar='PATH',
+                    help='path to .npz basis file (default: ~/.planewarp_clean/basis_hw.npz)')
     opts = ap.parse_args()
 
     if opts.clean_stats:
@@ -572,15 +574,18 @@ def main():
     proj_fail_solve = 0  # failed due to inconsistent system
     proj_fail_decode = 0 # projection succeeded but decoder returned ok=False
 
-    # Load 24-dim basis for column-space decoding
-    bp24 = CLEAN_DIR / 'basis_24.npz'
-    if not bp24.exists():
-        print(f"  ERROR: 24-dim basis not found at {bp24}. Run build_basis.py first.", file=sys.stderr)
-        sys.exit(1)
-    bd24 = np.load(bp24)
-    basis_syn = [np.asarray(bd24['syn'][i], dtype=np.uint8).reshape(r, s) for i in range(len(bd24['syn']))]
-    basis_corr = [np.asarray(bd24['corr'][i], dtype=np.uint8).reshape(r, s) for i in range(len(bd24['corr']))]
-    print(f"  Basis loaded: {len(basis_syn)} dims (full column space)")
+    # Load basis (prefer learned; fall back to synthetic)
+    basis_syn = basis_corr = None
+    bp = Path(opts.load_basis) if opts.load_basis else (CLEAN_DIR / 'basis_hw.npz')
+    if bp.exists():
+        bd = np.load(bp)
+        basis_syn = [np.asarray(bd['syn'][i], dtype=np.uint8).reshape(r, s) for i in range(len(bd['syn']))]
+        basis_corr = [np.asarray(bd['corr'][i], dtype=np.uint8).reshape(r, s) for i in range(len(bd['corr']))]
+        print(f"  Basis loaded: {len(basis_syn)} dims (from {bp})")
+    else:
+        print(f"  No learned basis at {bp} — building synthetic basis from H pivot columns")
+        basis_syn, basis_corr = pw.build_synthetic_basis(r, s)
+        print(f"  Synthetic basis: {len(basis_syn)} dims")
 
     # Use last 4 rounds for projection
     proj_rounds = min(4, rounds)

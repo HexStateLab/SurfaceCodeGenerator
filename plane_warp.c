@@ -1767,8 +1767,8 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-tesseract")) {
-            // AND-vote decoder: filter measurement noise across rounds,
-            // then decode once with the full 5D solver.
+            // Multi-round decoder: decode the last round's raw syndrome
+            // with the full 5D residual pipeline.
             int n=r*s, rounds;
             if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *per_round=malloc((size_t)rounds*n);
@@ -1776,42 +1776,23 @@ int main(int argc, char **argv) {
             for(int rnd=0;rnd<rounds;rnd++){
                 if(fread(per_round+rnd*n,1,n,stdin)!=(size_t)n){free(per_round);return 1;}
             }
-            // AND syndrome across all rounds.
-            uint8_t *syn=calloc(n,1);
+            uint8_t *syn=malloc(n);
             if(!syn){free(per_round);return 1;}
-            for(int q=0;q<n;q++){
-                int v=1;
-                for(int c=0;c<rounds;c++) v &= per_round[c*n+q];
-                syn[q]=v;
-            }
+            memcpy(syn,per_round+(rounds-1)*n,n);
             free(per_round);
-            // Reject if syndrome violates sub-lattice parity (not in image of H).
-            // Every valid syndrome has even row and column sums within each
-            // (px,py) parity class.  Odd parity = residual measurement faults.
-            int viable=1;
-            for(int px=0;px<2&&viable;px++) for(int py=0;py<2&&viable;py++) {
-                int hr=r/2, hs=s/2;
-                for(int si=0;si<hr;si++){
-                    int rp=0;
-                    for(int sj=0;sj<hs;sj++) rp ^= syn[(px+2*si)*s+(py+2*sj)];
-                    if(rp){viable=0;break;}
-                }
-                if(!viable) break;
-                for(int sj=0;sj<hs;sj++){
-                    int cp=0;
-                    for(int si=0;si<hr;si++) cp ^= syn[(px+2*si)*s+(py+2*sj)];
-                    if(cp){viable=0;break;}
-                }
-            }
-            uint8_t *out=calloc(n,1);
-            if(!out){free(syn);return 1;}
-            if(viable){
+            uint8_t *total=calloc(n,1), *dec=malloc(n), *raw=malloc(n);
+            if(!total||!dec||!raw){free(syn);free(total);free(dec);free(raw);return 1;}
+            memcpy(raw,syn,n);
+            for(int pass=0;pass<10;pass++){
                 preprocess_syndrome(r,s,syn);
-                solve_plane_5d(r,s,syn,out);
+                solve_plane_5d(r,s,syn,dec);
+                for(int q=0;q<n;q++) total[q]^=dec[q];
+                syndrome_of(r,s,total,syn);
+                for(int q=0;q<n;q++) syn[q]^=raw[q];
             }
-            free(syn);
-            fwrite(out,1,n,stdout); fflush(stdout);
-            free(out);
+            free(syn); free(raw);
+            fwrite(total,1,n,stdout); fflush(stdout);
+            free(total); free(dec);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-mv")) {

@@ -2015,6 +2015,105 @@ int main(int argc, char **argv) {
             free(syns); free(corrs); free(new_syn); free(out);
             return ok ? 0 : 1;
         }
+        else if(!strcmp(argv[i],"--project-decode")) {
+            // Consistency projection + linear basis decoder.
+            // stdin: [n:u32] [n*(syn+corr):nn+nn bytes each] [rnd0:nn][rnd1:nn][rnd2:nn][rnd3:nn]
+            // stdout: [correction:nn bytes]
+            int nn = r * s, n;
+            if(fread(&n,4,1,stdin)!=1||n<0||n>1000000){fprintf(stderr,"bad n\n");return 1;}
+            uint8_t *syns=malloc((size_t)n*nn);
+            uint8_t *corrs=malloc((size_t)n*nn);
+            uint8_t *rounds=malloc(4*nn);
+            uint8_t *out=malloc(nn);
+            if(!syns||!corrs||!rounds||!out){free(syns);free(corrs);free(rounds);free(out);return 1;}
+            for(int k=0;k<n;k++){
+                if(fread(syns+k*nn,1,nn,stdin)!=(size_t)nn||
+                   fread(corrs+k*nn,1,nn,stdin)!=(size_t)nn){
+                    free(syns);free(corrs);free(rounds);free(out);return 1;
+                }
+            }
+            for(int rd=0;rd<4;rd++){
+                if(fread(rounds+rd*nn,1,nn,stdin)!=(size_t)nn){
+                    free(syns);free(corrs);free(rounds);free(out);return 1;
+                }
+            }
+            // Build H matrix (nn × nn)
+            uint8_t *H=malloc((size_t)nn*nn);
+            if(!H){free(syns);free(corrs);free(rounds);free(out);return 1;}
+            uint8_t err_buf[MAX_N], syn_buf[MAX_N];
+            for(int col=0;col<nn;col++){
+                memset(err_buf,0,nn); err_buf[col]=1;
+                syndrome_of(r,s,err_buf,syn_buf);
+                for(int row=0;row<nn;row++) H[row*nn+col]=syn_buf[row];
+            }
+            // Find consistent bits (same value across all 4 rounds)
+            int *clean_idx=malloc((size_t)nn*sizeof(int));
+            int n_clean=0;
+            if(!clean_idx){free(H);free(syns);free(corrs);free(rounds);free(out);return 1;}
+            for(int q=0;q<nn;q++){
+                uint8_t val=rounds[q];
+                int all_same=1;
+                for(int rd=1;rd<4;rd++) if(rounds[rd*nn+q]!=val){all_same=0;break;}
+                if(all_same) clean_idx[n_clean++]=q;
+            }
+            int ok=0;
+            if(n_clean>=24){
+                // Augmented matrix: n_clean rows × (nn+1) cols
+                uint8_t *A=malloc((size_t)n_clean*(nn+1));
+                if(A){
+                    for(int i=0;i<n_clean;i++){
+                        int q=clean_idx[i];
+                        for(int col=0;col<nn;col++) A[i*(nn+1)+col]=H[q*nn+col];
+                        A[i*(nn+1)+nn]=rounds[q];
+                    }
+                    // RREF full elimination
+                    int rank=0;
+                    int pivot_col[MAX_N];
+                    memset(pivot_col,0,sizeof(pivot_col));
+                    for(int col=0;col<nn;col++){
+                        int pv=-1;
+                        for(int i=rank;i<n_clean;i++) if(A[i*(nn+1)+col]){pv=i;break;}
+                        if(pv<0) continue;
+                        if(pv!=rank) for(int c=0;c<=nn;c++){
+                            uint8_t tmp=A[pv*(nn+1)+c];
+                            A[pv*(nn+1)+c]=A[rank*(nn+1)+c];
+                            A[rank*(nn+1)+c]=tmp;
+                        }
+                        pivot_col[rank]=col;
+                        for(int i=0;i<n_clean;i++) if(i!=rank&&A[i*(nn+1)+col])
+                            for(int c=0;c<=nn;c++) A[i*(nn+1)+c]^=A[rank*(nn+1)+c];
+                        rank++;
+                    }
+                    // Check inconsistency
+                    int consistent=1;
+                    for(int i=rank;i<n_clean&&consistent;i++) if(A[i*(nn+1)+nn]){
+                        int az=1;
+                        for(int c=0;c<nn;c++) if(A[i*(nn+1)+c]){az=0;break;}
+                        if(az) consistent=0;
+                    }
+                    if(consistent){
+                        // Extract E
+                        uint8_t E[MAX_N];
+                        memset(E,0,nn);
+                        for(int i=0;i<rank;i++){
+                            int col=pivot_col[i];
+                            if(col>=0) E[col]=A[i*(nn+1)+nn];
+                        }
+                        // Compute S' = H*E (guaranteed in Col(H))
+                        uint8_t proj_syn[MAX_N];
+                        syndrome_of(r,s,E,proj_syn);
+                        // Decode using basis
+                        ok=decode_linear_basis(r,s,n,syns,corrs,proj_syn,out);
+                    }
+                    free(A);
+                }
+            }
+            free(clean_idx); free(H);
+            if(!ok) memset(out,0,nn);
+            fwrite(out,1,nn,stdout); fflush(stdout);
+            free(syns);free(corrs);free(rounds);free(out);
+            return ok?0:1;
+        }
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}
     }
     if(selftest) return run_selftest(seed);

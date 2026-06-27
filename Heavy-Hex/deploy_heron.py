@@ -584,6 +584,7 @@ def main():
 
     # Use last 4 rounds for projection
     proj_rounds = min(4, rounds)
+    decoded_mask = np.zeros(n_shots, dtype=bool)
     for idx in range(n_shots):
         # AND decode (for comparison)
         C_and, ok_and = pw.decode_linear_basis(basis_syn, basis_corr, and_all[idx])
@@ -595,9 +596,9 @@ def main():
         if ok:
             decode_ok += 1
             decode_corr[idx] = C
+            decoded_mask[idx] = True
 
     # Single-observable LER from data readout
-    single_err = 0
     and_single_err = 0
     proj_perf = 0
     proj_det = 0
@@ -605,10 +606,9 @@ def main():
     if data_raw is not None:
         for idx in range(n_shots):
             E = data_raw[idx]
-            # Projection LER
-            C = decode_corr[idx]
-            if C.sum() > 0 or True:  # correction was applied (or not)
-                res = (E ^ C).astype(np.uint8)
+            # Projection LER — only for decoded shots
+            if decoded_mask[idx]:
+                res = (E ^ decode_corr[idx]).astype(np.uint8)
                 sr = pw.syndrome_of(res)
                 if sr.sum() == 0:
                     if pw.is_stabilizer(res):

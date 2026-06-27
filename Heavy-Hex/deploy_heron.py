@@ -647,12 +647,20 @@ def main():
         if not pw.is_stabilizer(pw.decode_tesseract(all_syn[idx])):
             raw_errors += 1
 
+        # Helper: verify correction matches measured syndrome
+        def corr_matches(syn_1r, corr_2d):
+            """True if H*correction == measured_syndrome AND is_stabilizer(correction)."""
+            if not pw.is_stabilizer(corr_2d):
+                return False
+            hc = pw.syndrome_of(corr_2d)
+            return np.array_equal(hc.ravel(), syn_1r.ravel())
+
         # Method 2: AND-vote
         and_syn = and_all[idx][np.newaxis]
         syn_weight = int(and_syn.sum())
         correction = pw.decode_tesseract(and_syn)
         total_corr_and += int(correction.sum())
-        and_ok = pw.is_stabilizer(correction)
+        and_ok = corr_matches(and_syn[0], correction)
         if not and_ok:
             and_errors += 1
             if sample_error_idx is None:
@@ -660,17 +668,14 @@ def main():
             # Try linear basis decoder before falling back to ensemble
             if len(basis_syn) > 0:
                 ens_corr, in_span = pw.decode_linear_basis(basis_syn, basis_corr, and_all[idx])
-                if in_span:
-                    if pw.is_stabilizer(ens_corr):
-                        correction = ens_corr
-                        and_ok = True
-                        basis_used += 1
-                    else:
-                        basis_violations += 1
+                if in_span and corr_matches(and_all[idx], ens_corr):
+                    correction = ens_corr
+                    and_ok = True
+                    basis_used += 1
             if not and_ok:
                 # Method 3: exhaustive — try per-round, AND, OR, majority + flips
                 ens_corr, ens_ok = decode_exhaustive(all_syn[idx], pw, r, s, max_flips=12)
-                if ens_ok:
+                if ens_ok and corr_matches(and_all[idx], ens_corr):
                     correction = ens_corr
                     and_ok = True
                     ens_gain += 1

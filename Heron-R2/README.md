@@ -67,6 +67,9 @@ Both converge to near-identical results, validating the Python port.
 ## Usage
 
 ```bash
+# Note
+--share-pairs can be used as a command too.. I suggest it, actually as it cuts down resources needed.
+
 # Baseline |00⟩ preservation
 python3 test_entanglement.py --state 00 --rounds 1 --shots 2000
 

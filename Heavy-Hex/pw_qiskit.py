@@ -191,6 +191,95 @@ class PlaneWarp:
         return corr, p.returncode == 0
 
     _STAB_GROUP = None
+    _H_MATRIX = None
+
+    def _cache_H(self, r=6, s=8):
+        """Build and cache the 48×48 syndrome matrix H."""
+        if PlaneWarp._H_MATRIX is not None:
+            return PlaneWarp._H_MATRIX
+        n = r * s
+        H = np.zeros((n, n), dtype=np.uint8)
+        for q in range(n):
+            e = np.zeros((r, s), dtype=np.uint8)
+            e.ravel()[q] = 1
+            H[:, q] = self.syndrome_of(e).ravel()
+        PlaneWarp._H_MATRIX = H
+        return H
+
+    def build_synthetic_basis(self, r=6, s=8):
+        """Build a 24-dim synthetic basis from pivot columns of H.
+
+        Each pair is (column_of_H, single_qubit_error_on_pivot).
+        No external file needed. Returns (syn_list, corr_list).
+        """
+        H = self._cache_H(r, s)
+        n = r * s
+        A = H.copy()
+        pivots = []
+        for col in range(n):
+            nz = np.where(A[:, col])[0]
+            if len(nz) == 0:
+                continue
+            pv = nz[0]
+            if pv != len(pivots):
+                A[[len(pivots), pv]] = A[[pv, len(pivots)]]
+            pivots.append(col)
+            pr = len(pivots) - 1
+            for r2 in range(n):
+                if r2 != pr and A[r2, col]:
+                    A[r2] ^= A[pr]
+        syn_list, corr_list = [], []
+        for pc in pivots:
+            e = np.zeros((r, s), dtype=np.uint8)
+            e.ravel()[pc] = 1
+            syn = self.syndrome_of(e)
+            syn_list.append(syn)
+            corr_list.append(e)
+        return syn_list, corr_list
+
+    def project_only(self, rounds):
+        """Consistency projection without a basis decoder.
+
+        For ≥4 rounds: finds 4/4 consistent bits, solves H_clean*E = S_clean.
+        Works with ANY number of consistent bits (free variables set to 0).
+        For <4 rounds: treats all bits as "consistent" from the last round.
+
+        Returns (correction, ok) where ok=True if at least 1 row was consistent.
+        """
+        if len(rounds) < 1:
+            return np.zeros(rounds[0].shape, dtype=np.uint8), False
+        r, s = rounds[0].shape
+        n = r * s
+        H = self._cache_H(r, s)
+        agree = np.all(rounds[0] == rounds, axis=0)
+        clean_idx = np.where(agree.ravel())[0]
+        if len(clean_idx) == 0:
+            return np.zeros((r, s), dtype=np.uint8), False
+        H_clean = H[clean_idx]
+        S_clean = rounds[0].ravel()[clean_idx]
+        aug = np.hstack([H_clean, S_clean.reshape(-1, 1)]).astype(np.uint8)
+        m, nn = aug.shape
+        rank = 0
+        for col in range(n):
+            nz = np.where(aug[rank:, col])[0]
+            if len(nz) == 0:
+                continue
+            pv = nz[0] + rank
+            if pv != rank:
+                aug[[rank, pv]] = aug[[pv, rank]]
+            for r2 in range(m):
+                if r2 != rank and aug[r2, col]:
+                    aug[r2] ^= aug[rank]
+            rank += 1
+            if rank >= n:
+                break
+        if rank == 0:
+            return np.zeros((r, s), dtype=np.uint8), False
+        E = np.zeros(n, dtype=np.uint8)
+        for pi in range(rank):
+            pc = int(np.where(aug[pi, :n])[0][0])
+            E[pc] = aug[pi, -1]
+        return E.reshape(r, s), True
 
     def _build_stab_group(self, r=6, s=8):
         """Return (256, r, s) uint8 array of all stabilizer elements.
@@ -286,21 +375,27 @@ class PlaneWarp:
         return best.reshape(r, s)
 
     def project_decode(self, syns, corrs, rounds):
-        """Consistency projection + linear basis decoder, all in C.
+        """Consistency projection + linear basis decoder with relaxed fallbacks.
 
-        Takes 4 rounds of raw syndrome measurements (each (r,s) uint8),
-        projects onto Col(H) via consistent-bit Gaussian elimination,
-        then decodes with the linear basis decoder.
+        Strategy (tried in order):
+          1. C binary with 4/4 consistency projection (fast, ≥24 clean bits)
+          2. Python project_only (any # of consistent bits) + refine_min_weight
+          3. Majority-vote syndrome across all rounds → basis decode
+          4. Each individual round → basis decode (accept first success)
 
         syns, corrs — lists of (r,s) numpy uint8 arrays (basis pairs).
-        rounds      — (4, r, s) numpy uint8 array, one round per axis-0 entry.
+        rounds      — (N, r, s) numpy uint8 array, N≥1.
 
-        Returns (correction, ok) where ok=True if projection+decode succeeded.
+        Returns (correction, ok) where ok=True if decode succeeded.
         """
-        if not syns or len(rounds) != 4:
+        if not syns or len(rounds) == 0:
             return np.zeros(rounds[0].shape, dtype=np.uint8), False
+        if len(rounds) < 4:
+            return self.decode_linear_basis(syns, corrs, rounds[-1])
         r, s = syns[0].shape
         nn = r * s
+
+        # --- strategy 1: C binary (4/4 consistency) ---
         n = len(syns)
         buf = struct.pack('<I', n)
         for k in range(n):
@@ -312,10 +407,28 @@ class PlaneWarp:
         exe = os.path.join(_lib_dir, "plane_warp")
         p = subprocess.run([exe, str(r), str(s), "--project-decode"],
                            input=buf, capture_output=True)
-        if len(p.stdout) != nn:
-            return np.zeros((r, s), dtype=np.uint8), False
-        corr = np.frombuffer(p.stdout, dtype=np.uint8).reshape(r, s)
-        return corr, p.returncode == 0
+        if len(p.stdout) == nn and p.returncode == 0:
+            return np.frombuffer(p.stdout, dtype=np.uint8).reshape(r, s), True
+
+        # --- strategy 2: relaxed project_only + refine_min_weight ---
+        C, ok = self.project_only(rounds)
+        if ok:
+            C = self.refine_min_weight(C)
+            return C, True
+
+        # --- strategy 3: majority-vote syndrome ---
+        syn_sum = sum(rounds[rd].astype(np.int16) for rd in range(len(rounds)))
+        maj = ((syn_sum * 2) > len(rounds)).astype(np.uint8)
+        C, ok = self.decode_linear_basis(syns, corrs, maj)
+        if ok:
+            return C, True
+
+        # --- strategy 4: try each individual round ---
+        for rd in range(len(rounds) - 1, -1, -1):
+            C, ok = self.decode_linear_basis(syns, corrs, rounds[rd])
+            if ok:
+                return C, True
+        return np.zeros((r, s), dtype=np.uint8), False
 
 
 # =========================================================================

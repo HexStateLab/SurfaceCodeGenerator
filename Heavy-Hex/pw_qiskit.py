@@ -201,7 +201,7 @@ class PlaneWarp:
         Cached after first call.
         """
         if PlaneWarp._STAB_GROUP is not None:
-            return PlaneWarp._STAB_GROUP.reshape(-1, r, s)
+            return PlaneWarp._STAB_GROUP
         n = r * s
         # Build H
         H = np.zeros((n, n), dtype=np.uint8)
@@ -262,7 +262,7 @@ class PlaneWarp:
                     s ^= null[bit]
             all_s.append(s)
         PlaneWarp._STAB_GROUP = np.array(all_s, dtype=np.uint8)
-        return PlaneWarp._STAB_GROUP.reshape(-1, r, s)
+        return PlaneWarp._STAB_GROUP
 
     def refine_min_weight(self, C):
         """Return the minimum-weight correction coset-equivalent to C.

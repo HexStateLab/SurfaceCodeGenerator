@@ -226,21 +226,22 @@ class PlaneWarp:
                         col[(px + 2 * si) * s + (py + 2 * sj)] = 1
                     Cst[ci] = col; ci += 1
         # Combined nullspace: ker(H) ∩ stab_space
+        # RREF (GF2): only search rows from current rank, not from top
         A = np.vstack([H, Cst])
         m, nn = A.shape
-        pivots = []
+        pivots, rank = [], 0
         for col in range(nn):
-            nz = np.where(A[:, col])[0]
+            nz = np.where(A[rank:, col])[0]
             if len(nz) == 0:
                 continue
-            pv = nz[0]
-            if pv != len(pivots):
-                A[[len(pivots), pv]] = A[[pv, len(pivots)]]
+            pv = nz[0] + rank
+            if pv != rank:
+                A[[rank, pv]] = A[[pv, rank]]
             pivots.append(col)
-            pr = len(pivots) - 1
             for r2 in range(m):
-                if r2 != pr and A[r2, col]:
-                    A[r2] ^= A[pr]
+                if r2 != rank and A[r2, col]:
+                    A[r2] ^= A[rank]
+            rank += 1
         free = [c for c in range(nn) if c not in pivots]
         null = np.zeros((len(free), nn), dtype=np.uint8)
         for ki, fc in enumerate(free):

@@ -163,6 +163,9 @@ class PlaneWarp:
         return corr
 
 
+    def decode_demotion(self, syndromes):
+        from waxis_decode import WaxisDecoder
+        return WaxisDecoder(syndromes.shape[1], syndromes.shape[2]).decode(syndromes)
 # =========================================================================
 # Qiskit circuit builder for the (1+x^2)(1+y^2) code
 # =========================================================================

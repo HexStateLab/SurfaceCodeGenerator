@@ -142,10 +142,11 @@ class PlaneWarp:
         return bool(_lib.is_stabilizer(r, s, self._to_ptr(diff)))
 
     def decode_tesseract(self, syndromes):
+        from waxis_decode import min_weight_kernel
         rounds, r, s = syndromes.shape
         if rounds == 1:
             corr, _ = self.decode_layered(syndromes[0])
-            return corr
+            return min_weight_kernel(corr, r, s)
         n = r * s
         buf = struct.pack('<I', rounds)
         buf += syndromes.tobytes()
@@ -158,9 +159,9 @@ class PlaneWarp:
         if p.returncode != 0:
             print(f"WARNING: tesseract decoder failed (rc={p.returncode}, stderr={p.stderr.decode().strip()}), falling back to 2D on round 0", file=sys.stderr)
             corr, _ = self.decode_layered(syndromes[0])
-            return corr
+            return min_weight_kernel(corr, r, s)
         corr = np.frombuffer(p.stdout, dtype=np.uint8).reshape(r, s)
-        return corr
+        return min_weight_kernel(corr, r, s)
 
 
     def decode_demotion(self, syndromes):

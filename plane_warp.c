@@ -220,6 +220,7 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
 
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
+int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 static void metacheck_repair_block(int hr, int hs, uint8_t *S); // single-shot fwd
 static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out); // odd-grid fwd
 static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out);      // adjacent-toric fwd
@@ -310,7 +311,7 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
     // solve_plane); odd grids have no 4-block structure, so defer to the
     // parity-general decoder via solve_plane.
     if((r & 1) || (s & 1)) { solve_plane(r,s,syn,out); return; }
-    if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
+    if(hr<2||hs<2){solve_plane_layered(r,s,syn,out);return;}
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
@@ -320,7 +321,6 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
     uint8_t *Ec_arr[4]={0};
     for(int f=0;f<4;f++){
         hrc[f]=hr/2; hsc[f]=hs/2;
-        if(hrc[f]<2||hsc[f]<2) continue;
         int fsize=(int)((size_t)hrc[f]*hsc[f]);
         if(fsize<1||fsize>MAX_N) continue;
         uint8_t *Sf=malloc((size_t)r*s); uint8_t *Sc=malloc((size_t)fsize);
@@ -352,7 +352,7 @@ static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8
         free(Sf); free(Sc);
         nfaces++;
     }
-    if(nfaces==0){solve_plane(r,s,syn,out);return;}
+    if(nfaces==0){solve_plane_layered(r,s,syn,out);return;}
 
     uint8_t *S=calloc(MAX_N,1), *E=calloc(MAX_N,1); double *W=calloc(MAX_N,sizeof(double));
     if(!S||!E||!W){free(S);free(E);free(W);for(int f=0;f<4;f++)free(Ec_arr[f]);return;}
@@ -1518,88 +1518,15 @@ static void *run_persist_round(void *arg) {
     uint8_t syn[MAX_N], dec[MAX_N], acc[MAX_N], res[MAX_N];
     memcpy(syn, a->per_round+rnd*n, n);
     memset(acc,0,n); memcpy(res,syn,n);
-    for(int pass=0;pass<3;pass++){
-        preprocess_syndrome(r,s,res);
-        solve_plane_layered(r,s,res,dec);
+    preprocess_syndrome(r,s,res);
+    for(int pass=0;pass<10;pass++){
+        solve_plane_5d(r,s,res,dec);
         for(int q=0;q<n;q++) acc[q]^=dec[q];
         syndrome_of(r,s,acc,res);
         for(int q=0;q<n;q++) res[q]^=syn[q];
     }
     memcpy(a->dec_round+rnd*n, acc, n);
     return NULL;
-}
-
-// ------------------------------------------------------------
-// Linear basis decoder (native C)
-// ------------------------------------------------------------
-// Given n verified (syn, corr) pairs, decode new_syn by expressing it
-// as XOR of basis vectors via GF(2) Gaussian elimination.
-// Returns 1 if new_syn is in the span, 0 otherwise.
-int decode_linear_basis(int r, int s, int n,
-                        const uint8_t *syns, const uint8_t *corrs,
-                        const uint8_t *new_syn, uint8_t *out) {
-    int nn = r * s;
-    if (n <= 0 || nn <= 0) { memset(out, 0, nn); return 0; }
-
-    // Working copies for RREF
-    uint8_t *ws = malloc((size_t)n * nn);
-    uint8_t *wc = malloc((size_t)n * nn);
-    int *pivot = malloc((size_t)n * sizeof(int));
-    uint8_t *temp = malloc((size_t)nn);
-    uint8_t *coeffs = calloc((size_t)n, 1);
-    if (!ws || !wc || !pivot || !temp || !coeffs) {
-        free(ws); free(wc); free(pivot); free(temp); free(coeffs);
-        memset(out, 0, nn); return 0;
-    }
-    memcpy(ws, syns, (size_t)n * nn);
-    memcpy(wc, corrs, (size_t)n * nn);
-
-    // Forward elimination: build row-echelon form
-    for (int b = 0; b < n; b++) {
-        pivot[b] = -1;
-        for (int q = 0; q < nn; q++) {
-            if (ws[b * nn + q]) { pivot[b] = q; break; }
-        }
-        if (pivot[b] < 0) continue;
-        // Eliminate this pivot from all later basis vectors
-        for (int b2 = b + 1; b2 < n; b2++) {
-            if (ws[b2 * nn + pivot[b]]) {
-                for (int q = 0; q < nn; q++) {
-                    ws[b2 * nn + q] ^= ws[b * nn + q];
-                    wc[b2 * nn + q] ^= wc[b * nn + q];
-                }
-            }
-        }
-    }
-
-    // Decompose new_syn using the RREF basis
-    memcpy(temp, new_syn, nn);
-    for (int b = 0; b < n; b++) {
-        int p = pivot[b];
-        if (p >= 0 && temp[p]) {
-            for (int q = 0; q < nn; q++) temp[q] ^= ws[b * nn + q];
-            coeffs[b] = 1;
-        }
-    }
-
-    int ok = 1;
-    for (int q = 0; q < nn; q++) {
-        if (temp[q]) { ok = 0; break; }
-    }
-
-    if (ok) {
-        memset(out, 0, nn);
-        for (int b = 0; b < n; b++) {
-            if (coeffs[b]) {
-                for (int q = 0; q < nn; q++) out[q] ^= wc[b * nn + q];
-            }
-        }
-    } else {
-        memset(out, 0, nn);
-    }
-
-    free(ws); free(wc); free(pivot); free(temp); free(coeffs);
-    return ok;
 }
 
 int main(int argc, char **argv) {
@@ -1808,7 +1735,7 @@ int main(int argc, char **argv) {
             for(int q=0;q<n;q++){
                 int cnt=0;
                 for(int r=0;r<rounds;r++)if(dec_round[r*n+q])cnt++;
-                if(cnt*3>rounds)consensus[q]=1;
+                if(cnt*2>rounds)consensus[q]=1;
             }
             free(dec_round);
             // Compute residual: last-round syndrome XOR syndrome of consensus
@@ -1827,9 +1754,9 @@ int main(int argc, char **argv) {
             for(int q=0;q<n;q++)residual[q]=raw_last[q]^cons_syn[q];
             memcpy(total,consensus,n);
             memcpy(syn2,residual,n);
-            for(int pass=0;pass<15;pass++){
-                preprocess_syndrome(r,s,syn2);
-                solve_plane_layered(r,s,syn2,dec2);
+            preprocess_syndrome(r,s,syn2);
+            for(int pass=0;pass<10;pass++){
+                solve_plane_5d(r,s,syn2,dec2);
                 for(int q=0;q<n;q++)total[q]^=dec2[q];
                 syndrome_of(r,s,total,syn2);
                 for(int q=0;q<n;q++)syn2[q]^=raw_last[q];
@@ -1840,14 +1767,8 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-tesseract")) {
-            // 4D tesseract decoder — temporal-diff chain with round‑0 base.
-            // syn_c = syndrome at round c = H * acc_c ⊕ n_c
-            // delta_c = solve_2D(syn_c ⊕ syn_{c+1})   — W‑axis rotation
-            // base_0 = solve_2D(syn_0)                — round 0: ~0 data errors
-            // corr_c = base_0 ⊕ ⊕_{k=0}^{c-1} delta_k
-            //        ≈ acc_c ⊕ n_c                    (intermediate noise cancels)
-            // Noise n_m appears ONLY in corr_m.  Base‑0 noise n_0 cancels through
-            // the chain (n_0 ⊕ n_0 = 0 from delta_0).  Consensus suppresses noise.
+            // AND-vote decoder: filter measurement noise across rounds,
+            // then decode once with the full 5D solver.
             int n=r*s, rounds;
             if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *per_round=malloc((size_t)rounds*n);
@@ -1855,81 +1776,42 @@ int main(int argc, char **argv) {
             for(int rnd=0;rnd<rounds;rnd++){
                 if(fread(per_round+rnd*n,1,n,stdin)!=(size_t)n){free(per_round);return 1;}
             }
-            // Phase 1: temporal diffs — decode syn_c ⊕ syn_{c+1}
-            uint8_t *delta=calloc((size_t)(rounds-1)*n,1);
-            if(!delta){free(per_round);return 1;}
-            uint8_t *diff=malloc(n), *p1_acc=malloc(n), *p1_res=malloc(n), *p1_dec=malloc(n);
-            if(!diff||!p1_acc||!p1_res||!p1_dec){free(per_round);free(delta);free(diff);free(p1_acc);free(p1_res);free(p1_dec);return 1;}
-            for(int c=0;c<rounds-1;c++){
-                for(int q=0;q<n;q++) diff[q]=per_round[c*n+q]^per_round[(c+1)*n+q];
-                memset(p1_acc,0,n); memcpy(p1_res,diff,n);
-                for(int pass=0;pass<5;pass++){
-                    preprocess_syndrome(r,s,p1_res);
-                    solve_plane(r,s,p1_res,p1_dec);
-                    for(int q=0;q<n;q++) p1_acc[q]^=p1_dec[q];
-                    syndrome_of(r,s,p1_acc,p1_res);
-                    for(int q=0;q<n;q++) p1_res[q]^=diff[q];
-                }
-                canonicalize(r, s, p1_acc);
-                memcpy(delta+c*n,p1_acc,n);
-            }
-            free(diff); free(p1_acc); free(p1_res); free(p1_dec);
-            // Phase 2: base at round 0 (~0 data errors, only measurement noise)
-            uint8_t *base=malloc(n), *p2_res=malloc(n), *p2_dec=malloc(n);
-            if(!base||!p2_res||!p2_dec){free(base);free(p2_res);free(p2_dec);free(delta);free(per_round);return 1;}
-            memcpy(p2_res,per_round+0*n,n);
-            memset(base,0,n);
-            for(int pass=0;pass<5;pass++){
-                preprocess_syndrome(r,s,p2_res);
-                solve_plane_layered(r,s,p2_res,p2_dec);
-                for(int q=0;q<n;q++) base[q]^=p2_dec[q];
-                syndrome_of(r,s,base,p2_res);
-                for(int q=0;q<n;q++) p2_res[q]^=per_round[0*n+q];
-            }
-            canonicalize(r, s, base);
-            free(p2_res); free(p2_dec);
-            // Phase 3: forward‑accumulate deltas from round 0 to build all corr_c
-            uint8_t *corr=calloc((size_t)rounds*n,1);
-            if(!corr){free(base);free(delta);free(per_round);return 1;}
-            memcpy(corr,base,n);
-            for(int c=0;c<rounds-1;c++){
-                for(int q=0;q<n;q++) corr[(c+1)*n+q]=corr[c*n+q]^delta[c*n+q];
-            }
-            free(delta);
-            // Phase 4: consensus
-            uint8_t *consensus=calloc(n,1);
-            if(!consensus){free(corr);free(base);free(per_round);return 1;}
+            // AND syndrome across all rounds.
+            uint8_t *syn=calloc(n,1);
+            if(!syn){free(per_round);return 1;}
             for(int q=0;q<n;q++){
-                int cnt=0;
-                for(int c=0;c<rounds;c++) if(corr[c*n+q]) cnt++;
-                if(cnt*3>rounds) consensus[q]=1;
+                int v=1;
+                for(int c=0;c<rounds;c++) v &= per_round[c*n+q];
+                syn[q]=v;
             }
-            free(corr);
-            // Phase 5: residual decode of last‑round syndrome
-            uint8_t *raw_last=malloc(n);
-            uint8_t *cons_syn=calloc(n,1);
-            uint8_t *residual=malloc(n);
-            uint8_t *syn2=malloc(n), *dec2=malloc(n), *total=malloc(n);
-            if(!raw_last||!cons_syn||!residual||!syn2||!dec2||!total){
-                free(consensus);free(raw_last);free(cons_syn);free(residual);
-                free(syn2);free(dec2);free(total);free(base);free(per_round);return 1;
+            free(per_round);
+            // Reject if syndrome violates sub-lattice parity (not in image of H).
+            // Every valid syndrome has even row and column sums within each
+            // (px,py) parity class.  Odd parity = residual measurement faults.
+            int viable=1;
+            for(int px=0;px<2&&viable;px++) for(int py=0;py<2&&viable;py++) {
+                int hr=r/2, hs=s/2;
+                for(int si=0;si<hr;si++){
+                    int rp=0;
+                    for(int sj=0;sj<hs;sj++) rp ^= syn[(px+2*si)*s+(py+2*sj)];
+                    if(rp){viable=0;break;}
+                }
+                if(!viable) break;
+                for(int sj=0;sj<hs;sj++){
+                    int cp=0;
+                    for(int si=0;si<hr;si++) cp ^= syn[(px+2*si)*s+(py+2*sj)];
+                    if(cp){viable=0;break;}
+                }
             }
-            memcpy(raw_last,per_round+(rounds-1)*n,n);
-            free(per_round); free(base);
-            syndrome_of(r,s,consensus,cons_syn);
-            for(int q=0;q<n;q++) residual[q]=raw_last[q]^cons_syn[q];
-            memcpy(total,consensus,n);
-            memcpy(syn2,residual,n);
-            for(int pass=0;pass<15;pass++){
-                preprocess_syndrome(r,s,syn2);
-                solve_plane_layered(r,s,syn2,dec2);
-                for(int q=0;q<n;q++) total[q]^=dec2[q];
-                syndrome_of(r,s,total,syn2);
-                for(int q=0;q<n;q++) syn2[q]^=raw_last[q];
+            uint8_t *out=calloc(n,1);
+            if(!out){free(syn);return 1;}
+            if(viable){
+                preprocess_syndrome(r,s,syn);
+                solve_plane_5d(r,s,syn,out);
             }
-            fwrite(total,1,n,stdout); fflush(stdout);
-            free(consensus);free(raw_last);free(cons_syn);free(residual);
-            free(syn2);free(dec2);free(total);
+            free(syn);
+            fwrite(out,1,n,stdout); fflush(stdout);
+            free(out);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-mv")) {
@@ -1982,137 +1864,6 @@ int main(int argc, char **argv) {
             solve_plane(r,s,syn_shift,dec);
             fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
-        }
-        else if(!strcmp(argv[i],"--decode-basis")) {
-            // Linear basis decoder: read n (4 bytes), then n*(syn+corr) pairs (each nn bytes),
-            // then the new syndrome (nn bytes). Output correction (nn bytes).
-            int nn = r * s, n;
-            if (fread(&n, 4, 1, stdin) != 1 || n < 0 || n > 1000000) {
-                fprintf(stderr, "bad basis count\n"); return 1;
-            }
-            uint8_t *syns = malloc((size_t)n * nn);
-            uint8_t *corrs = malloc((size_t)n * nn);
-            uint8_t *new_syn = malloc((size_t)nn);
-            uint8_t *out = malloc((size_t)nn);
-            if (!syns || !corrs || !new_syn || !out) {
-                free(syns); free(corrs); free(new_syn); free(out);
-                fprintf(stderr, "alloc fail\n"); return 1;
-            }
-            for (int k = 0; k < n; k++) {
-                if (fread(syns + k * nn, 1, nn, stdin) != (size_t)nn ||
-                    fread(corrs + k * nn, 1, nn, stdin) != (size_t)nn) {
-                    free(syns); free(corrs); free(new_syn); free(out);
-                    fprintf(stderr, "short read at entry %d\n", k); return 1;
-                }
-            }
-            if (fread(new_syn, 1, nn, stdin) != (size_t)nn) {
-                free(syns); free(corrs); free(new_syn); free(out);
-                fprintf(stderr, "short read of new_syn\n"); return 1;
-            }
-            int ok = decode_linear_basis(r, s, n, syns, corrs, new_syn, out);
-            fwrite(out, 1, nn, stdout);
-            fflush(stdout);
-            free(syns); free(corrs); free(new_syn); free(out);
-            return ok ? 0 : 1;
-        }
-        else if(!strcmp(argv[i],"--project-decode")) {
-            // Consistency projection + linear basis decoder.
-            // stdin: [n:u32] [n*(syn+corr):nn+nn bytes each] [rnd0:nn][rnd1:nn][rnd2:nn][rnd3:nn]
-            // stdout: [correction:nn bytes]
-            int nn = r * s, n;
-            if(fread(&n,4,1,stdin)!=1||n<0||n>1000000){fprintf(stderr,"bad n\n");return 1;}
-            uint8_t *syns=malloc((size_t)n*nn);
-            uint8_t *corrs=malloc((size_t)n*nn);
-            uint8_t *rounds=malloc(4*nn);
-            uint8_t *out=malloc(nn);
-            if(!syns||!corrs||!rounds||!out){free(syns);free(corrs);free(rounds);free(out);return 1;}
-            for(int k=0;k<n;k++){
-                if(fread(syns+k*nn,1,nn,stdin)!=(size_t)nn||
-                   fread(corrs+k*nn,1,nn,stdin)!=(size_t)nn){
-                    free(syns);free(corrs);free(rounds);free(out);return 1;
-                }
-            }
-            for(int rd=0;rd<4;rd++){
-                if(fread(rounds+rd*nn,1,nn,stdin)!=(size_t)nn){
-                    free(syns);free(corrs);free(rounds);free(out);return 1;
-                }
-            }
-            // Build H matrix (nn × nn)
-            uint8_t *H=malloc((size_t)nn*nn);
-            if(!H){free(syns);free(corrs);free(rounds);free(out);return 1;}
-            uint8_t err_buf[MAX_N], syn_buf[MAX_N];
-            for(int col=0;col<nn;col++){
-                memset(err_buf,0,nn); err_buf[col]=1;
-                syndrome_of(r,s,err_buf,syn_buf);
-                for(int row=0;row<nn;row++) H[row*nn+col]=syn_buf[row];
-            }
-            // Find consistent bits (same value across all 4 rounds)
-            int *clean_idx=malloc((size_t)nn*sizeof(int));
-            int n_clean=0;
-            if(!clean_idx){free(H);free(syns);free(corrs);free(rounds);free(out);return 1;}
-            for(int q=0;q<nn;q++){
-                uint8_t val=rounds[q];
-                int all_same=1;
-                for(int rd=1;rd<4;rd++) if(rounds[rd*nn+q]!=val){all_same=0;break;}
-                if(all_same) clean_idx[n_clean++]=q;
-            }
-            int ok=0;
-            if(n_clean>=24){
-                // Augmented matrix: n_clean rows × (nn+1) cols
-                uint8_t *A=malloc((size_t)n_clean*(nn+1));
-                if(A){
-                    for(int i=0;i<n_clean;i++){
-                        int q=clean_idx[i];
-                        for(int col=0;col<nn;col++) A[i*(nn+1)+col]=H[q*nn+col];
-                        A[i*(nn+1)+nn]=rounds[q];
-                    }
-                    // RREF full elimination
-                    int rank=0;
-                    int pivot_col[MAX_N];
-                    memset(pivot_col,0,sizeof(pivot_col));
-                    for(int col=0;col<nn;col++){
-                        int pv=-1;
-                        for(int i=rank;i<n_clean;i++) if(A[i*(nn+1)+col]){pv=i;break;}
-                        if(pv<0) continue;
-                        if(pv!=rank) for(int c=0;c<=nn;c++){
-                            uint8_t tmp=A[pv*(nn+1)+c];
-                            A[pv*(nn+1)+c]=A[rank*(nn+1)+c];
-                            A[rank*(nn+1)+c]=tmp;
-                        }
-                        pivot_col[rank]=col;
-                        for(int i=0;i<n_clean;i++) if(i!=rank&&A[i*(nn+1)+col])
-                            for(int c=0;c<=nn;c++) A[i*(nn+1)+c]^=A[rank*(nn+1)+c];
-                        rank++;
-                    }
-                    // Check inconsistency
-                    int consistent=1;
-                    for(int i=rank;i<n_clean&&consistent;i++) if(A[i*(nn+1)+nn]){
-                        int az=1;
-                        for(int c=0;c<nn;c++) if(A[i*(nn+1)+c]){az=0;break;}
-                        if(az) consistent=0;
-                    }
-                    if(consistent){
-                        // Extract E
-                        uint8_t E[MAX_N];
-                        memset(E,0,nn);
-                        for(int i=0;i<rank;i++){
-                            int col=pivot_col[i];
-                            if(col>=0) E[col]=A[i*(nn+1)+nn];
-                        }
-                        // Compute S' = H*E (guaranteed in Col(H))
-                        uint8_t proj_syn[MAX_N];
-                        syndrome_of(r,s,E,proj_syn);
-                        // Decode using basis
-                        ok=decode_linear_basis(r,s,n,syns,corrs,proj_syn,out);
-                    }
-                    free(A);
-                }
-            }
-            free(clean_idx); free(H);
-            if(!ok) memset(out,0,nn);
-            fwrite(out,1,nn,stdout); fflush(stdout);
-            free(syns);free(corrs);free(rounds);free(out);
-            return ok?0:1;
         }
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}
     }

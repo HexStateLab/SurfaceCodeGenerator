@@ -1767,8 +1767,9 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-tesseract")) {
-            // Multi-round decoder: decode the last round's raw syndrome
-            // with the full 5D residual pipeline.
+            // AND-vote decoder: AND across all rounds to filter measurement noise,
+            // then one-shot 5D decode. Suitable for measurement-noise-dominated
+            // hardware (PM >> PG).  AND false-positive rate ~ (PM)^rounds ≈ 0.
             int n=r*s, rounds;
             if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *per_round=malloc((size_t)rounds*n);
@@ -1778,21 +1779,19 @@ int main(int argc, char **argv) {
             }
             uint8_t *syn=malloc(n);
             if(!syn){free(per_round);return 1;}
-            memcpy(syn,per_round+(rounds-1)*n,n);
-            free(per_round);
-            uint8_t *total=calloc(n,1), *dec=malloc(n), *raw=malloc(n);
-            if(!total||!dec||!raw){free(syn);free(total);free(dec);free(raw);return 1;}
-            memcpy(raw,syn,n);
-            for(int pass=0;pass<10;pass++){
-                preprocess_syndrome(r,s,syn);
-                solve_plane_5d(r,s,syn,dec);
-                for(int q=0;q<n;q++) total[q]^=dec[q];
-                syndrome_of(r,s,total,syn);
-                for(int q=0;q<n;q++) syn[q]^=raw[q];
+            for(int q=0;q<n;q++){
+                int v=1;
+                for(int c=0;c<rounds;c++) v &= per_round[c*n+q];
+                syn[q]=v;
             }
-            free(syn); free(raw);
-            fwrite(total,1,n,stdout); fflush(stdout);
-            free(total); free(dec);
+            free(per_round);
+            uint8_t *out=calloc(n,1);
+            if(!out){free(syn);return 1;}
+            preprocess_syndrome(r,s,syn);
+            solve_plane_5d(r,s,syn,out);
+            free(syn);
+            fwrite(out,1,n,stdout); fflush(stdout);
+            free(out);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-mv")) {

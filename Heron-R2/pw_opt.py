@@ -11,13 +11,14 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, stabilizer_basis='Z'):
     """Build optimized share-pair QEC circuit.
 
-    Measures V(i,j) = data[i][j] ⊕ data[(i+2)%r][j] for i=0..r-3 (NOT r-2, r-1).
-    The final two rows' V are reconstructed: V(r-2) = V(r-4) ⊕ V(r-2),
-    V(r-1) = V(r-3) ⊕ V(r-1) — but actually simpler: only measure even and
-    odd positions up to r//2 sectors.
+    stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers).
+    stabilizer_basis='X': measure V(i,j) = X_i X_{i+2,j} (X⊗X stabilizers).
+
+    In X mode, initial state is prepared as |+⟩⊗N (satisfies X-stabilizers)
+    and the ancilla cycle uses anc→data CX (instead of data→anc).
 
     For an r×s grid where both are even:
       - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
@@ -82,6 +83,11 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         qc.h(b_prep_idx)
         # Don't measure — the Bell prep ancilla stays entangled with the data
     else:
+        # |+⟩⊗N preparation for X-stabilizer basis (satisfies X_i X_j = +1)
+        if stabilizer_basis == 'X':
+            for ii in range(r):
+                for jj in range(s):
+                    qc.h(data_map[ii][jj])
         if "1" in logical_state:
             if logical_state[1] == "1":
                 for jj in range(s):
@@ -103,8 +109,16 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                         anc_global += 1
 
                         qc.reset(a_idx)
-                        qc.cx(data_map[i][j], a_idx)
-                        qc.cx(data_map[(i + 2) % r][j], a_idx)
+                        if stabilizer_basis == 'X':
+                            # X⊗X measurement: anc→data CX with Hadamard on anc
+                            qc.h(a_idx)
+                            qc.cx(a_idx, data_map[i][j])
+                            qc.cx(a_idx, data_map[(i + 2) % r][j])
+                            qc.h(a_idx)
+                        else:
+                            # Z⊗Z measurement: data→anc CX
+                            qc.cx(data_map[i][j], a_idx)
+                            qc.cx(data_map[(i + 2) % r][j], a_idx)
 
                         syn_idx = a_idx - n_data
                         qc.measure(a_idx, cr_syn[rnd][syn_idx])

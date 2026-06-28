@@ -46,8 +46,15 @@ def get_token():
 
 
 def build_circuit(r, s, rounds, logical_state="00", share_pairs=False,
-                  bell=False, bell_measure=False, measure_x=False, opt=False):
+                  bell=False, bell_measure=False, measure_x=False, opt=False,
+                  stabilizer_basis='Z'):
     """Build QEC circuit for a given logical state.
+
+    stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z).
+    stabilizer_basis='X': measure V(i,j) = X_i X_{i+2,j} (X⊗X).
+
+    In X mode, initial state is prepared as |+⟩⊗N and ancilla cycle uses
+    anc→data CX instead of data→anc.
 
     Logical operators:
       Z_L1 = Z on row 0,  X_L1 = X on column 0
@@ -111,6 +118,11 @@ def build_circuit(r, s, rounds, logical_state="00", share_pairs=False,
                 qc.cx(b_prep_idx, data_map[0][j])
             qc.h(b_prep_idx)
         else:
+            # |+⟩⊗N prep for X-stabilizer basis (satisfies X_i X_j = +1)
+            if stabilizer_basis == 'X':
+                for ii in range(r):
+                    for jj in range(s):
+                        qc.h(data_map[ii][jj])
             if "1" in logical_state:
                 if logical_state[1] == "1":
                     for jj in range(s):
@@ -128,8 +140,16 @@ def build_circuit(r, s, rounds, logical_state="00", share_pairs=False,
                             i = 2 * p + px
                             j = 2 * q + py
                             qc.reset(anc_idx)
-                            qc.cx(data_map[i][j], anc_idx)
-                            qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                            if stabilizer_basis == 'X':
+                                qc.h(data_map[i][j])
+                                qc.h(data_map[(i + 2) % r][j])
+                                qc.cx(data_map[i][j], anc_idx)
+                                qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                                qc.h(data_map[i][j])
+                                qc.h(data_map[(i + 2) % r][j])
+                            else:
+                                qc.cx(data_map[i][j], anc_idx)
+                                qc.cx(data_map[(i + 2) % r][j], anc_idx)
                             qc.measure(anc_idx, cr_syn[rnd][anc_idx - n_data])
                             anc_idx += 1
             qc.barrier()
@@ -284,6 +304,21 @@ def logical_measure(corrected_data, r, s):
     return lz1, lz2
 
 
+def all_logicals_measure(corrected_data, r, s, basis='Z'):
+    """Measure all Z-type (basis='Z') or X-type (basis='X') logicals.
+
+    In Z-basis, row/col strings are Z-type logicals.
+    In X-basis (H before readout), same strings are X-type logicals.
+    """
+    op = basis
+    logicals = {}
+    for i in range(r - 1):
+        logicals[f'{op}_row_{i}'] = corrected_data[:, i, :].sum(axis=1) % 2
+    for j in range(s - 1):
+        logicals[f'{op}_col_{j}'] = corrected_data[:, :, j].sum(axis=1) % 2
+    return logicals
+
+
 def compute_fidelity(lz1, lz2, expected_z1, expected_z2):
     """Fraction of shots matching expected logical values."""
     correct = ((lz1 == expected_z1) & (lz2 == expected_z2)).sum()
@@ -317,6 +352,8 @@ def run_test(token, opts):
     from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 
     r, s = 6, 8
+    if opts.grid:
+        r, s = opts.grid
     rounds = opts.rounds
     shots = opts.shots
     share_pairs = opts.share_pairs
@@ -337,6 +374,7 @@ def run_test(token, opts):
     qc, data_map, lq0_qubits, lq1_qubits = build_circuit(
         r, s, rounds, logical_state=logical_state, share_pairs=share_pairs, bell=bell,
         bell_measure=bell_measure, measure_x=opts.measure_x, opt=opt,
+        stabilizer_basis='X' if opts.x_stabilizer else 'Z',
     )
     basis = "X" if opts.measure_x else "Z"
     label = f"Bell-{basis}{'-M' if bell_measure else ''}" if bell else f"|{logical_state}⟩"
@@ -346,7 +384,8 @@ def run_test(token, opts):
     print(f"Circuit: {r}×{s} grid, {rounds} rounds, {label}, {shots} shots")
     print(f"  Data qubits: {r * s}, Ancillas: {n_anc}{', +1 Bell ancilla' if n_bell else ''}")
     if opt:
-        print(f"  Optimized: V(2) software-reconstructed, {n_anc} ancillas, 64 CX")
+        stab = "X" if opts.x_stabilizer else "Z"
+        print(f"  Optimized: {stab}-stabilizer software-reconstructed, {n_anc} ancillas, 64 CX")
     if opts.measure_x:
         print(f"  Readout: H⊗n applied before measurement (X-basis)")
 
@@ -494,6 +533,24 @@ def run_test(token, opts):
                 print(f"    X_L1 X_L₂ conditional match: {x_conditional:.3f}")
 
             jobs[job_id][dec_name] = info
+        elif opts.all_logicals:
+            basis_label = "X" if opts.measure_x else "Z"
+            logicals = all_logicals_measure(corrected, r, s, basis=basis_label)
+            n_logicals = r + s - 2
+            all_ok = np.ones(n_shots, dtype=np.uint8)
+            for name, vals in logicals.items():
+                all_ok &= (vals == 0)
+                err_rate = vals.mean()
+                print(f"  {dec_name}: {name} error rate = {err_rate:.4f}")
+            joint_fidelity = all_ok.mean()
+            print(f"  {dec_name}: All-{n_logicals}-{basis_label}-logicals fidelity = {joint_fidelity:.4f} "
+                  f"(all {n_logicals} {basis_label}-type |0⟩)")
+            info = {
+                "joint_fidelity": float(joint_fidelity),
+                "time_s": round(dt, 2),
+                "expected_state": f"|{'0'*n_logicals}⟩",
+            }
+            jobs[job_id][dec_name] = info
         else:
             expected_z1 = int(logical_state[0])
             expected_z2 = int(logical_state[1])
@@ -525,8 +582,17 @@ def run_test(token, opts):
     print(f"\nResults saved to {SAVE_FILE}")
 
     op = "X" if opts.measure_x else "Z"
-    f = jobs[job_id].get("waxis", {}).get(f"bell_fidelity_{op}" if bell else "fidelity", 0)
-    label = f"Bell-{op}" if bell else "Fidelity"
+    waxis = jobs[job_id].get("waxis", {})
+    if bell:
+        f = waxis.get(f"bell_fidelity_{op}", 0)
+        label = f"Bell-{op}"
+    elif opts.all_logicals:
+        basis_label = "X" if opts.measure_x else "Z"
+        f = waxis.get("joint_fidelity", 0)
+        label = f"All-{r+s-2}-{basis_label}-logical fidelity"
+    else:
+        f = waxis.get("fidelity", 0)
+        label = "Fidelity"
     print(f"\n  {'✓' if f > 0.8 else '~' if f > 0.6 else '✗'} "
           f"{label}={f:.3f}: {'Preserved!' if f > 0.8 else 'Partial' if f > 0.6 else 'Degraded'}")
 
@@ -542,10 +608,16 @@ def main():
     ap.add_argument('--share-pairs', action='store_true')
     ap.add_argument('--opt', action='store_true',
                     help='Optimized share-pair: software-reconstructed V(2), 32 anc, 64 CX')
+    ap.add_argument('--x-stabilizer', action='store_true',
+                    help='Measure X⊗X stabilizers instead of Z⊗Z (prepares |+⟩⊗N)')
     ap.add_argument('--measure-x', action='store_true',
                     help='Apply H before readout for X-basis measurement')
     ap.add_argument('--bell-measure', action='store_true',
                     help='Add Bell-state measurement after QEC to read X_L1 X_L₂')
+    ap.add_argument('--all-logicals', action='store_true',
+                    help='Report all Z-type logicals (rows 0..r-2, cols 0..s-2)')
+    ap.add_argument('--grid', type=int, nargs=2, metavar=('R', 'S'),
+                    help='Grid dimensions (default: 6 8)')
     ap.add_argument('--state', type=str, default="00",
                     choices=["00", "01", "10", "11", "bell"],
                     help="logical state to prepare (or 'bell' for Bell pair)")

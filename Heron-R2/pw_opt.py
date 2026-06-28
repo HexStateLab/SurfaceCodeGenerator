@@ -42,32 +42,6 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False)
                     anc_indices.append((px, py, p, q))
                     n_anc += 1
 
-    # Build initial_layout for heavy-hex: pin each abstract qubit to its physical flag qubit
-    initial_layout = {}
-    for ii in range(r):
-        for jj in range(s):
-            initial_layout[data_map[ii][jj]] = data_map[ii][jj]
-    anc_physical = []
-    anc_global = n_data
-    for px in range(2):
-        for py in range(2):
-            for p in range(hr - 1):
-                for q in range(hs):
-                    i = 2 * p + px
-                    j = 2 * q + py
-                    phys = anc_maps[(i, j, 0)]
-                    anc_physical.append(phys)
-                    initial_layout[anc_global] = phys
-                    anc_global += 1
-
-    if bell:
-        used = set(data_map[ii][jj] for ii in range(r) for jj in range(s))
-        used.update(anc_physical)
-        for p in range(156):  # heavy-hex has 156 physical qubits
-            if p not in used:
-                initial_layout[n_data + n_anc] = p
-                break
-
     n_bell = 1 if bell else 0
     total = n_data + n_anc + n_bell
     qr = QuantumRegister(total, "q")
@@ -130,7 +104,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False)
     lq0_qubits = [data_map[0][jj] for jj in range(s)]
     lq1_qubits = [data_map[ii][0] for ii in range(r)]
 
-    return qc, data_map, lq0_qubits, lq1_qubits, n_anc, initial_layout
+    return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
 def all_syndromes_opt(pub_result, rounds, r, s, n_anc):
@@ -180,53 +154,36 @@ def verify_optimized():
     """Verify the optimized circuit builds and transpiles correctly."""
     from qiskit_ibm_runtime.fake_provider.backends.fez.fake_fez import FakeFez
     from qiskit import transpile
-    from qiskit.transpiler import CouplingMap
-    import json, os
-
-    path = os.path.expanduser(
-        "~/.local/lib/python3.12/site-packages/qiskit_ibm_runtime/"
-        "fake_provider/backends/fez/conf_fez.json"
-    )
-    with open(path) as f:
-        conf = json.load(f)
-    for gate in conf["gates"]:
-        if gate["name"] == "cz":
-            cm_full = CouplingMap(couplinglist=[(min(a,b), max(a,b))
-                                                for a,b in gate["coupling_map"] if a != b])
-            break
+    from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 
     backend = FakeFez()
 
     # Test |00⟩ circuit (no Bell)
     r, s, rounds = 6, 8, 1
-    qc, dm, lq0, lq1, n_anc, il = build_circuit(r, s, rounds, logical_state="00")
+    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00")
     ops = qc.count_ops()
     print(f"Optimized |00⟩ circuit: {qc.num_qubits} qubits ({r*s} data + {n_anc} anc), "
           f"CX={ops.get('cx',0)}")
-    ilist = [il[i] for i in range(qc.num_qubits)]
-    qc_t = transpile(qc, backend=backend, coupling_map=cm_full,
-                     basis_gates=['cx', 'id', 'rz', 'sx', 'x'],
-                     initial_layout=ilist,
-                     optimization_level=3)
+    pm = generate_preset_pass_manager(backend=backend, optimization_level=3,
+                                      seed_transpiler=42)
+    qc_t = pm.run(qc)
     ops_t = qc_t.count_ops()
     print(f"  Transpiled: phys={qc_t.num_qubits}, depth={qc_t.depth()}, "
-          f"CX={ops_t.get('cx',0)}, SWAP={ops_t.get('swap',0)}")
+          f"CZ={ops_t.get('cz',0)}, SWAP={ops_t.get('swap',0)}")
     assert ops_t.get('swap', 0) == 0, "SWAPs found in |00⟩!"
     print("  ✓ 0 SWAPs verified")
 
     # Test Bell circuit
-    qc_b, _, _, _, _, il_b = build_circuit(r, s, rounds, bell=True)
+    qc_b, dm_b, _, _, _ = build_circuit(r, s, rounds, bell=True)
     ops_b = qc_b.count_ops()
     print(f"\nOptimized Bell circuit: {qc_b.num_qubits} qubits, "
           f"CX={ops_b.get('cx',0)}")
-    ilist_b = [il_b[i] for i in range(qc_b.num_qubits)]
-    qc_b_t = transpile(qc_b, backend=backend, coupling_map=cm_full,
-                       basis_gates=['cx', 'id', 'rz', 'sx', 'x'],
-                       initial_layout=ilist_b,
-                       optimization_level=3)
+    pm_b = generate_preset_pass_manager(backend=backend, optimization_level=3,
+                                        seed_transpiler=42)
+    qc_b_t = pm_b.run(qc_b)
     ops_b_t = qc_b_t.count_ops()
     print(f"  Transpiled: phys={qc_b_t.num_qubits}, depth={qc_b_t.depth()}, "
-          f"CX={ops_b_t.get('cx',0)}, SWAP={ops_b_t.get('swap',0)}")
+          f"CZ={ops_b_t.get('cz',0)}, SWAP={ops_b_t.get('swap',0)}")
 
 
 def verify_pipeline():
@@ -239,7 +196,7 @@ def verify_pipeline():
     backend = AerSimulator(device='CPU')
     r, s, rounds = 6, 8, 1
 
-    qc, dm, lq0, lq1, n_anc, _ = build_circuit(r, s, rounds, logical_state="00")
+    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00")
     print(f"Circuit: {qc.num_qubits}q, CX={qc.count_ops().get('cx',0)}")
 
     noise_model = NoiseModel()

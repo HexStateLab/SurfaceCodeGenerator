@@ -43,6 +43,11 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     n_anc_phys = 2 * r * s
     n_anc = 4 * (hr - 1) * hs
 
+    if every_round_free:
+        qec_rounds = 0
+    else:
+        qec_rounds = rounds - 1 if free_final_round else rounds
+
     probe_active = probe_qubit is not None and qec_rounds > 0
     n_extra = (1 if bell else 0) + (1 if bell_measure else 0) + (1 if ghz else 0) + (1 if ghz_measure else 0) + (1 if probe_active else 0)
     extra_qubits = []
@@ -69,13 +74,6 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         extra_idx["probe"] = extra_cursor
         extra_cursor += 1
     total = n_data + n_anc_phys + n_extra
-
-    if every_round_free:
-        qec_rounds = 0
-    else:
-        qec_rounds = rounds - 1 if free_final_round else rounds
-
-    probe_active = probe_qubit is not None and qec_rounds > 0
 
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(qec_rounds)]

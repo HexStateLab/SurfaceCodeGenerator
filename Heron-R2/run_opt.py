@@ -85,6 +85,11 @@ def run_test(token, opts):
     ghz_measure = opts.ghz_measure
     no_reset = not opts.reset_every_round
     free_final_round = not opts.no_free_final_round
+    accumulated_ancilla = opts.accumulated_ancilla
+
+    if accumulated_ancilla and free_final_round:
+        print("WARNING: --accumulated-ancilla disables free-final-round (all rounds run CX, ancillas read once at end)")
+        free_final_round = False
 
     if free_final_round:
         readout_is_x = opts.measure_x
@@ -115,6 +120,7 @@ def run_test(token, opts):
         stabilizer_basis='X' if opts.x_stabilizer else 'Z',
         no_reset=no_reset,
         free_final_round=free_final_round,
+        accumulated_ancilla=accumulated_ancilla,
     )
     if opts.partial_x:
         basis = "X_partial"
@@ -127,13 +133,21 @@ def run_test(token, opts):
     else:
         label = f"|{logical_state}⟩"
     stab = "X" if opts.x_stabilizer else "Z"
-    anc_rounds = max(0, rounds - 1) if free_final_round else max(0, rounds)
-    cx_per_round = 8 * (r // 2 - 1) * (s // 2)
-    total_cx = anc_rounds * cx_per_round
-    ffr_note = f" (last round free from data)" if free_final_round else ""
+    if accumulated_ancilla:
+        anc_rounds = 0
+        cx_count = rounds * 8 * (r // 2 - 1) * (s // 2)
+        aa_note = f" + 1 ancilla readout (cumulative)"
+    elif free_final_round:
+        anc_rounds = max(0, rounds - 1)
+        cx_count = anc_rounds * 8 * (r // 2 - 1) * (s // 2)
+        aa_note = " (last round free from data)"
+    else:
+        anc_rounds = max(0, rounds)
+        cx_count = anc_rounds * 8 * (r // 2 - 1) * (s // 2)
+        aa_note = ""
     print(f"Circuit: {r}×{s} grid, {rounds} rounds, {label}, {shots} shots")
     print(f"  Data: {r*s}, Ancillas: {n_anc}, {stab}-stab, no_reset={no_reset}")
-    print(f"  {anc_rounds} ancilla round{'s' if anc_rounds != 1 else ''} × {cx_per_round} CX = {total_cx} CX{ffr_note}")
+    print(f"  {rounds} CX round{'s' if rounds != 1 else ''} × {8 * (r // 2 - 1) * (s // 2)} CX = {cx_count} CX{aa_note}")
 
     if opts.dry_run:
         ops = qc.count_ops()
@@ -170,6 +184,7 @@ def run_test(token, opts):
         "backend": backend.name, "logical_state": logical_state,
         "bell_measure": bell_measure, "ghz_measure": ghz_measure, "no_reset": no_reset,
         "measure_x": opts.measure_x, "partial_x": opts.partial_x,
+        "accumulated_ancilla": accumulated_ancilla,
         "submitted": time.time(),
     }
     SAVE_FILE.write_text(json.dumps(jobs, indent=2, default=str))
@@ -191,7 +206,8 @@ def run_test(token, opts):
         all_syn = np.zeros((n_shots, 0, r, s), dtype=np.uint8)
     else:
         all_syn = all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=no_reset,
-                                    free_final_round=free_final_round, data_raw=data_raw)
+                                    free_final_round=free_final_round, data_raw=data_raw,
+                                    accumulated_ancilla=accumulated_ancilla)
 
     bell_out = None
     if bell:
@@ -221,7 +237,8 @@ def run_test(token, opts):
                   logical_state=logical_state, measure_x=opts.measure_x,
                   partial_x=opts.partial_x,
                   bell_measure=bell_measure, ghz_measure=ghz_measure, no_reset=no_reset,
-                  free_final_round=free_final_round)
+                  free_final_round=free_final_round,
+                  accumulated_ancilla=accumulated_ancilla)
     if bell_out is not None:
         kwargs["bell_out"] = bell_out
     if ghz_out is not None:
@@ -442,13 +459,18 @@ def decode_last_job():
     ghz_m = data.get("ghz_m", None) if "ghz_m" in data else None
 
     free_final_round = bool(data.get("free_final_round", False))
+    accumulated_ancilla = bool(data.get("accumulated_ancilla", False))
     if partial_x:
         basis = "X_partial"
     else:
         basis = "X" if measure_x else "Z"
-    ffr = " free-final" if free_final_round else ""
+    mode = ""
+    if accumulated_ancilla:
+        mode = " accumulated-ancilla"
+    elif free_final_round:
+        mode = " free-final"
     print(f"Re-decoding job {job_id}")
-    print(f"  {r}×{s} grid, {rounds} rounds, {n_shots} shots, {basis}-basis{ffr}")
+    print(f"  {r}×{s} grid, {rounds} rounds, {n_shots} shots, {basis}-basis{mode}")
     print(f"  Logical state: {logical_state}\n")
 
     if rounds == 0:
@@ -570,12 +592,13 @@ def decode_last_job():
             mx = "X" if j.get("measure_x") else "Z"
             xs = "X" if j.get("x_stabilizer") else "Z"
             ro = "/R" if not j.get("no_reset", True) else ""
+            aa = "/AA" if j.get("accumulated_ancilla") else ""
             w_ = j.get("waxis", {}) or {}
             zc = w_.get("Z_corr", "?")
             xc = w_.get("X_corr", "?")
             wt = w_.get("witness", "")
             wt_str = f"  W={wt:.3f}" if wt != "" else ""
-            print(f"    {jid[:12]}  {rnds}r  read={mx}{bm}  stab={xs}{ro}  "
+            print(f"    {jid[:12]}  {rnds}r  read={mx}{bm}  stab={xs}{ro}{aa}  "
                   f"⟨ZZ⟩={zc}  ⟨XX⟩={xc}{wt_str}")
 
     # Two-run combination for jobs without single-run witness
@@ -643,6 +666,11 @@ def main():
                     help='Reset ancillas every round (default: no-reset, save resets)')
     ap.add_argument('--no-free-final-round', action='store_true',
                     help='Disable free final round; run all rounds as ancilla rounds (costs 64 extra CX)')
+    ap.add_argument('--accumulated-ancilla', action='store_true',
+                    help='Run all CX rounds without mid-circuit ancilla measurements; '
+                         'read ancillas once at end for cumulative syndrome. '
+                         'Saves all per-round measurement errors. '
+                         'Incompatible with --no-free-final-round.')
     ap.add_argument('--x-stabilizer', action='store_true',
                     help='Measure X⊗X stabilizers instead of Z⊗Z')
     ap.add_argument('--measure-x', action='store_true',

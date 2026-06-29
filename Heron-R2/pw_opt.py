@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, accumulated_ancilla=False):
     """Build optimized share-pair QEC circuit.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
@@ -25,6 +25,13 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     free_final_round=True: run rounds-1 ancilla rounds; the destructive data readout
     at the end supplies the last round's Z-stabilizer syndrome. Only valid when
     readout basis matches stabilizer basis (both Z or both X). Saves 64 CX.
+
+    accumulated_ancilla=True: run all rounds of CX without mid-circuit ancilla
+    measurements. Ancillas accumulate the cumulative syndrome across all rounds:
+    m = P_0 ⊕ P_1 ⊕ ... ⊕ P_{N-1}. A single ancilla readout at the end extracts
+    the cumulative syndrome at 0 CX cost. Readout errors are avoided on all but
+    the final measurement. Enables arbitrarily many CX rounds with a single
+    ancilla measurement overhead.
 
     For an r×s grid where both are even:
       - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
@@ -64,10 +71,18 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         extra_cursor += 1
     total = n_data + n_anc_phys + n_extra
 
-    qec_rounds = rounds - 1 if free_final_round else rounds
+    if accumulated_ancilla:
+        qec_rounds = rounds
+        anc_meas_rounds = 1
+    elif free_final_round:
+        qec_rounds = rounds - 1
+        anc_meas_rounds = qec_rounds
+    else:
+        qec_rounds = rounds
+        anc_meas_rounds = qec_rounds
 
     qr = QuantumRegister(total, "q")
-    cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(qec_rounds)]
+    cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(anc_meas_rounds)]
     cr_data = ClassicalRegister(n_data, "data")
     cregs = [*cr_syn, cr_data]
     extra_cr = {}
@@ -117,7 +132,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 for ii in range(r):
                     qc.x(data_map[ii][0])
 
-    # QEC rounds (rounds-1 if free_final_round, else rounds)
+    # QEC rounds
     for rnd in range(qec_rounds):
         slot = 0
         for px in range(2):
@@ -137,7 +152,23 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                         else:
                             qc.cx(data_map[i][j], anc_idx)
                             qc.cx(data_map[(i + 2) % r][j], anc_idx)
-                        qc.measure(anc_idx, cr_syn[rnd][slot])
+                        if not accumulated_ancilla:
+                            qc.measure(anc_idx, cr_syn[rnd][slot])
+                        slot += 1
+        if not accumulated_ancilla:
+            qc.barrier()
+
+    # Accumulated ancilla: single endpoint measurement of all ancillas
+    if accumulated_ancilla:
+        slot = 0
+        for px in range(2):
+            for py in range(2):
+                for p in range(hr - 1):
+                    for q in range(hs):
+                        i = 2 * p + px
+                        j = 2 * q + py
+                        anc_idx = anc_maps[(i, j, 0)]
+                        qc.measure(anc_idx, cr_syn[0][slot])
                         slot += 1
         qc.barrier()
 
@@ -188,7 +219,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, accumulated_ancilla=False):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
@@ -203,6 +234,33 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
     Only rounds-1 ancilla registers are expected in pub_result.
     """
     hr, hs = r // 2, s // 2
+
+    if accumulated_ancilla:
+        # Single ancilla measurement at end = cumulative syndrome across all rounds
+        first = getattr(pub_result.data, "syn_0")
+        shots = first.num_shots
+
+        bits = first.to_bool_array(order='little')
+        m = bits[:, :n_anc].astype(np.uint8)
+
+        syn = np.zeros((shots, 1, r, s), dtype=np.uint8)
+        V = np.zeros((shots, r, s), dtype=np.uint8)
+        idx = 0
+        for px in range(2):
+            for py in range(2):
+                for p in range(hr - 1):
+                    for q in range(hs):
+                        i = 2 * p + px
+                        j = 2 * q + py
+                        V[:, i, j] = m[:, idx]
+                        idx += 1
+
+        V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
+        V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
+        syn[:, 0] = V ^ np.roll(V, shift=-2, axis=2)
+
+        return syn
+
     anc_rounds = rounds - 1 if free_final_round else rounds
 
     if anc_rounds == 0:
@@ -227,7 +285,6 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
         for c in range(anc_rounds):
             m = m_parity[:, c]
 
-            # Unpack measurements into (shots, r, s) V array
             V = np.zeros((shots, r, s), dtype=np.uint8)
             idx = 0
             for px in range(2):
@@ -239,14 +296,10 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
                             V[:, i, j] = m[:, idx]
                             idx += 1
 
-            # Reconstruct V(r-2, j) and V(r-1, j)
             V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
             V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
-
-            # Reconstruct full syndrome: S(i,j) = V(i,j) ⊕ V(i,j+2 mod s)
             syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
 
-    # Free final round: compute last syndrome from data readout
     if free_final_round and data_raw is not None:
         V_last = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-2, axis=1)
         syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)

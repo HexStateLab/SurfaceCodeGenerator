@@ -467,10 +467,10 @@ static void metacheck_repair_block(int hr, int hs, uint8_t *S) {
 static void blk_descent(int hr, int hs, uint8_t *E, double *W) {
     #define SEC_d(a,b) ((a)*hs+(b))
     for(;;) { int chg=0;
-        for(int b=0;b<hs;b++){ double w0=0,w1=0;
+        for(int b=1;b<hs;b++){ double w0=0,w1=0;
             for(int a=0;a<hr;a++){if(E[SEC_d(a,b)])w0+=W[SEC_d(a,b)];else w1+=W[SEC_d(a,b)];}
             if(w1<w0){for(int a=0;a<hr;a++)E[SEC_d(a,b)]^=1;chg=1;}}
-        for(int a=0;a<hr;a++){ double w0=0,w1=0;
+        for(int a=1;a<hr;a++){ double w0=0,w1=0;
             for(int b=0;b<hs;b++){if(E[SEC_d(a,b)])w0+=W[SEC_d(a,b)];else w1+=W[SEC_d(a,b)];}
             if(w1<w0){for(int b=0;b<hs;b++)E[SEC_d(a,b)]^=1;chg=1;}}
         if(!chg)break;
@@ -591,11 +591,11 @@ static void blk_sweep(int m,int n,uint8_t *work,int order) {
     for(;;) {
         int changed=0;
         if(order==0) {
-            for(int j=0;j<n;j++) if(blk_best_col(m,n,work,j)){blk_flip_col(m,n,work,j);changed=1;}
-            for(int i=0;i<m;i++) if(blk_best_row(m,n,work,i)){blk_flip_row(m,n,work,i);changed=1;}
+            for(int j=1;j<n;j++) if(blk_best_col(m,n,work,j)){blk_flip_col(m,n,work,j);changed=1;}
+            for(int i=1;i<m;i++) if(blk_best_row(m,n,work,i)){blk_flip_row(m,n,work,i);changed=1;}
         } else {
-            for(int i=0;i<m;i++) if(blk_best_row(m,n,work,i)){blk_flip_row(m,n,work,i);changed=1;}
-            for(int j=0;j<n;j++) if(blk_best_col(m,n,work,j)){blk_flip_col(m,n,work,j);changed=1;}
+            for(int i=1;i<m;i++) if(blk_best_row(m,n,work,i)){blk_flip_row(m,n,work,i);changed=1;}
+            for(int j=1;j<n;j++) if(blk_best_col(m,n,work,j)){blk_flip_col(m,n,work,j);changed=1;}
         }
         if(!changed) break;
     }
@@ -697,15 +697,23 @@ static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
 // correction with the same syndrome.
 static void kernel_enum_block(int m, int n, uint8_t *out) {
     if(m <= 16) {
-        // Exhaustive enumeration for small-to-medium kernels
+        // Exhaustive enumeration for small-to-medium kernels.
+        // Row-0 and column-0 are FIXED (never flipped) to preserve logical state.
+        // All other rows and columns can be freely flipped — those are stabilizers.
         int best_rmask=0, best_cmask=0, best_wt=m*n+1;
-        for(int rmask=0; rmask<(1<<m); rmask++) {
+        for(int rmask=0; rmask<(1<<m); rmask+=2) {  // bit 0 = row 0, pinned
             int cmask=0, wt=0;
             for(int b=0;b<n;b++) {
                 int ones=0;
-                for(int a=0;a<m;a++) if(out[a*n+b] ^ ((rmask>>a)&1)) ones++;
-                if(ones > m-ones) { cmask |= (1<<b); wt += m-ones; }
-                else wt += ones;
+                for(int a=0;a<m;a++) ones += out[a*n+b] ^ ((rmask>>a)&1);
+                if(b == 0) {
+                    // Column 0 is pinned — never flip (would toggle logical state)
+                    wt += ones < m-ones ? ones : m-ones;
+                } else if(ones > m-ones) {
+                    cmask |= (1<<b); wt += m-ones;
+                } else {
+                    wt += ones;
+                }
             }
             if(wt < best_wt) { best_wt=wt; best_rmask=rmask; best_cmask=cmask; }
         }
@@ -717,26 +725,27 @@ static void kernel_enum_block(int m, int n, uint8_t *out) {
     } else {
         // Multi-start greedy descent: run from many random starting points
         // and keep the best, to avoid local minima.
+        // Row-0 and column-0 are pinned (logical operators).
         uint8_t base[MAX_N]; memcpy(base,out,(size_t)m*n);
         int best_wt = m*n+1; uint8_t best[MAX_N];
         int nrestart = 64;
         if(m+n > 40) nrestart = m+n > 80 ? 512 : 256;
         for(int restart=0; restart<nrestart; restart++) {
             uint8_t tmp[MAX_N]; memcpy(tmp,base,(size_t)m*n);
-            // Randomize row mask for diversity (first restart keeps original)
+            // Randomize column mask for diversity (skip column 0 — pinned)
             if(restart > 0) {
-                uint32_t rmask = (uint32_t)ts_rand();
-                for(int b=0;b<n;b++) if((rmask>>b)&1)
+                uint32_t cmask = (uint32_t)ts_rand();
+                for(int b=1;b<n;b++) if((cmask>>b)&1)
                     for(int a=0;a<m;a++) tmp[a*n+b] ^= 1;
             }
             for(;;) {
                 int chg=0;
-                for(int b=0;b<n;b++) {
+                for(int b=1;b<n;b++) {  // skip column 0 (pinned)
                     int w0=0,w1=0;
                     for(int a=0;a<m;a++){if(tmp[a*n+b])w0++;else w1++;}
                     if(w1<w0){for(int a=0;a<m;a++)tmp[a*n+b]^=1;chg=1;}
                 }
-                for(int a=0;a<m;a++) {
+                for(int a=1;a<m;a++) {  // skip row 0 (pinned)
                     int w0=0,w1=0;
                     for(int b=0;b<n;b++){if(tmp[a*n+b])w0++;else w1++;}
                     if(w1<w0){for(int b=0;b<n;b++)tmp[a*n+b]^=1;chg=1;}
@@ -1281,11 +1290,13 @@ void preprocess_syndrome(int r, int s, uint8_t *syn) {
             else if(!v11) syn[a1*s+b1]^=1;
         }
     }
-    // Pass 2: iterative edge-flip product-code — pair odd rows/cols only
-    // at positions where syn=1 (real measurement error sites).
-    // For odd grids, stride-2 is a single cycle (gcd(2,odd)=1): the 4-class
-    // decomposition doesn't distribute the syndrome correctly and the
-    // edge-flip would remove valid syndrome bits. Skip entirely for odd axes.
+    // Pass 2: iterative edge-flip product-code — only for low-density syndromes.
+    // Count non-zero entries; if > threshold, syndrome is too dense for the
+    // product-code repair model (DEPOLARIZE2 correlated measurement faults).
+    // For such dense syndromes, the edge-flip pass would destroy valid structure.
+    int nz = 0;
+    for(int q=0; q<r*s; q++) if(syn[q]) nz++;
+    if(nz > r*s/10 + 3) return;  // skip edge-flip for dense syndromes
     if((r & 1) || (s & 1)) return;
     for(int iter=0; iter<10; iter++) {
         int any=0;

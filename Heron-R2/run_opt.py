@@ -48,12 +48,13 @@ def compute_fidelity(lz1, lz2, z1, z2):
 def decode(decoder_name, all_syn, r, s):
     """Decode syndromes and return (n_shots, r, s) corrections."""
     n_shots, rounds, _, _ = all_syn.shape
+    if rounds == 0:
+        return np.zeros((n_shots, r, s), dtype=np.uint8)
     if decoder_name == "tesseract":
-        from pw_qiskit import PlaneWarp
-        pw = PlaneWarp(r, s)
+        from decoder import tesseract_decode
         corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
         for i in range(n_shots):
-            corrs[i] = pw.decode_tesseract(all_syn[i])
+            corrs[i] = tesseract_decode(all_syn[i], r, s)
         return corrs
     elif decoder_name == "waxis":
         from waxis_decode import WaxisDecoder
@@ -63,10 +64,10 @@ def decode(decoder_name, all_syn, r, s):
             corrs[i] = dec.decode(all_syn[i])
         return corrs
     elif decoder_name == "ffinal":
-        from sweep_efree import tesseract_decode_ffinal
+        from decoder import tesseract_decode_ffinal
         corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
         for i in range(n_shots):
-            corrs[i] = tesseract_decode_ffinal(all_syn[i])
+            corrs[i] = tesseract_decode_ffinal(all_syn[i], r, s)
         return corrs
     raise ValueError(f"unknown decoder: {decoder_name}")
 
@@ -126,13 +127,13 @@ def run_test(token, opts):
     else:
         label = f"|{logical_state}⟩"
     stab = "X" if opts.x_stabilizer else "Z"
-    anc_rounds = rounds - 1 if free_final_round else rounds
+    anc_rounds = max(0, rounds - 1) if free_final_round else max(0, rounds)
     cx_per_round = 8 * (r // 2 - 1) * (s // 2)
     total_cx = anc_rounds * cx_per_round
     ffr_note = f" (last round free from data)" if free_final_round else ""
     print(f"Circuit: {r}×{s} grid, {rounds} rounds, {label}, {shots} shots")
     print(f"  Data: {r*s}, Ancillas: {n_anc}, {stab}-stab, no_reset={no_reset}")
-    print(f"  {anc_rounds} ancilla rounds × {cx_per_round} CX = {total_cx} CX{ffr_note}")
+    print(f"  {anc_rounds} ancilla round{'s' if anc_rounds != 1 else ''} × {cx_per_round} CX = {total_cx} CX{ffr_note}")
 
     if opts.dry_run:
         ops = qc.count_ops()

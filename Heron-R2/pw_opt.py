@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, every_round_free=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, every_round_free=False, probe_qubit=None):
     """Build optimized share-pair QEC circuit.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
@@ -26,21 +26,15 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     at the end supplies the last round's Z-stabilizer syndrome. Saves 64 CX.
 
     every_round_free=True: run 0 ancilla rounds; ALL rounds' syndromes are computed
-    from the final destructive data readout D_N. Since CX gates don't modify data,
-    D_r = D_0 ⊕ cumulative_errors = D_N ⊕ errors_{r..N}. With no ancilla information
-    we lose temporal resolution, so every round gets S_r = f(D_N) — the net error
-    syndrome at measurement time. The decoder sees N identical rounds, which lets
-    temporal decoders (tesseract) use consensus on a single snapshot. 0 CX.
-    Overrides free_final_round.
+    from the final destructive data readout D_N. 0 CX. Overrides free_final_round.
 
-    For an r×s grid where both are even:
-      - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
-      - In sector coords, V(p,q) = data[p][q] ⊕ data[(p+1)%(r/2)][q]
-      - Measure V(p,q) for p=0..r/2-2 (all except last row in sector)
-      - Compute V(r/2-1, q) = sum of all measured V(p,q) for p=0..r/2-2
-
-    For r=6, s=8: sector size 3×4, measure p=0,1; compute p=2.
+    probe_qubit=(i,j): add 1 CX per round from data qubit (i,j) → a dedicated ancilla,
+    measured each round. Gives per-round Z-measurement of that qubit, providing
+    temporal resolution at that single position with no additional data disturbance.
+    Time-localized errors at (i,j) can be extracted via consecutive differencing.
     """
+    from pw_qiskit import heavy_hex_flag_layout
+    data_map, anc_maps, _, _ = heavy_hex_flag_layout(r, s)
     from pw_qiskit import heavy_hex_flag_layout
     data_map, anc_maps, _, _ = heavy_hex_flag_layout(r, s)
 
@@ -49,12 +43,14 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     n_anc_phys = 2 * r * s
     n_anc = 4 * (hr - 1) * hs
 
-    n_extra = (1 if bell else 0) + (1 if bell_measure else 0) + (1 if ghz else 0) + (1 if ghz_measure else 0)
+    probe_active = probe_qubit is not None and qec_rounds > 0
+    n_extra = (1 if bell else 0) + (1 if bell_measure else 0) + (1 if ghz else 0) + (1 if ghz_measure else 0) + (1 if probe_active else 0)
     extra_qubits = []
     if bell: extra_qubits.append(("bell", 1))
     if bell_measure: extra_qubits.append(("bell_m", 1))
     if ghz: extra_qubits.append(("ghz", 1))
     if ghz_measure: extra_qubits.append(("ghz_m", 1))
+    if probe_active: extra_qubits.append(("probe", 1))
     extra_idx = {}
     extra_cursor = n_data + n_anc_phys
     if bell:
@@ -69,6 +65,9 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     if ghz_measure:
         extra_idx["ghz_m"] = extra_cursor
         extra_cursor += 1
+    if probe_active:
+        extra_idx["probe"] = extra_cursor
+        extra_cursor += 1
     total = n_data + n_anc_phys + n_extra
 
     if every_round_free:
@@ -76,15 +75,22 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     else:
         qec_rounds = rounds - 1 if free_final_round else rounds
 
+    probe_active = probe_qubit is not None and qec_rounds > 0
+
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(qec_rounds)]
     cr_data = ClassicalRegister(n_data, "data")
+    cr_probe = ClassicalRegister(qec_rounds, "probe") if probe_active else None
     cregs = [*cr_syn, cr_data]
     extra_cr = {}
     for name in extra_idx:
-        cr = ClassicalRegister(1, name)
-        extra_cr[name] = cr
-        cregs.append(cr)
+        if name == "probe":
+            extra_cr["probe"] = cr_probe
+            cregs.append(cr_probe)
+        else:
+            cr = ClassicalRegister(1, name)
+            extra_cr[name] = cr
+            cregs.append(cr)
     qc = QuantumCircuit(qr, *cregs)
 
     if ghz:
@@ -151,6 +157,18 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                         slot += 1
         qc.barrier()
 
+        # Temporal probe: 1 CX from data qubit (pi,pj) → dedicated ancilla, measured
+        if probe_active:
+            pi, pj = probe_qubit
+            pidx = extra_idx["probe"]
+            if rnd == 0 or not no_reset:
+                qc.reset(pidx)
+            qc.cx(data_map[pi][pj], pidx)
+            # In X basis, rotate data back before read? No — CX with data→anc is Z-type;
+            # data is undisturbed either way. In X-basis, the data qubit is in |+⟩/|−⟩;
+            # CX(data, anc) measures data Z, which destroys X info. So skip probe in X basis.
+            qc.measure(pidx, cr_probe[rnd])
+
     # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state
     if bell_measure:
         bm_idx = extra_idx["bell_m"]
@@ -198,7 +216,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, every_round_free=False):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, every_round_free=False, probe_qubit=None):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
@@ -213,11 +231,15 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
     Only rounds-1 ancilla registers are expected in pub_result.
 
     When every_round_free=True, ALL rounds' syndromes are computed from data_raw.
-    CX gates are control-on-data, so data is never touched — D_r = D_0 ⊕ errors.
-    Every round gets the same syndrome S = f(D_N), the net error at measurement
-    time. 0 CX invested. The decoder sees N identical rounds for temporal consensus.
+    0 CX invested. The decoder sees N identical rounds for temporal consensus.
+
+    probe_qubit=(i,j): extract per-round probe measurements from register "probe".
+    Returns (syn, probe_data) where probe_data is (shots, rounds) uint8, or None
+    if probe_qubit is None.
     """
     hr, hs = r // 2, s // 2
+
+    probe_data = None
 
     if every_round_free:
         shots = data_raw.shape[0]
@@ -226,7 +248,8 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
         syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
         for c in range(rounds):
             syn[:, c] = S
-        return syn
+        # No ancilla rounds → no probe data
+        return syn, probe_data
 
     anc_rounds = rounds - 1 if free_final_round else rounds
 
@@ -241,6 +264,19 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
         for c in range(anc_rounds):
             bits = getattr(pub_result.data, f"syn_{c}").to_bool_array(order='little')
             m_raw[:, c] = bits[:, :n_anc].astype(np.uint8)
+
+        # Extract probe measurements
+        if probe_qubit is not None:
+            pb = getattr(pub_result.data, "probe").to_bool_array(order='little')
+            p_raw = pb.astype(np.uint8)  # (shots, anc_rounds), cumulative
+            if no_reset:
+                p_parity = p_raw.copy()
+                p_parity[:, 1:] ^= p_raw[:, :-1]
+            else:
+                p_parity = p_raw
+            probe_data = p_parity
+        else:
+            probe_data = None
 
         if no_reset:
             m_parity = m_raw.copy()
@@ -276,7 +312,7 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
         V_last = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-2, axis=1)
         syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)
 
-    return syn
+    return syn, probe_data
 
 
 def S_of(D):
@@ -440,7 +476,7 @@ def verify_pipeline(no_reset=False):
 
     # Verify efree syndrome vs direct (S_of) match
     syn_direct = S_of(data_raw[0])
-    syn_efree = all_syndromes_opt(None, 1, r, s, 0, data_raw=data_raw[:1], every_round_free=True)
+    syn_efree, _ = all_syndromes_opt(None, 1, r, s, 0, data_raw=data_raw[:1], every_round_free=True)
     match = np.array_equal(syn_direct, syn_efree[0, 0])
     print(f"  efree syndrome matches S_of: {match}")
     print("✓ Pipeline verified")

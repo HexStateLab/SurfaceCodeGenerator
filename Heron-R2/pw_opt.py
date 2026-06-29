@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False):
     """Build optimized share-pair QEC circuit.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
@@ -44,11 +44,20 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     if ghz: extra_qubits.append(("ghz", 1))
     if ghz_measure: extra_qubits.append(("ghz_m", 1))
     extra_idx = {}
-    if bell: extra_idx["bell"] = anc_maps[(0, 0, 1)]
-    if bell_measure: extra_idx["bell_m"] = anc_maps[(0, 1, 1)]
-    if ghz: extra_idx["ghz"] = anc_maps[(r - 1, 0, 0)]
-    if ghz_measure: extra_idx["ghz_m"] = anc_maps[(r - 1, 1, 0)]
-    total = n_data + n_anc_phys
+    extra_cursor = n_data + n_anc_phys
+    if bell:
+        extra_idx["bell"] = extra_cursor
+        extra_cursor += 1
+    if bell_measure:
+        extra_idx["bell_m"] = extra_cursor
+        extra_cursor += 1
+    if ghz:
+        extra_idx["ghz"] = extra_cursor
+        extra_cursor += 1
+    if ghz_measure:
+        extra_idx["ghz_m"] = extra_cursor
+        extra_cursor += 1
+    total = n_data + n_anc_phys + n_extra
 
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(rounds)]
@@ -138,11 +147,29 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         qc.h(bm_idx)
         qc.measure(bm_idx, extra_cr["bell_m"][0])
 
+    # GHZ measurement after QEC: measures X⊗12 on the boundary
+    if ghz_measure:
+        gm_idx = extra_idx["ghz_m"]
+        qc.h(gm_idx)
+        for j in range(s - 1):
+            qc.cx(gm_idx, data_map[r - 1][j])
+        for i in range(r - 1):
+            qc.cx(gm_idx, data_map[i][s - 1])
+        qc.h(gm_idx)
+        qc.measure(gm_idx, extra_cr["ghz_m"][0])
+
     # X-basis rotation
     if measure_x:
         for ii in range(r):
             for jj in range(s):
                 qc.h(data_map[ii][jj])
+        qc.barrier()
+    elif partial_x:
+        # H on support of X_L1 X_L2 (row 0 ∪ column 0)
+        for jj in range(s):
+            qc.h(data_map[0][jj])
+        for ii in range(1, r):
+            qc.h(data_map[ii][0])
         qc.barrier()
 
     # Final data readout

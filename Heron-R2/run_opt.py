@@ -110,6 +110,113 @@ def decode(decoder_name, all_syn, r, s, periodic=True):
         return corrs
     raise ValueError(f"unknown decoder: {decoder_name}")
 
+def run_checkpointed(token, opts):
+    """Run a long QEC experiment as a sequence of checkpointed segments
+    instead of chasing a single 'infinite free rounds' run with zero
+    ground truth.
+
+    opts.rounds is split into segments of opts.checkpoint_every ancilla
+    rounds each. Every segment is run with free_final_round forced on,
+    so its last round's syndrome comes from a real destructive data
+    readout. That gives two things at the end of every segment that a
+    truly unbroken no-data-readout run can never give you:
+
+      1. A ground-truth check (pw_opt.check_consistency) of the
+         preceding no-reset ancilla rounds against a real measurement —
+         catching ancilla-measurement drift, leakage, or decoder bias
+         before it silently compounds.
+      2. A real logical fidelity number, rather than one inferred purely
+         from chained decoder predictions.
+
+    Caveat (stated, not hidden): the data readout at each checkpoint is
+    destructive, so this does NOT preserve a single continuously
+    entangled/coherent logical state across the whole run — each segment
+    re-prepares fresh. What it gives you instead is a *trend*: how the
+    no-reset/free-final-round technique's syndrome quality and logical
+    fidelity evolve as a function of round depth, with periodic
+    validation instead of an unmonitored "infinite" run.
+    """
+    import copy
+
+    total_rounds = opts.rounds
+    seg_len = opts.checkpoint_every
+    if seg_len <= 0:
+        raise ValueError("--checkpoint-every must be a positive integer")
+    if seg_len > total_rounds:
+        seg_len = total_rounds
+
+    n_segments = -(-total_rounds // seg_len)  # ceil div
+    print(f"=== Checkpointed run: {total_rounds} total rounds in "
+          f"{n_segments} segment(s) of <= {seg_len} rounds each ===")
+    print("    (each segment ends in a real data readout — ground truth, "
+          "not an unbroken coherent run)\n")
+
+    trend = []
+    cumulative_rounds = 0
+    for seg_idx in range(n_segments):
+        this_len = min(seg_len, total_rounds - cumulative_rounds)
+        if this_len <= 0:
+            break
+
+        seg_opts = copy.deepcopy(opts)
+        seg_opts.rounds = this_len
+        seg_opts.no_free_final_round = False   # force checkpoint readout
+        seg_opts.checkpoint_every = 0          # don't recurse
+
+        print(f"--- Segment {seg_idx + 1}/{n_segments}: {this_len} round(s) "
+              f"(cumulative {cumulative_rounds + this_len}) ---")
+        job_id = run_test(token, seg_opts)
+        cumulative_rounds += this_len
+
+        jobs = json.loads(SAVE_FILE.read_text()) if SAVE_FILE.exists() else {}
+        rec = jobs.get(job_id, {}) if job_id else {}
+        cc = rec.get("consistency", {}) or {}
+        best = rec.get("ffinal") or rec.get("tesseract") or {}
+
+        trend.append({
+            "segment": seg_idx + 1,
+            "rounds_this_segment": this_len,
+            "cumulative_rounds": cumulative_rounds,
+            "job_id": job_id,
+            "mean_mismatch": cc.get("mean_mismatch"),
+            "frac_zero_mismatch": cc.get("frac_zero_mismatch"),
+            "fidelity": best.get("fidelity"),
+            "correlation": best.get("correlation"),
+            "witness": best.get("witness"),
+        })
+        print()
+
+    print("=== Checkpoint trend summary ===")
+    print(f"{'seg':>3} {'rounds':>7} {'cum':>5} {'mean_mismatch':>14} "
+          f"{'frac_zero':>10} {'fidelity':>9} {'witness':>9}")
+    for row in trend:
+        mm = f"{row['mean_mismatch']:.3f}" if row['mean_mismatch'] is not None else "    n/a"
+        fz = f"{row['frac_zero_mismatch']*100:.1f}%" if row['frac_zero_mismatch'] is not None else "    n/a"
+        fi = f"{row['fidelity']:.3f}" if row['fidelity'] is not None else "    n/a"
+        wt = f"{row['witness']:.3f}" if row['witness'] is not None else "    n/a"
+        print(f"{row['segment']:>3} {row['rounds_this_segment']:>7} {row['cumulative_rounds']:>5} "
+              f"{mm:>14} {fz:>10} {fi:>9} {wt:>9}")
+
+    mismatches = [r["mean_mismatch"] for r in trend if r["mean_mismatch"] is not None]
+    fidelities = [r["fidelity"] for r in trend if r["fidelity"] is not None]
+    if len(mismatches) >= 2:
+        delta = mismatches[-1] - mismatches[0]
+        direction = "rising" if delta > 0.01 else "falling" if delta < -0.01 else "flat"
+        print(f"\n  Ancilla-vs-data mismatch trend: {mismatches[0]:.3f} -> {mismatches[-1]:.3f} ({direction})")
+        if direction == "rising":
+            print("  -> ancilla syndrome quality is degrading across segments; consider a "
+                  "shorter --checkpoint-every, --reset-every-round, or check for ancilla leakage.")
+    if len(fidelities) >= 2:
+        delta = fidelities[-1] - fidelities[0]
+        direction = "dropping" if delta < -0.02 else "rising" if delta > 0.02 else "flat"
+        print(f"  Logical fidelity trend: {fidelities[0]:.3f} -> {fidelities[-1]:.3f} ({direction})")
+
+    trend_file = Path("checkpoint_trend.json")
+    trend_file.write_text(json.dumps(trend, indent=2, default=str))
+    print(f"\nTrend data saved to {trend_file}")
+    return trend
+
+
 def run_test(token, opts):
     from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 
@@ -218,7 +325,7 @@ def run_test(token, opts):
         two_q = sum(v for k, v in ops.items() if k in ('cz', 'ecr', 'cx', 'swap'))
         print(f"  Physical qubits: {qc.num_qubits}, Two-qubit gates: {two_q}")
         print("\nDry run complete.")
-        return
+        return None
     else:
         print("Transpiling ...")
         if offline:
@@ -292,6 +399,7 @@ def run_test(token, opts):
             print(f"    Shots with 0 mismatches: {cc['frac_zero_mismatch']*100:.1f}%")
             print(f"    Shots with 1 mismatch:   {cc['frac_one_mismatch']*100:.1f}%")
             print(f"    Mean mismatched plaquettes: {cc['mean_mismatch']:.3f}")
+            jobs[job_id]["consistency"] = cc
 
     ghz_out = None
     if ghz:
@@ -567,6 +675,7 @@ def run_test(token, opts):
             print(f"\n  {'✓' if f > 0.8 else '~' if f > 0.6 else '✗'} "
                   f"Fidelity={f:.3f}: {'Preserved!' if f > 0.8 else 'Partial' if f > 0.6 else 'Degraded'}")
 
+    return job_id
 
 
 def decode_last_job():
@@ -884,12 +993,21 @@ def main():
                     help='Skip destructive data readout at end. Compute Z logicals from decoder '
                          'predictions (syndrome → correction parity). Combined with --bell-measure, '
                          'gives full witness without collapsing the Bell state — enables infinite rounds.')
+    ap.add_argument('--checkpoint-every', type=int, default=0, metavar='N',
+                    help='Run --rounds as a sequence of segments of N ancilla rounds each, '
+                         'forcing a real data-readout checkpoint (free_final_round) at the end of '
+                         'every segment instead of one long unmonitored run. Validates the no-reset '
+                         'ancilla syndrome against ground truth and tracks fidelity drift across '
+                         'segments. Use instead of --no-data-readout when chasing many rounds.')
     opts = ap.parse_args()
     if opts.redecode:
         decode_last_job()
     else:
         token = None if (opts.offline or opts.dry_run) else get_token()
-        run_test(token, opts)
+        if opts.checkpoint_every and opts.checkpoint_every > 0:
+            run_checkpointed(token, opts)
+        else:
+            run_test(token, opts)
 
 if __name__ == "__main__":
     main()

@@ -56,13 +56,6 @@ def decode(decoder_name, all_syn, r, s):
         for i in range(n_shots):
             corrs[i] = tesseract_decode(all_syn[i], r, s)
         return corrs
-    elif decoder_name == "waxis":
-        from waxis_decode import WaxisDecoder
-        dec = WaxisDecoder(r, s)
-        corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
-        for i in range(n_shots):
-            corrs[i] = dec.decode(all_syn[i])
-        return corrs
     elif decoder_name == "ffinal":
         from decoder import tesseract_decode_ffinal
         corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
@@ -85,6 +78,7 @@ def run_test(token, opts):
     bell = (logical_state == "bell")
     ghz = (logical_state == "ghz")
     bell_measure = opts.bell_measure
+    bell_after_qec = opts.bell_after_qec
     ghz_measure = opts.ghz_measure
     no_reset = not opts.reset_every_round
     free_final_round = not opts.no_free_final_round
@@ -133,6 +127,7 @@ def run_test(token, opts):
         stabilizer_basis='X' if opts.x_stabilizer else 'Z',
         no_reset=no_reset,
         free_final_round=free_final_round,
+        bell_after_qec=bell_after_qec,
     )
     if opts.partial_x:
         basis = "X_partial"
@@ -259,7 +254,37 @@ def run_test(token, opts):
 
     print(f"\nDecoding {n_shots} shots ({basis}-basis readout) ...\n")
 
-    decoders = ("ffinal", "tesseract", "waxis")
+    # For bell-after-qec: compute witness from raw data without decoder
+    if bell and bell_after_qec:
+        # Compute ⟨ZZ⟩ from data_raw (even r,s → bell-flip cancels)
+        lz1_raw = data_raw[:, 0, :].sum(axis=1) % 2
+        lz2_raw = data_raw[:, :, 0].sum(axis=1) % 2
+        agree_z = (lz1_raw == lz2_raw).astype(np.uint8)
+        z_vals = np.where(agree_z, 1, -1)
+        z_corr = float(z_vals.mean())
+        # ⟨XX⟩ from bell measurement
+        x_vals = np.where(bell_m == 0, 1, -1)
+        x_corr = float(x_vals.mean())
+        witness = z_corr + x_corr
+
+        # Post-select on |Φ⁺⟩ (bell_out=0): W = ZZ + XX both = +1
+        sel = (bell_out == 0)
+        n_sel = sel.sum()
+        z_sel = float(z_vals[sel].mean()) if n_sel > 0 else 0.0
+        x_sel = float(x_vals[sel].mean()) if n_sel > 0 else 0.0
+        w_sel = z_sel + x_sel
+
+        print(f"\n  Bell witness (bell-after-qec, raw data):")
+        print(f"    Bell prep: |0⟩={(bell_out==0).sum()} |1⟩={(bell_out==1).sum()}")
+        print(f"    All shots:  ⟨ZZ⟩={z_corr:.3f}  ⟨XX⟩={x_corr:.3f}  W={witness:.3f}")
+        print(f"    Post-sel Φ⁺ ({n_sel}/{n_shots}): ⟨ZZ⟩={z_sel:.3f}  ⟨XX⟩={x_sel:.3f}  W={w_sel:.3f}")
+        info = {"Z_corr": float(z_corr), "X_corr": float(x_corr),
+                "witness": float(witness), "Z_sel": float(z_sel), "X_sel": float(x_sel),
+                "witness_sel": float(w_sel), "n_sel": int(n_sel),
+                "basis": "bell_after_qec", "time_s": 0}
+        jobs[job_id]["bell_after_qec"] = info
+
+    decoders = ("ffinal", "tesseract")
     for dec_name in decoders:
         t0 = time.time()
         corrs = decode(dec_name, all_syn, r, s)
@@ -278,15 +303,15 @@ def run_test(token, opts):
                 info = {"X_corr": float(x_corr), "basis": "X_partial", "time_s": round(dt, 2)}
                 jobs[job_id][dec_name] = info
             elif bell_m is not None and bell_out is not None:
-                # Single-run Bell witness: Z from all data, X conditioned on bell_out
+                # Single-run Bell witness: Z from decoded data, X from bell measurement
                 agree_z = (lz1 == lz2).astype(np.uint8)
                 z_corr = float(2 * int(agree_z.sum()) - n_shots) / n_shots
-                x_corr = float(2 * int((bell_m == bell_out).sum()) - n_shots) / n_shots
+                x_corr = float(2 * int((bell_m == 0).sum()) - n_shots) / n_shots
                 witness = z_corr + x_corr
                 print(f"  {dec_name} ({dt:.1f}s):")
                 print(f"    Bell prep: |0⟩={(bell_out==0).sum()} |1⟩={(bell_out==1).sum()}")
                 print(f"    ⟨Z_L1⊗Z_L2⟩ = {z_corr:.3f}")
-                print(f"    ⟨X_L1⊗X_L₂⟩_cond (bell_m == bell_out) = {x_corr:.3f}")
+                print(f"    ⟨X_L1⊗X_L₂⟩ = {x_corr:.3f}")
                 print(f"    W = {z_corr:.3f} + {x_corr:.3f} = {witness:.3f}")
                 info = {"Z_corr": float(z_corr), "X_corr": float(x_corr),
                         "witness": float(witness),
@@ -382,43 +407,53 @@ def run_test(token, opts):
     SAVE_FILE.write_text(json.dumps(jobs, indent=2, default=str))
     print(f"\nResults saved to {SAVE_FILE}")
 
-    waxis = jobs[job_id].get("waxis", {})
-    if ghz:
-        f = waxis.get("joint_fidelity", 0)
-        ba = waxis.get("boundary_all_same", 0)
-        w = waxis.get("witness_ghz", None)
-        if w is not None:
-            x = waxis.get("X_cond", 0)
-            print(f"\n  {'✓ ENTANGLED!' if w > 1 else '~ Below threshold' if w > 0.5 else '✗ Separable'} "
-                  f"W_GHZ = {2*ba-1:.3f} + {x:.3f} = {w:.3f}")
-        else:
-            print(f"\n  GHZ: All-12-Z fidelity={f:.3f}, Boundary all-same={ba:.3f}")
-    elif bell:
-        if opts.partial_x:
-            xn = waxis.get("X_corr", 0)
-            print(f"\n  {'✓' if abs(xn) > 0.6 else '~' if abs(xn) > 0.2 else '✗'} "
-                  f"⟨X_L1⊗X_L₂⟩={xn:.3f}: {'Strong' if abs(xn) > 0.6 else 'Weak' if abs(xn) > 0.2 else 'Degraded'}")
-        elif opts.bell_measure:
-            w = waxis.get("witness", 0)
-            z = waxis.get("Z_corr", 0)
-            x = waxis.get("X_corr", 0)
-            print(f"\n  {'✓ ENTANGLED!' if w > 1 else '~ Below threshold' if w > 0.5 else '✗ Separable'} "
-                  f"W = {z:.3f} + {x:.3f} = {w:.3f}")
-        else:
-            zn = waxis.get("Z_post_sel", waxis.get("Z_corr", 0))
-            n = waxis.get("n_sel", 0)
-            print(f"\n  Z-only bell run: ⟨Z Z⟩_0 = {zn:.3f} ({n} bell=0 shots)")
-            print(f"  Combine with a bell-measure run via --redecode for full W")
-    elif opts.all_logicals:
-        basis_label = "X" if opts.measure_x else "Z"
-        f = waxis.get("joint_fidelity", 0)
-        label = f"All-{r+s-2}-{basis_label}"
-        print(f"\n  {'✓' if f > 0.8 else '~' if f > 0.6 else '✗'} "
-              f"{label}={f:.3f}: {'Preserved!' if f > 0.8 else 'Partial' if f > 0.6 else 'Degraded'}")
+    # Summary from best decoder
+    if bell_after_qec:
+        baq = jobs[job_id].get("bell_after_qec", {})
+        w_sel = baq.get("witness_sel", 0)
+        n_sel = baq.get("n_sel", 0)
+        z_sel = baq.get("Z_sel", 0)
+        x_sel = baq.get("X_sel", 0)
+        print(f"\n  {'✓ ENTANGLED!' if w_sel > 1 else '~ Below threshold' if w_sel > 0.5 else '✗ Separable'} "
+              f"W_post({n_sel}) = {z_sel:.3f} + {x_sel:.3f} = {w_sel:.3f}")
     else:
-        f = waxis.get("fidelity", 0)
-        print(f"\n  {'✓' if f > 0.8 else '~' if f > 0.6 else '✗'} "
-              f"Fidelity={f:.3f}: {'Preserved!' if f > 0.8 else 'Partial' if f > 0.6 else 'Degraded'}")
+        best = jobs[job_id].get("ffinal") or jobs[job_id].get("tesseract") or {}
+        if ghz:
+            f = best.get("fidelity", 0)
+            w = best.get("witness_ghz", None)
+            if w is not None:
+                x = best.get("X_cond", 0)
+                ba = best.get("boundary_all_same", 0)
+                print(f"\n  {'✓ ENTANGLED!' if w > 1 else '~ Below threshold' if w > 0.5 else '✗ Separable'} "
+                      f"W_GHZ = {2*ba-1:.3f} + {x:.3f} = {w:.3f}")
+            else:
+                print(f"\n  GHZ: All-12-Z fidelity={f:.3f}")
+        elif bell:
+            if opts.partial_x:
+                xn = best.get("X_corr", 0)
+                print(f"\n  {'✓' if abs(xn) > 0.6 else '~' if abs(xn) > 0.2 else '✗'} "
+                      f"⟨X_L1⊗X_L₂⟩={xn:.3f}: {'Strong' if abs(xn) > 0.6 else 'Weak' if abs(xn) > 0.2 else 'Degraded'}")
+            elif opts.bell_measure:
+                w = best.get("witness", 0)
+                z = best.get("Z_corr", 0)
+                x = best.get("X_corr", 0)
+                print(f"\n  {'✓ ENTANGLED!' if w > 1 else '~ Below threshold' if w > 0.5 else '✗ Separable'} "
+                      f"W = {z:.3f} + {x:.3f} = {w:.3f}")
+            else:
+                zn = best.get("Z_post_sel", best.get("Z_corr", 0))
+                n = best.get("n_sel", 0)
+                print(f"\n  Z-only bell run: ⟨Z Z⟩_0 = {zn:.3f} ({n} bell=0 shots)")
+        elif opts.all_logicals:
+            basis_label = "X" if opts.measure_x else "Z"
+            f = best.get("fidelity", 0)
+            label = f"All-{r+s-2}-{basis_label}"
+            print(f"\n  {'✓' if f > 0.8 else '~' if f > 0.6 else '✗'} "
+                  f"{label}={f:.3f}: {'Preserved!' if f > 0.8 else 'Partial' if f > 0.6 else 'Degraded'}")
+        else:
+            f = best.get("fidelity", 0)
+            print(f"\n  {'✓' if f > 0.8 else '~' if f > 0.6 else '✗'} "
+                  f"Fidelity={f:.3f}: {'Preserved!' if f > 0.8 else 'Partial' if f > 0.6 else 'Degraded'}")
+
 
 
 def decode_last_job():
@@ -496,7 +531,7 @@ def decode_last_job():
 
     # Decoder loop (only if rounds > 0)
     if rounds > 0:
-        decoders = ("ffinal", "tesseract", "waxis")
+        decoders = ("ffinal", "tesseract")
         for dec_name in decoders:
             t0 = time.time()
             corrs = decode(dec_name, all_syn, r, s)
@@ -579,8 +614,7 @@ def decode_last_job():
     print(f"  ✓ Re-decoded {n_shots} shots")
 
     # Try to combine Z + X for Bell witness from two separate jobs
-    # (Primary: single-run bell+bell_measure jobs already have a "witness" field)
-    def get_corr(j, key, fallback=None, dec='waxis'):
+    def get_corr(j, key, fallback=None, dec='ffinal'):
         v = j.get(dec, {}).get(key) or j.get('tesseract', {}).get(key)
         if v is None and fallback is not None:
             v = j.get(dec, {}).get(fallback) or j.get('tesseract', {}).get(fallback)
@@ -595,7 +629,8 @@ def decode_last_job():
             mx = "X" if j.get("measure_x") else "Z"
             xs = "X" if j.get("x_stabilizer") else "Z"
             ro = "/R" if not j.get("no_reset", True) else ""
-            w_ = j.get("waxis", {}) or {}
+            baq = "/afterQEC" if j.get("bell_after_qec") else ""
+            w_ = j.get("ffinal", {}) or j.get("bell_after_qec", {})
             zc = w_.get("Z_corr", "?")
             xc = w_.get("X_corr", "?")
             wt = w_.get("witness", "")
@@ -676,6 +711,9 @@ def main():
                     help='H on row 0 ∪ col 0, read X_L1 X_L2 from data (0 CX; use instead of --bell-measure for final readout)')
     ap.add_argument('--bell-measure', action='store_true',
                     help='Ancilla-based Bell X measurement mid-circuit (13 CX; only needed for non-destructive readout)')
+    ap.add_argument('--bell-after-qec', action='store_true',
+                    help='Create Bell state AFTER QEC rounds (avoids mid-circuit collapse). '
+                         'QEC runs on |00⟩, then Bell creation at end. Requires --state bell and --bell-measure.')
     ap.add_argument('--ghz-measure', action='store_true',
                     help='Ancilla-based GHZ boundary X⊗12 measurement (13 CX; prefer --partial-x for final readout)')
     ap.add_argument('--all-logicals', action='store_true',

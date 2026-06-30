@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False):
     """Build optimized share-pair QEC circuit.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
@@ -86,7 +86,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             qc.cx(g_idx, data_map[i][s - 1])
         qc.h(g_idx)
         qc.measure(g_idx, extra_cr["ghz"][0])
-    elif bell:
+    elif bell and not bell_after_qec:
         b_prep_idx = extra_idx["bell"]
         qc.h(b_prep_idx)
         for i in range(r):
@@ -140,6 +140,17 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                         qc.measure(anc_idx, cr_syn[rnd][slot])
                         slot += 1
         qc.barrier()
+
+    # Bell creation after QEC (fresh Bell state from QEC-cleaned |00⟩)
+    if bell_after_qec:
+        b_idx = extra_idx["bell"]
+        qc.h(b_idx)
+        for i in range(r):
+            qc.cx(b_idx, data_map[i][0])
+        for j in range(1, s):
+            qc.cx(b_idx, data_map[0][j])
+        qc.h(b_idx)
+        qc.measure(b_idx, extra_cr["bell"][0])
 
     # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state
     if bell_measure:

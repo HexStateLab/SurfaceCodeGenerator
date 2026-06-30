@@ -72,8 +72,11 @@ def decode(decoder_name, all_syn, r, s):
     raise ValueError(f"unknown decoder: {decoder_name}")
 
 def run_test(token, opts):
-    from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
     from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+    offline = getattr(opts, "offline", False)
+    if not offline:
+        from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 
     r, s = opts.grid or (6, 8)
     rounds = opts.rounds
@@ -96,9 +99,24 @@ def run_test(token, opts):
             print("WARNING: --no-free-final-round forced: partial_x is mixed basis")
             free_final_round = False
 
+    offline_sampler = None
     if opts.dry_run:
         backend = None
         print("Backend: [dry-run]")
+    elif offline:
+        from offline_sim import setup as offline_setup
+        backend, offline_sampler = offline_setup(
+            fake=opts.fake,
+            two_qubit_rate=opts.noise_2q,
+            one_qubit_rate=opts.noise_1q,
+            readout_rate=opts.noise_readout,
+            reset_rate=opts.noise_reset,
+            seed=opts.seed,
+        )
+        src = f"fake={opts.fake}" if opts.fake else (
+            f"2q={opts.noise_2q} 1q={opts.noise_1q} ro={opts.noise_readout} rst={opts.noise_reset}"
+        )
+        print(f"Backend: {backend.name} [OFFLINE simulator, noise: {src}]")
     else:
         service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
         if opts.backend:
@@ -143,17 +161,24 @@ def run_test(token, opts):
         return
     else:
         print("Transpiling ...")
-        pm = generate_preset_pass_manager(
-            backend=backend, optimization_level=3,
-            routing_method="sabre", seed_transpiler=42,
-        )
-        qc_t = pm.run(qc)
+        if offline:
+            from offline_sim import transpile_offline
+            qc_t = transpile_offline(qc, backend)
+        else:
+            pm = generate_preset_pass_manager(
+                backend=backend, optimization_level=1,
+                seed_transpiler=42,
+            )
+            qc_t = pm.run(qc)
         ops = qc_t.count_ops()
         two_q = sum(v for k, v in ops.items() if k in ('cz', 'ecr', 'cx', 'swap'))
         print(f"  Physical qubits: {qc_t.num_qubits}, Depth: {qc_t.depth()}, Two-qubit gates: {two_q}")
 
     print(f"\nSubmitting ...")
-    sampler = Sampler(mode=backend)
+    if offline:
+        sampler = offline_sampler
+    else:
+        sampler = Sampler(mode=backend)
     job = sampler.run([qc_t], shots=shots)
     job_id = job.job_id()
     print(f"  Job ID: {job_id}")
@@ -661,11 +686,26 @@ def main():
                     choices=["00", "01", "10", "11", "bell", "ghz"],
                     help="logical state (or 'bell'/'ghz' for entangled states)")
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--offline', action='store_true',
+                    help='Run on the local offline dynamic-circuit simulator (no IBM token/queue)')
+    ap.add_argument('--fake', type=str, default=None, metavar='NAME',
+                    help='Offline: device-calibrate noise from a fake backend (e.g. fez, marrakesh, torino)')
+    ap.add_argument('--noise-2q', type=float, default=0.0,
+                    help='Offline: depolarizing prob on 2-qubit gates (ignored if --fake given)')
+    ap.add_argument('--noise-1q', type=float, default=0.0,
+                    help='Offline: depolarizing prob on 1-qubit gates')
+    ap.add_argument('--noise-readout', type=float, default=0.0,
+                    help='Offline: symmetric readout bit-flip prob')
+    ap.add_argument('--noise-reset', type=float, default=0.0,
+                    help='Offline: prob a reset leaves |1> (imperfect active reset)')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='Offline: RNG seed for reproducible sampling')
     opts = ap.parse_args()
     if opts.redecode:
         decode_last_job()
     else:
-        run_test(get_token(), opts)
+        token = None if (opts.offline or opts.dry_run) else get_token()
+        run_test(token, opts)
 
 if __name__ == "__main__":
     main()

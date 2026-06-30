@@ -455,9 +455,9 @@ def run_test(token, opts):
                 print(f"\n  {'✓' if abs(xn) > 0.6 else '~' if abs(xn) > 0.2 else '✗'} "
                       f"⟨X_L1⊗X_L₂⟩={xn:.3f}: {'Strong' if abs(xn) > 0.6 else 'Weak' if abs(xn) > 0.2 else 'Degraded'}")
             elif opts.bell_measure:
-                w = best.get("witness", 0)
-                z = best.get("Z_corr", 0)
-                x = best.get("X_corr", 0)
+                w = best.get("witness_sel", 0)
+                z = best.get("Z_sel", 0)
+                x = best.get("X_sel", 0)
                 print(f"\n  {'✓ ENTANGLED!' if w > 1 else '~ Below threshold' if w > 0.5 else '✗ Separable'} "
                       f"W = {z:.3f} + {x:.3f} = {w:.3f}")
             else:
@@ -569,19 +569,26 @@ def decode_last_job():
                     print(f"    ⟨X_L1⊗X_L₂⟩ = {x_corr:.3f} (from {len(x_flat)} H-rotated qubits)")
                     info[dec_name] = {"X_corr": float(x_corr), "basis": "X_partial"}
                 elif bell_m is not None and bell_out is not None:
-                    # Single-run Bell witness: Z from all data, X conditioned on bell_out
-                    lz1, lz2 = logical_measure(corrected, r, s)
-                    agree_z = (lz1 == lz2).astype(np.uint8)
-                    z_corr = float(2 * int(agree_z.sum()) - n_shots) / n_shots
-                    x_corr = float(2 * int((bell_m == bell_out).sum()) - n_shots) / n_shots
-                    witness = z_corr + x_corr
+                    # Single-run Bell witness: post-select on bell_out=0 (|Φ⁺⟩)
+                    sel = (bell_out == 0)
+                    n_sel = sel.sum()
+                    if n_sel > 0:
+                        lz1, lz2 = logical_measure(corrected[sel], r, s)
+                        agree_z = (lz1 == lz2).astype(np.uint8)
+                        z_sel = float(2 * int(agree_z.sum()) - n_sel) / n_sel
+                        x_sel = float(2 * int((bell_m[sel] == 0).sum()) - n_sel) / n_sel
+                    else:
+                        z_sel = x_sel = 0.0
+                    w_sel = z_sel + x_sel
                     print(f"  {dec_name} ({dt:.1f}s):")
                     print(f"    Bell prep: |0⟩={(bell_out==0).sum()} |1⟩={(bell_out==1).sum()}")
-                    print(f"    ⟨Z_L1⊗Z_L2⟩ = {z_corr:.3f}")
-                    print(f"    ⟨X_L1⊗X_L₂⟩_cond = {x_corr:.3f}")
-                    print(f"    W = {z_corr:.3f} + {x_corr:.3f} = {witness:.3f}")
-                    info[dec_name] = {"Z_corr": float(z_corr), "X_corr": float(x_corr),
-                                      "witness": float(witness), "basis": "bell"}
+                    print(f"    Post-sel Φ⁺ ({n_sel}/{n_shots}):")
+                    print(f"      ⟨Z_L1⊗Z_L2⟩_sel = {z_sel:.3f}")
+                    print(f"      ⟨X_L1⊗X_L₂⟩_sel = {x_sel:.3f}")
+                    print(f"      W_sel = {z_sel:.3f} + {x_sel:.3f} = {w_sel:.3f}")
+                    info[dec_name] = {"Z_sel": float(z_sel), "X_sel": float(x_sel),
+                                      "witness_sel": float(w_sel), "n_sel": int(n_sel),
+                                      "basis": "bell"}
                 else:
                     # Z-only bell run
                     lz1, lz2 = logical_measure(corrected, r, s)

@@ -54,54 +54,8 @@ def all_logicals_measure(corrected_data, r, s, basis='Z', periodic=True):
                 logicals[f'X_col_{j}'] = corrected_X[:, :, j].sum(axis=1) % 2
     return logicals
 
-
-def sub_lattice_logicals(corrected_data, r, s, basis='Z'):
-    """Extract the 24 sub-lattice kernel logicals: 12 Z-type + 12 X-type.
-
-    The (1+x²)(1+y²) code's error kernel decomposes into 4 independent
-    (1+x)(1+y) toric blocks (parity sub-lattices of size hr×hs).  Each
-    block has kernel dimension hr+hs-1 = 6, split as:
-
-      - Z-type (column flips):  hs-1 = 3 independent column-Z operators
-      - X-type (row flips):     hr   = 3 independent row-X operators
-
-    Total: 4 × (3 + 3) = 24 logicals (12 Z, 12 X).
-
-    In the Z basis the 12 column-Z operators are measured; in the X basis
-    the 12 row-X operators are measured (after H-rotation, data bits are
-    flipped so that X=+1 → 0, X=-1 → 1).
-
-    Returns a dict of (n_shots,) uint8 arrays.
-    """
-    hr, hs = r // 2, s // 2
-    logicals = {}
-    flip = 1 if basis == 'X' else 0
-    for px in range(2):
-        for py in range(2):
-            tag = f'px{px}_py{py}'
-            sub = corrected_data[:, px::2, py::2] ^ flip
-            if basis == 'Z':
-                for b in range(hs - 1):
-                    logicals[f'{tag}_Z_col_{b}'] = sub[:, :, b].sum(axis=1) % 2
-            else:
-                for a in range(hr):
-                    logicals[f'{tag}_X_row_{a}'] = sub[:, a, :].sum(axis=1) % 2
-    return logicals
-
 def compute_fidelity(lz1, lz2, z1, z2):
     return ((lz1 == z1) & (lz2 == z2)).mean()
-
-def _call_decoder(fn, syn, r, s, periodic):
-    """Call a decoder function, falling back to no `periodic` kwarg if the
-    local decoder.py hasn't been updated to accept it (signature mismatch
-    between run_opt.py and decoder.py)."""
-    try:
-        return fn(syn, r, s, periodic=periodic)
-    except TypeError as e:
-        if "periodic" in str(e):
-            return fn(syn, r, s)
-        raise
-
 
 def decode(decoder_name, all_syn, r, s, periodic=True):
     """Decode syndromes and return (n_shots, r, s) corrections."""
@@ -112,122 +66,15 @@ def decode(decoder_name, all_syn, r, s, periodic=True):
         from decoder import tesseract_decode
         corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
         for i in range(n_shots):
-            corrs[i] = _call_decoder(tesseract_decode, all_syn[i], r, s, periodic)
+            corrs[i] = tesseract_decode(all_syn[i], r, s, periodic=periodic)
         return corrs
     elif decoder_name == "ffinal":
         from decoder import tesseract_decode_ffinal
         corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
         for i in range(n_shots):
-            corrs[i] = _call_decoder(tesseract_decode_ffinal, all_syn[i], r, s, periodic)
+            corrs[i] = tesseract_decode_ffinal(all_syn[i], r, s, periodic=periodic)
         return corrs
     raise ValueError(f"unknown decoder: {decoder_name}")
-
-def run_checkpointed(token, opts):
-    """Run a long QEC experiment as a sequence of checkpointed segments
-    instead of chasing a single 'infinite free rounds' run with zero
-    ground truth.
-
-    opts.rounds is split into segments of opts.checkpoint_every ancilla
-    rounds each. Every segment is run with free_final_round forced on,
-    so its last round's syndrome comes from a real destructive data
-    readout. That gives two things at the end of every segment that a
-    truly unbroken no-data-readout run can never give you:
-
-      1. A ground-truth check (pw_opt.check_consistency) of the
-         preceding no-reset ancilla rounds against a real measurement —
-         catching ancilla-measurement drift, leakage, or decoder bias
-         before it silently compounds.
-      2. A real logical fidelity number, rather than one inferred purely
-         from chained decoder predictions.
-
-    Caveat (stated, not hidden): the data readout at each checkpoint is
-    destructive, so this does NOT preserve a single continuously
-    entangled/coherent logical state across the whole run — each segment
-    re-prepares fresh. What it gives you instead is a *trend*: how the
-    no-reset/free-final-round technique's syndrome quality and logical
-    fidelity evolve as a function of round depth, with periodic
-    validation instead of an unmonitored "infinite" run.
-    """
-    import copy
-
-    total_rounds = opts.rounds
-    seg_len = opts.checkpoint_every
-    if seg_len <= 0:
-        raise ValueError("--checkpoint-every must be a positive integer")
-    if seg_len > total_rounds:
-        seg_len = total_rounds
-
-    n_segments = -(-total_rounds // seg_len)  # ceil div
-    print(f"=== Checkpointed run: {total_rounds} total rounds in "
-          f"{n_segments} segment(s) of <= {seg_len} rounds each ===")
-    print("    (each segment ends in a real data readout — ground truth, "
-          "not an unbroken coherent run)\n")
-
-    trend = []
-    cumulative_rounds = 0
-    for seg_idx in range(n_segments):
-        this_len = min(seg_len, total_rounds - cumulative_rounds)
-        if this_len <= 0:
-            break
-
-        seg_opts = copy.deepcopy(opts)
-        seg_opts.rounds = this_len
-        seg_opts.no_free_final_round = False   # force checkpoint readout
-        seg_opts.checkpoint_every = 0          # don't recurse
-
-        print(f"--- Segment {seg_idx + 1}/{n_segments}: {this_len} round(s) "
-              f"(cumulative {cumulative_rounds + this_len}) ---")
-        job_id = run_test(token, seg_opts)
-        cumulative_rounds += this_len
-
-        jobs = json.loads(SAVE_FILE.read_text()) if SAVE_FILE.exists() else {}
-        rec = jobs.get(job_id, {}) if job_id else {}
-        cc = rec.get("consistency", {}) or {}
-        best = rec.get("ffinal") or rec.get("tesseract") or {}
-
-        trend.append({
-            "segment": seg_idx + 1,
-            "rounds_this_segment": this_len,
-            "cumulative_rounds": cumulative_rounds,
-            "job_id": job_id,
-            "mean_mismatch": cc.get("mean_mismatch"),
-            "frac_zero_mismatch": cc.get("frac_zero_mismatch"),
-            "fidelity": best.get("fidelity"),
-            "correlation": best.get("correlation"),
-            "witness": best.get("witness"),
-        })
-        print()
-
-    print("=== Checkpoint trend summary ===")
-    print(f"{'seg':>3} {'rounds':>7} {'cum':>5} {'mean_mismatch':>14} "
-          f"{'frac_zero':>10} {'fidelity':>9} {'witness':>9}")
-    for row in trend:
-        mm = f"{row['mean_mismatch']:.3f}" if row['mean_mismatch'] is not None else "    n/a"
-        fz = f"{row['frac_zero_mismatch']*100:.1f}%" if row['frac_zero_mismatch'] is not None else "    n/a"
-        fi = f"{row['fidelity']:.3f}" if row['fidelity'] is not None else "    n/a"
-        wt = f"{row['witness']:.3f}" if row['witness'] is not None else "    n/a"
-        print(f"{row['segment']:>3} {row['rounds_this_segment']:>7} {row['cumulative_rounds']:>5} "
-              f"{mm:>14} {fz:>10} {fi:>9} {wt:>9}")
-
-    mismatches = [r["mean_mismatch"] for r in trend if r["mean_mismatch"] is not None]
-    fidelities = [r["fidelity"] for r in trend if r["fidelity"] is not None]
-    if len(mismatches) >= 2:
-        delta = mismatches[-1] - mismatches[0]
-        direction = "rising" if delta > 0.01 else "falling" if delta < -0.01 else "flat"
-        print(f"\n  Ancilla-vs-data mismatch trend: {mismatches[0]:.3f} -> {mismatches[-1]:.3f} ({direction})")
-        if direction == "rising":
-            print("  -> ancilla syndrome quality is degrading across segments; consider a "
-                  "shorter --checkpoint-every, --reset-every-round, or check for ancilla leakage.")
-    if len(fidelities) >= 2:
-        delta = fidelities[-1] - fidelities[0]
-        direction = "dropping" if delta < -0.02 else "rising" if delta > 0.02 else "flat"
-        print(f"  Logical fidelity trend: {fidelities[0]:.3f} -> {fidelities[-1]:.3f} ({direction})")
-
-    trend_file = Path("checkpoint_trend.json")
-    trend_file.write_text(json.dumps(trend, indent=2, default=str))
-    print(f"\nTrend data saved to {trend_file}")
-    return trend
-
 
 def run_test(token, opts):
     from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
@@ -247,9 +94,6 @@ def run_test(token, opts):
     ghz_measure = opts.ghz_measure
     no_reset = not opts.reset_every_round
     free_final_round = not opts.no_free_final_round
-    no_data_readout = opts.no_data_readout
-    if no_data_readout:
-        free_final_round = False
     full_stabilizer = opts.full_stabilizer
     periodic = not opts.open
 
@@ -263,28 +107,13 @@ def run_test(token, opts):
             print("WARNING: --no-free-final-round forced: partial_x is mixed basis")
             free_final_round = False
 
-    # Ancilla-mediated measurement only preserves logical coherence when the
-    # measured operator commutes with the logical operators being tracked.
-    # V(i,j) (the default 2-CX half-stabilizer) does NOT commute with the
-    # row-0 logical or the GHZ boundary logical under periodic BC (verified:
-    # 8/32 measured positions anticommute in both cases) -- so under periodic
-    # BC, ancilla-mediated readout of those is NOT equivalent to a coherence-
-    # preserving measurement; it collapses exactly like a direct readout
-    # would. S(i,j) (full_stabilizer=True, 4-CX) commutes with every logical
-    # operator checked (row-0, col-0, the bell_measure col0|col2 witness, and
-    # the GHZ boundary operator) with zero exceptions. Auto-correct instead
-    # of warning-and-proceeding-broken.
-    needs_full_stabilizer = periodic and opts.rounds > (1 if free_final_round else 0) and (bell_measure or ghz_measure)
-    if needs_full_stabilizer and not full_stabilizer:
-        what = "bell_measure" if bell_measure else "ghz_measure"
-        print(f"NOTE: periodic BC + --{what} + QEC rounds > 0 requires the full "
-              f"4-qubit stabilizer S(i,j) to keep ancilla measurement commuting with "
-              f"the logical operators (V(i,j) anticommutes at some positions and "
-              f"would otherwise collapse the state). Auto-enabling --full-stabilizer "
-              f"(4 CX/check instead of 2 -- this is the real cost of coherence-"
-              f"preserving rounds here, not optional). Use --open to avoid this cost "
-              f"if your logical operators are column-based and already commute with V.")
-        full_stabilizer = True
+    if bell_measure and periodic and opts.rounds > (1 if free_final_round else 0):
+        print("WARNING: --bell-measure with periodic BC and QEC rounds > 0 is "
+              "fundamentally incompatible: X_L1=row 0 anticommutes with V(0,j) "
+              "stabilizers, so the Bell state is outside the code space. "
+              "QEC rounds will project it back, destroying the Bell state. "
+              "Use --open for open BC (X_L1=col 0, X_L2=col 2 commute with "
+              "all stabilizers) or --rounds 1 for 0 QEC rounds.")
 
     offline_sampler = None
     if opts.dry_run:
@@ -312,7 +141,7 @@ def run_test(token, opts):
             backend = service.backend("ibm_marrakesh")
         print(f"Backend: {backend.name} ({backend.num_qubits} qubits)")
 
-    qc, data_map, lq0_qubits, lq1_qubits, n_anc, _ = build_circuit(
+    qc, data_map, lq0_qubits, lq1_qubits, n_anc = build_circuit(
         r, s, rounds, logical_state=logical_state, bell=bell,
         ghz=ghz, ghz_measure=ghz_measure,
         bell_measure=bell_measure, measure_x=opts.measure_x,
@@ -324,7 +153,6 @@ def run_test(token, opts):
         full_stabilizer=full_stabilizer,
         dd=opts.dd,
         periodic=periodic,
-        no_data_readout=no_data_readout,
     )
     if opts.partial_x:
         basis = "X_partial"
@@ -352,7 +180,7 @@ def run_test(token, opts):
         two_q = sum(v for k, v in ops.items() if k in ('cz', 'ecr', 'cx', 'swap'))
         print(f"  Physical qubits: {qc.num_qubits}, Two-qubit gates: {two_q}")
         print("\nDry run complete.")
-        return None
+        return
     else:
         print("Transpiling ...")
         if offline:
@@ -403,13 +231,9 @@ def run_test(token, opts):
 
     pub_result = result[0]
 
-    if no_data_readout:
-        data_raw = None
-        n_shots = getattr(pub_result.data, "syn_0").num_shots
-    else:
-        dbits = getattr(pub_result.data, "data").to_bool_array(order='little')
-        data_raw = dbits.astype(np.uint8).reshape(-1, r, s)
-        n_shots = data_raw.shape[0]
+    dbits = getattr(pub_result.data, "data").to_bool_array(order='little')
+    data_raw = dbits.astype(np.uint8).reshape(-1, r, s)
+    n_shots = data_raw.shape[0]
 
     if rounds == 0:
         all_syn = np.zeros((n_shots, 0, r, s), dtype=np.uint8)
@@ -419,52 +243,33 @@ def run_test(token, opts):
                                     full_stabilizer=full_stabilizer, periodic=periodic)
 
     # Consistency check: compare last ancilla round vs data-readout syndrome
-    if free_final_round and rounds >= 2 and data_raw is not None:
+    if free_final_round and rounds >= 2:
         cc = check_consistency(all_syn, data_raw, r, s)
         if cc:
             print(f"  Consistency check (ancilla vs data, last round):")
             print(f"    Shots with 0 mismatches: {cc['frac_zero_mismatch']*100:.1f}%")
             print(f"    Shots with 1 mismatch:   {cc['frac_one_mismatch']*100:.1f}%")
             print(f"    Mean mismatched plaquettes: {cc['mean_mismatch']:.3f}")
-            jobs[job_id]["consistency"] = cc
 
     ghz_out = None
     if ghz:
         ghz_out = getattr(pub_result.data, "ghz").to_bool_array(order='little').flatten().astype(np.uint8)
         print(f"  GHZ prep: |0⟩: {(ghz_out == 0).sum()}, |1⟩: {(ghz_out == 1).sum()}")
 
-    n_bell_groups = r // 2  # 3 groups of 2 rows
     bell_m = None
     if bell_measure:
-        if bell_after_qec:
-            # End-only: 3 separate extra_cr registers
-            bg = np.zeros((n_shots, n_bell_groups), dtype=np.uint8)
-            for g in range(n_bell_groups):
-                b = getattr(pub_result.data, f"bell_g{g}").to_bool_array(order='little').flatten().astype(np.uint8)
-                bg[:, g] = b
-            bell_m = bg.sum(axis=1) % 2  # XOR all 3 groups
-            print(f"  Bell measure (end-only, {n_bell_groups} groups): |0⟩ (X_L1 X_L2=+1): {(bell_m == 0).sum()}, "
-                  f"|1⟩ (X_L1 X_L2=-1): {(bell_m == 1).sum()}")
+        bm1 = getattr(pub_result.data, "bell_m1").to_bool_array(order='little').flatten().astype(np.uint8)
+        bm2 = getattr(pub_result.data, "bell_m2").to_bool_array(order='little').flatten().astype(np.uint8)
+        if periodic:
+            bell_m = bm1
+            print(f"  Bell measure (single ancilla): |0⟩ (X_L1 X_L₂=+1): {(bell_m == 0).sum()}, "
+                  f"|1⟩ (X_L1 X_L₂=-1): {(bell_m == 1).sum()}")
         else:
-            # Per-round: cr_bell registers with n_bell_groups bits each
-            q_bell = max(0, rounds - 1) if free_final_round else rounds
-            if q_bell == 0:
-                q_bell = 1
-            bell_m_raw = np.zeros((n_shots, q_bell, n_bell_groups), dtype=np.uint8)
-            for c in range(q_bell):
-                bits = getattr(pub_result.data, f"bell_{c}").to_bool_array(order='little')
-                bell_m_raw[:, c, :] = bits[:, :n_bell_groups].astype(np.uint8)
-            # No-reset differencing: m_r = m_{r-1} ⊕ P_r → P_r = m_r ⊕ m_{r-1}
-            bell_m_raw[:, 1:] ^= bell_m_raw[:, :-1]
-            # X_L1·X_L2 = XOR of all group results
-            xl1xl2 = bell_m_raw.sum(axis=2) % 2  # (n_shots, q_bell)
-            bell_m = xl1xl2
-            print(f"  Bell measure (per-round, {n_bell_groups} groups × 2 rows): {q_bell} round{'s' if q_bell > 1 else ''}")
-            for c in range(q_bell):
-                p = (xl1xl2[:, c] == 0).mean()
-                print(f"    Round {c}: ⟨XX⟩=+1: {p*100:.1f}%, ⟨XX⟩={2*p-1:.3f}")
-            avg = float((xl1xl2 == 0).mean())
-            print(f"    Average: ⟨XX⟩=+1: {avg*100:.1f}%, ⟨XX⟩={2*avg-1:.3f}")
+            bell_m = bm1 ^ bm2
+            print(f"  Bell measure (split): |0⟩ (X_L1 X_L₂=+1): {(bell_m == 0).sum()}, "
+                  f"|1⟩ (X_L1 X_L₂=-1): {(bell_m == 1).sum()}")
+            print(f"    X_L1 eigen: |+⟩={(bm1==0).sum()}  |−⟩={(bm1==1).sum()}")
+            print(f"    X_L₂ eigen: |+⟩={(bm2==0).sum()}  |−⟩={(bm2==1).sum()}")
 
     ghz_m = None
     if ghz_measure:
@@ -516,18 +321,8 @@ def run_test(token, opts):
         t0 = time.time()
         corrs = decode(dec_name, all_syn, r, s, periodic=periodic)
         dt = time.time() - t0
-        if no_data_readout:
-            # No destructive data readout — compute Z logicals from decoder predictions
-            # Initial state is |00⟩_L: Z_logical = decoder correction parity in that column
-            if periodic:
-                lz1 = corrs[:, 0, :].sum(axis=1) % 2
-                lz2 = corrs[:, :, 0].sum(axis=1) % 2
-            else:
-                lz1 = corrs[:, :, 0].sum(axis=1) % 2
-                lz2 = corrs[:, :, 2].sum(axis=1) % 2
-        else:
-            corrected = data_raw ^ corrs
-            lz1, lz2 = logical_measure(corrected, r, s, periodic=periodic)
+        corrected = data_raw ^ corrs
+        lz1, lz2 = logical_measure(corrected, r, s, periodic=periodic)
 
         if bell:
             if opts.partial_x:
@@ -606,13 +401,8 @@ def run_test(token, opts):
             jobs[job_id][dec_name] = info
         elif opts.all_logicals:
             basis_label = "X" if opts.measure_x else "Z"
-            if opts.sub_lattice:
-                logicals = sub_lattice_logicals(corrected, r, s, basis=basis_label)
-                hr, hs = r // 2, s // 2
-                n_logicals = 4 * (hr + hs - 1)  # 24 for r=6,s=8
-            else:
-                logicals = all_logicals_measure(corrected, r, s, basis=basis_label)
-                n_logicals = r + s - 2
+            logicals = all_logicals_measure(corrected, r, s, basis=basis_label)
+            n_logicals = r + s - 2
             all_ok = np.ones(n_shots, dtype=np.uint8)
             for name, vals in logicals.items():
                 all_ok &= (vals == 0)
@@ -690,11 +480,7 @@ def run_test(token, opts):
         elif opts.all_logicals:
             basis_label = "X" if opts.measure_x else "Z"
             f = best.get("fidelity", 0)
-            n_lbl = r + s - 2
-            if opts.sub_lattice:
-                hr, hs = r // 2, s // 2
-                n_lbl = 4 * (hr + hs - 1)
-            label = f"All-{n_lbl}-{basis_label}"
+            label = f"All-{r+s-2}-{basis_label}"
             print(f"\n  {'✓' if f > 0.8 else '~' if f > 0.6 else '✗'} "
                   f"{label}={f:.3f}: {'Preserved!' if f > 0.8 else 'Partial' if f > 0.6 else 'Degraded'}")
         else:
@@ -702,7 +488,6 @@ def run_test(token, opts):
             print(f"\n  {'✓' if f > 0.8 else '~' if f > 0.6 else '✗'} "
                   f"Fidelity={f:.3f}: {'Preserved!' if f > 0.8 else 'Partial' if f > 0.6 else 'Degraded'}")
 
-    return job_id
 
 
 def decode_last_job():
@@ -988,8 +773,6 @@ def main():
                     help='Ancilla-based GHZ boundary X⊗12 measurement (13 CX; prefer --partial-x for final readout)')
     ap.add_argument('--all-logicals', action='store_true',
                     help='Report all Z-type logicals')
-    ap.add_argument('--sub-lattice', action='store_true',
-                    help='Use sub-lattice decomposition for 24 kernel logicals (12 Z + 12 X)')
     ap.add_argument('--grid', type=int, nargs=2, metavar=('R', 'S'),
                     help='Grid dimensions (default: 6 8)')
     ap.add_argument('--state', type=str, default="00",
@@ -1016,25 +799,12 @@ def main():
                     help='Open boundary conditions (no vertical wrapping). '
                          'X_L1=col0, X_L2=col2 — both commute with all V(i,j), '
                          'so Bell state survives multi-round QEC.')
-    ap.add_argument('--no-data-readout', action='store_true',
-                    help='Skip destructive data readout at end. Compute Z logicals from decoder '
-                         'predictions (syndrome → correction parity). Combined with --bell-measure, '
-                         'gives full witness without collapsing the Bell state — enables infinite rounds.')
-    ap.add_argument('--checkpoint-every', type=int, default=0, metavar='N',
-                    help='Run --rounds as a sequence of segments of N ancilla rounds each, '
-                         'forcing a real data-readout checkpoint (free_final_round) at the end of '
-                         'every segment instead of one long unmonitored run. Validates the no-reset '
-                         'ancilla syndrome against ground truth and tracks fidelity drift across '
-                         'segments. Use instead of --no-data-readout when chasing many rounds.')
     opts = ap.parse_args()
     if opts.redecode:
         decode_last_job()
     else:
         token = None if (opts.offline or opts.dry_run) else get_token()
-        if opts.checkpoint_every and opts.checkpoint_every > 0:
-            run_checkpointed(token, opts)
-        else:
-            run_test(token, opts)
+        run_test(token, opts)
 
 if __name__ == "__main__":
     main()

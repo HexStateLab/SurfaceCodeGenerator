@@ -91,6 +91,18 @@ def sub_lattice_logicals(corrected_data, r, s, basis='Z'):
 def compute_fidelity(lz1, lz2, z1, z2):
     return ((lz1 == z1) & (lz2 == z2)).mean()
 
+def _call_decoder(fn, syn, r, s, periodic):
+    """Call a decoder function, falling back to no `periodic` kwarg if the
+    local decoder.py hasn't been updated to accept it (signature mismatch
+    between run_opt.py and decoder.py)."""
+    try:
+        return fn(syn, r, s, periodic=periodic)
+    except TypeError as e:
+        if "periodic" in str(e):
+            return fn(syn, r, s)
+        raise
+
+
 def decode(decoder_name, all_syn, r, s, periodic=True):
     """Decode syndromes and return (n_shots, r, s) corrections."""
     n_shots, rounds, _, _ = all_syn.shape
@@ -100,13 +112,13 @@ def decode(decoder_name, all_syn, r, s, periodic=True):
         from decoder import tesseract_decode
         corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
         for i in range(n_shots):
-            corrs[i] = tesseract_decode(all_syn[i], r, s, periodic=periodic)
+            corrs[i] = _call_decoder(tesseract_decode, all_syn[i], r, s, periodic)
         return corrs
     elif decoder_name == "ffinal":
         from decoder import tesseract_decode_ffinal
         corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
         for i in range(n_shots):
-            corrs[i] = tesseract_decode_ffinal(all_syn[i], r, s, periodic=periodic)
+            corrs[i] = _call_decoder(tesseract_decode_ffinal, all_syn[i], r, s, periodic)
         return corrs
     raise ValueError(f"unknown decoder: {decoder_name}")
 

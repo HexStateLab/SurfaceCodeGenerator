@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False):
     """Build optimized share-pair QEC circuit.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
@@ -151,7 +151,11 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                                 qc.cx(data_map[(i + 2) % r][j], anc_idx)
                         qc.measure(anc_idx, cr_syn[rnd][slot])
                         slot += 1
-        qc.barrier()
+        # Dynamic decoupling: X gates on all idle data qubits between rounds
+        if dd and rnd < qec_rounds - 1:
+            for ii in range(r):
+                for jj in range(s):
+                    qc.x(data_map[ii][jj])
 
     # Bell creation after QEC (fresh Bell state from QEC-cleaned |00⟩)
     if bell_after_qec:
@@ -278,6 +282,40 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
         syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)
 
     return syn
+
+
+def check_consistency(all_syn, data_raw, r, s):
+    """Diagnostic: compare final-round ancilla syndrome vs data-readout syndrome.
+
+    When free_final_round is used, both the ancilla-based and data-based
+    syndromes for the last round are available.  Their XOR gives the
+    measurement error pattern for the last ancilla round.
+
+    Returns a dict of per-shot and aggregate metrics.
+    """
+    n_shots, rounds, _, _ = all_syn.shape
+    if rounds < 2:
+        return {}
+
+    # Last ancilla round (rounds-2) — this is the last one measured before
+    # the free final round (= rounds-1) which comes from data.
+    syn_anc = all_syn[:, -2]   # (n_shots, r, s) from ancilla
+    # Data-based syndrome for the same physical state
+    V_data = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-2, axis=1)
+    syn_data = V_data ^ np.roll(V_data, shift=-2, axis=2)
+
+    mismatch = syn_anc ^ syn_data   # 1 where ancilla syndrome ≠ data syndrome
+    n_mismatch = mismatch.sum(axis=(1, 2))  # mismatched plaquettes per shot
+    frac_zero = (n_mismatch == 0).mean()
+    frac_one = (n_mismatch == 1).mean()
+    mean_mismatch = n_mismatch.mean()
+
+    return {
+        "frac_zero_mismatch": float(frac_zero),
+        "frac_one_mismatch": float(frac_one),
+        "mean_mismatch": float(mean_mismatch),
+        "n_shots": n_shots,
+    }
 
 
 def verify_no_reset():

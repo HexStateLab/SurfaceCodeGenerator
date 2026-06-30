@@ -8,7 +8,7 @@ entanglement witness, all-logicals) lives here.
 import sys, time, json, argparse
 import numpy as np
 from pathlib import Path
-from pw_opt import build_circuit, all_syndromes_opt
+from pw_opt import build_circuit, all_syndromes_opt, check_consistency
 
 SAVE_FILE = Path("jobs.json")
 RAW_DIR = Path("raw")
@@ -130,6 +130,7 @@ def run_test(token, opts):
         free_final_round=free_final_round,
         bell_after_qec=bell_after_qec,
         full_stabilizer=full_stabilizer,
+        dd=opts.dd,
     )
     if opts.partial_x:
         basis = "X_partial"
@@ -164,7 +165,7 @@ def run_test(token, opts):
             qc_t = transpile_offline(qc, backend)
         else:
             pm = generate_preset_pass_manager(
-                backend=backend, optimization_level=1,
+                backend=backend, optimization_level=opts.opt_level,
                 seed_transpiler=42,
             )
             qc_t = pm.run(qc)
@@ -217,6 +218,15 @@ def run_test(token, opts):
         all_syn = all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=no_reset,
                                     free_final_round=free_final_round, data_raw=data_raw,
                                     full_stabilizer=full_stabilizer)
+
+    # Consistency check: compare last ancilla round vs data-readout syndrome
+    if free_final_round and rounds >= 2:
+        cc = check_consistency(all_syn, data_raw, r, s)
+        if cc:
+            print(f"  Consistency check (ancilla vs data, last round):")
+            print(f"    Shots with 0 mismatches: {cc['frac_zero_mismatch']*100:.1f}%")
+            print(f"    Shots with 1 mismatch:   {cc['frac_one_mismatch']*100:.1f}%")
+            print(f"    Mean mismatched plaquettes: {cc['mean_mismatch']:.3f}")
 
     bell_out = None
     if bell:
@@ -308,18 +318,24 @@ def run_test(token, opts):
                 info = {"X_corr": float(x_corr), "basis": "X_partial", "time_s": round(dt, 2)}
                 jobs[job_id][dec_name] = info
             elif bell_m is not None and bell_out is not None:
-                # Single-run Bell witness: Z from decoded data, X from bell measurement
-                agree_z = (lz1 == lz2).astype(np.uint8)
-                z_corr = float(2 * int(agree_z.sum()) - n_shots) / n_shots
-                x_corr = float(2 * int((bell_m == 0).sum()) - n_shots) / n_shots
-                witness = z_corr + x_corr
+                # Single-run Bell witness: post-select on bell_out=0 (|Φ⁺⟩)
+                sel = (bell_out == 0)
+                n_sel = sel.sum()
+                if n_sel > 0:
+                    agree_z = (lz1[sel] == lz2[sel]).astype(np.uint8)
+                    z_sel = float(2 * int(agree_z.sum()) - n_sel) / n_sel
+                    x_sel = float(2 * int((bell_m[sel] == 0).sum()) - n_sel) / n_sel
+                else:
+                    z_sel = x_sel = 0.0
+                w_sel = z_sel + x_sel
                 print(f"  {dec_name} ({dt:.1f}s):")
                 print(f"    Bell prep: |0⟩={(bell_out==0).sum()} |1⟩={(bell_out==1).sum()}")
-                print(f"    ⟨Z_L1⊗Z_L2⟩ = {z_corr:.3f}")
-                print(f"    ⟨X_L1⊗X_L₂⟩ = {x_corr:.3f}")
-                print(f"    W = {z_corr:.3f} + {x_corr:.3f} = {witness:.3f}")
-                info = {"Z_corr": float(z_corr), "X_corr": float(x_corr),
-                        "witness": float(witness),
+                print(f"    Post-sel Φ⁺ ({n_sel}/{n_shots}):")
+                print(f"      ⟨Z_L1⊗Z_L2⟩_sel = {z_sel:.3f}")
+                print(f"      ⟨X_L1⊗X_L₂⟩_sel = {x_sel:.3f}")
+                print(f"      W_sel = {z_sel:.3f} + {x_sel:.3f} = {w_sel:.3f}")
+                info = {"Z_sel": float(z_sel), "X_sel": float(x_sel),
+                        "witness_sel": float(w_sel), "n_sel": int(n_sel),
                         "basis": "bell", "time_s": round(dt, 2)}
                 jobs[job_id][dec_name] = info
             else:
@@ -704,6 +720,8 @@ def main():
     ap.add_argument('--shots', type=int, default=1000)
     ap.add_argument('--rounds', type=int, default=2)
     ap.add_argument('--backend', '-b', type=str, default=None, metavar='NAME')
+    ap.add_argument('--opt-level', type=int, default=3, choices=[0,1,2,3],
+                    help='Transpiler optimization level (default: 3 — safe since no if_test in circuits)')
     ap.add_argument('--reset-every-round', action='store_true',
                     help='Reset ancillas every round (default: no-reset, save resets)')
     ap.add_argument('--no-free-final-round', action='store_true',
@@ -747,6 +765,8 @@ def main():
                     help='Offline: prob a reset leaves |1> (imperfect active reset)')
     ap.add_argument('--seed', type=int, default=None,
                     help='Offline: RNG seed for reproducible sampling')
+    ap.add_argument('--dd', action='store_true',
+                    help='Dynamic decoupling: X gates on all data qubits between rounds')
     opts = ap.parse_args()
     if opts.redecode:
         decode_last_job()

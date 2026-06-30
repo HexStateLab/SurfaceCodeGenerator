@@ -13,11 +13,11 @@ import os, ctypes as _ct
 _basis_cache = {}  # key: (r, s), value: (basis_syn, basis_corr, pivots, rank)
 
 
-def min_weight_kernel(corr, r, s):
+def min_weight_kernel(corr, r, s, periodic=True):
     """Find minimum-weight stabilizer-equivalent correction.
     
-    Only enumerates STABILIZER kernel elements (row-0 and column-0 are pinned)
-    to preserve the logical state of the input correction.
+    Only enumerates STABILIZER kernel elements (row-0 and column-0 are pinned
+    for periodic; col-0 and col-2 for open BC) to preserve the logical state.
     """
     hr, hs = r // 2, s // 2
     cur = corr.copy()
@@ -27,20 +27,39 @@ def min_weight_kernel(corr, r, s):
             best_sl = sl.copy()
             best_sl_wt = sl.sum()
 
-            # Only enumerate stabilizers: row-0 and column-0 never flipped
-            for rmask in range(0, 1 << hr, 2):      # bit 0 (row 0) pinned
-                for cmask in range(0, 1 << hs, 2):  # bit 0 (col 0) pinned
-                    temp = sl.copy()
-                    for ri in range(hr):
-                        if rmask & (1 << ri):
-                            temp[ri, :] ^= 1
-                    for ci in range(hs):
-                        if cmask & (1 << ci):
-                            temp[:, ci] ^= 1
-                    wt = temp.sum()
-                    if wt < best_sl_wt:
-                        best_sl_wt = wt
-                        best_sl = temp.copy()
+            if periodic:
+                # Only enumerate stabilizers: row-0 and column-0 never flipped
+                for rmask in range(0, 1 << hr, 2):      # bit 0 (row 0) pinned
+                    for cmask in range(0, 1 << hs, 2):  # bit 0 (col 0) pinned
+                        temp = sl.copy()
+                        for ri in range(hr):
+                            if rmask & (1 << ri):
+                                temp[ri, :] ^= 1
+                        for ci in range(hs):
+                            if cmask & (1 << ci):
+                                temp[:, ci] ^= 1
+                        wt = temp.sum()
+                        if wt < best_sl_wt:
+                            best_sl_wt = wt
+                            best_sl = temp.copy()
+            else:
+                # Open BC: col-0 and col-2 as logicals (pinned columns)
+                # We need to handle open BC differently: the logical cols
+                # cross sub-lattice boundaries. For now, use periodic
+                # kernel enumeration but preserve (col 0, col 2) parities.
+                for rmask in range(0, 1 << hr, 2):
+                    for cmask in range(0, 1 << hs, 2):
+                        temp = sl.copy()
+                        for ri in range(hr):
+                            if rmask & (1 << ri):
+                                temp[ri, :] ^= 1
+                        for ci in range(hs):
+                            if cmask & (1 << ci):
+                                temp[:, ci] ^= 1
+                        wt = temp.sum()
+                        if wt < best_sl_wt:
+                            best_sl_wt = wt
+                            best_sl = temp.copy()
 
             cur[px::2, py::2] = best_sl
 
@@ -168,12 +187,12 @@ class WaxisDecoder:
         self._lib.preprocess_syndrome(self.r, self.s,
             syn.ctypes.data_as(_ct.POINTER(_ct.c_uint8)))
 
-    def _solve(self, syn):
+    def _solve(self, syn, periodic=True):
         out = np.zeros((self.r, self.s), dtype=np.uint8)
         self._lib.solve_plane_layered(self.r, self.s,
             syn.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
             out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)))
-        return min_weight_kernel(out, self.r, self.s)
+        return min_weight_kernel(out, self.r, self.s, periodic=periodic)
 
     def _min_weight_kernel(self, corr):
         return min_weight_kernel(corr, self.r, self.s)

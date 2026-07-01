@@ -3,8 +3,11 @@ decoder.py — Core decoder for the (1+x²)(1+y²) code.
 
 Provides:
   - tesseract_decode_ffinal(syndromes, r, s)  — ffinal decoder (no AND-vote)
+  - tesseract_decode_rot(syndromes, r, s)    — ffinal + best single rotation
+  - tesseract_decode_rot4(syndromes, r, s)   — all 4 rotations stacked
+  - decode_np(syn, r, s)     — subprocess: plane_warp --decode-np
   - prep(syn, r, s)          — C library preprocess_syndrome wrapper
-  - solve(syn, r, s)         — C library solve_plane_layered + min-weight kernel
+  - solve(syn, r, s)         — C library solve_plane + min-weight kernel
   - S_of(E, r, s)            — compute syndrome from error pattern
   - check_logical(corr, r, s) — logical Z values from correction
 
@@ -19,12 +22,46 @@ _lib = _ct.CDLL(_os.path.join(_lib_dir, "libplane_warp.so"))
 _lib.preprocess_syndrome.argtypes = [_ct.c_int, _ct.c_int,
     _ct.POINTER(_ct.c_uint8)]
 _lib.preprocess_syndrome.restype = None
-_lib.solve_plane_layered.argtypes = [_ct.c_int, _ct.c_int,
+_lib.solve_plane.argtypes = [_ct.c_int, _ct.c_int,
     _ct.POINTER(_ct.c_uint8), _ct.POINTER(_ct.c_uint8)]
-_lib.solve_plane_layered.restype = _ct.c_int
+_lib.solve_plane.restype = _ct.c_int
 _lib.syndrome_of.argtypes = [_ct.c_int, _ct.c_int,
     _ct.POINTER(_ct.c_uint8), _ct.POINTER(_ct.c_uint8)]
 _lib.syndrome_of.restype = None
+
+# ---- 4D rotation helpers ----
+ZW = [(1,0,0,1), (0,1,1,0), (1,1,0,1), (1,0,1,1), (0,1,1,1), (1,1,1,0)]
+
+def rotate_syn(syn, dx, dy, mi):
+    """Forward 4D rotation: syndrome → rotated syndrome."""
+    r, s = syn.shape
+    out = np.zeros((r, s), dtype=np.uint8)
+    m00,m01,m10,m11 = ZW[mi]
+    for i in range(r):
+        for j in range(s):
+            it = (i + dx) % r
+            jt = (j + dy) % s
+            si2 = (m00 * (it & 1) ^ m01 * (jt & 1)) & 1
+            sj2 = (m10 * (it & 1) ^ m11 * (jt & 1)) & 1
+            out[(it & ~1) + si2, (jt & ~1) + sj2] = syn[i, j]
+    return out
+
+def unrotate_corr(corr, dx, dy, mi):
+    """Inverse 4D rotation: correction → unrotated correction."""
+    r, s = corr.shape
+    out = np.zeros((r, s), dtype=np.uint8)
+    m00,m01,m10,m11 = ZW[mi]
+    for i in range(r):
+        for j in range(s):
+            it = (i + dx) % r
+            jt = (j + dy) % s
+            si2 = (m00 * (it & 1) ^ m01 * (jt & 1)) & 1
+            sj2 = (m10 * (it & 1) ^ m11 * (jt & 1)) & 1
+            out[i, j] = corr[(it & ~1) + si2, (jt & ~1) + sj2]
+    return out
+
+# Best fixed rotations found at weight 3000 on 100×100
+ROTS = [(0,0,0), (50,50,1), (0,50,2), (33,33,3)]
 
 # Cache for min-weight kernel LUT per grid size
 _lut_cache = {}
@@ -95,10 +132,22 @@ def prep(syn, r, s):
 
 def solve(syn, r, s):
     out = np.zeros((r, s), dtype=np.uint8)
-    _lib.solve_plane_layered(r, s,
+    _lib.solve_plane(r, s,
         syn.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
         out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)))
     return min_weight_kernel_fast(out, r, s)
+
+
+def decode_np(syn, r, s, timeout=30):
+    """Subprocess-based decode using ./plane_warp --decode-np.
+    This calls solve_plane with internal restarts, giving ~72% at w=3000.
+    Slower than ctypes but matches run_80pct.py exactly.
+    """
+    import subprocess as _sp
+    bin_path = _os.path.join(_lib_dir, 'plane_warp')
+    proc = _sp.run([bin_path, str(r), str(s), '--decode-np'],
+                   input=syn.tobytes(), capture_output=True, timeout=timeout)
+    return np.frombuffer(proc.stdout, np.uint8).reshape(r, s)
 
 
 def S_of(E, r, s):
@@ -118,6 +167,54 @@ def tesseract_decode_ffinal(syndromes, r, s):
     syn = syndromes[-1].copy().astype(np.uint8)
     prep(syn, r, s)
     return solve(syn, r, s)
+
+
+def tesseract_decode_rot(syndromes, r, s, mi=3, dx=33, dy=33):
+    """ffinal decoder with best fixed 4D rotation (dx=33,dy=33,mi=3).
+    Rotates syndrome before decode, unrotates correction.
+    At weight 3000 on 100×100: ~76% vs ~72% identity (—rot).
+    """
+    syn = syndromes[-1].copy().astype(np.uint8)
+    syn_r = rotate_syn(syn, dx, dy, mi)
+    prep(syn_r, r, s)
+    corr_r = solve(syn_r, r, s)
+    return unrotate_corr(corr_r, dx, dy, mi)
+
+
+def tesseract_decode_rot4(syndromes, r, s):
+    """Run all 4 best rotations, return corrections stacked (4,r,s).
+    For external union-rate evaluation; not for production single-shot.
+    """
+    syn = syndromes[-1].copy().astype(np.uint8)
+    out = []
+    for dx, dy, mi in ROTS:
+        syn_r = rotate_syn(syn, dx, dy, mi)
+        prep(syn_r, r, s)
+        corr_r = solve(syn_r, r, s)
+        out.append(unrotate_corr(corr_r, dx, dy, mi))
+    return np.stack(out)
+
+
+def tesseract_decode_np(syndromes, r, s, timeout=30):
+    """Subprocess --decode-np: matches run_80pct.py exactly (~72% baseline).
+    Takes last-round syndrome, decodes via subprocess (no prep).
+    """
+    syn = syndromes[-1].copy().astype(np.uint8)
+    return decode_np(syn, r, s, timeout)
+
+
+def tesseract_decode_np_rot4(syndromes, r, s, timeout=30):
+    """4-rotation ANY-of-N pipeline using subprocess --decode-np.
+    Returns stacked (4,r,s) corrections identical to run_80pct.py.
+    Union rate ~84% at weight 3000 on 100×100.
+    """
+    syn = syndromes[-1].copy().astype(np.uint8)
+    out = []
+    for dx, dy, mi in ROTS:
+        syn_r = rotate_syn(syn, dx, dy, mi)
+        corr_r = decode_np(syn_r, r, s, timeout)
+        out.append(unrotate_corr(corr_r, dx, dy, mi))
+    return np.stack(out)
 
 
 def tesseract_decode(syndromes, r, s):

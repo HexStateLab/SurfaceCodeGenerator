@@ -22,42 +22,49 @@ _lib = _ct.CDLL(_os.path.join(_lib_dir, "libplane_warp.so"))
 _lib.preprocess_syndrome.argtypes = [_ct.c_int, _ct.c_int,
     _ct.POINTER(_ct.c_uint8)]
 _lib.preprocess_syndrome.restype = None
-_lib.solve_plane.argtypes = [_ct.c_int, _ct.c_int,
-    _ct.POINTER(_ct.c_uint8), _ct.POINTER(_ct.c_uint8)]
-_lib.solve_plane.restype = _ct.c_int
 _lib.syndrome_of.argtypes = [_ct.c_int, _ct.c_int,
     _ct.POINTER(_ct.c_uint8), _ct.POINTER(_ct.c_uint8)]
 _lib.syndrome_of.restype = None
 
+# Subprocess decode — uses the working Heron-R2/plane_warp binary (Jun 27),
+# NOT the rebuilt .so which has a broken solve_plane.
+import subprocess as _sp
+_BIN = _os.path.join(_lib_dir, 'plane_warp')
+
+def _sub_decode(syn, r, s, timeout=30):
+    """Call ./plane_warp --decode-np via subprocess (matching run_80pct.py)."""
+    proc = _sp.run([_BIN, str(r), str(s), '--decode-np'],
+                   input=syn.tobytes(), capture_output=True, timeout=timeout)
+    return np.frombuffer(proc.stdout, np.uint8).reshape(r, s)
+_lib.rot_4d_fwd.argtypes = [_ct.c_int, _ct.c_int,
+    _ct.POINTER(_ct.c_uint8), _ct.POINTER(_ct.c_uint8),
+    _ct.c_int, _ct.c_int, _ct.c_int]
+_lib.rot_4d_fwd.restype = None
+_lib.rot_4d_inv.argtypes = [_ct.c_int, _ct.c_int,
+    _ct.POINTER(_ct.c_uint8), _ct.POINTER(_ct.c_uint8),
+    _ct.c_int, _ct.c_int, _ct.c_int]
+_lib.rot_4d_inv.restype = None
+
 # ---- 4D rotation helpers ----
-ZW = [(1,0,0,1), (0,1,1,0), (1,1,0,1), (1,0,1,1), (0,1,1,1), (1,1,1,0)]
+# Best fixed rotations found at weight 3000 on 100×100
+ROTS = [(0,0,0), (50,50,1), (0,50,2), (33,33,3)]
 
 def rotate_syn(syn, dx, dy, mi):
-    """Forward 4D rotation: syndrome → rotated syndrome."""
+    """C-backed 4D rotation: syndrome → rotated syndrome."""
+    out = np.zeros_like(syn)
     r, s = syn.shape
-    out = np.zeros((r, s), dtype=np.uint8)
-    m00,m01,m10,m11 = ZW[mi]
-    for i in range(r):
-        for j in range(s):
-            it = (i + dx) % r
-            jt = (j + dy) % s
-            si2 = (m00 * (it & 1) ^ m01 * (jt & 1)) & 1
-            sj2 = (m10 * (it & 1) ^ m11 * (jt & 1)) & 1
-            out[(it & ~1) + si2, (jt & ~1) + sj2] = syn[i, j]
+    _lib.rot_4d_fwd(r, s,
+        syn.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
+        out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)), dx, dy, mi)
     return out
 
 def unrotate_corr(corr, dx, dy, mi):
-    """Inverse 4D rotation: correction → unrotated correction."""
+    """C-backed inverse 4D rotation: correction → unrotated."""
+    out = np.zeros_like(corr)
     r, s = corr.shape
-    out = np.zeros((r, s), dtype=np.uint8)
-    m00,m01,m10,m11 = ZW[mi]
-    for i in range(r):
-        for j in range(s):
-            it = (i + dx) % r
-            jt = (j + dy) % s
-            si2 = (m00 * (it & 1) ^ m01 * (jt & 1)) & 1
-            sj2 = (m10 * (it & 1) ^ m11 * (jt & 1)) & 1
-            out[i, j] = corr[(it & ~1) + si2, (jt & ~1) + sj2]
+    _lib.rot_4d_inv(r, s,
+        corr.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
+        out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)), dx, dy, mi)
     return out
 
 # Best fixed rotations found at weight 3000 on 100×100
@@ -131,23 +138,13 @@ def prep(syn, r, s):
 
 
 def solve(syn, r, s):
-    out = np.zeros((r, s), dtype=np.uint8)
-    _lib.solve_plane(r, s,
-        syn.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
-        out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)))
-    return min_weight_kernel_fast(out, r, s)
+    """Decode via subprocess --decode-np (uses working Jun 27 binary)."""
+    return _sub_decode(syn, r, s)
 
 
 def decode_np(syn, r, s, timeout=30):
-    """Subprocess-based decode using ./plane_warp --decode-np.
-    This calls solve_plane with internal restarts, giving ~72% at w=3000.
-    Slower than ctypes but matches run_80pct.py exactly.
-    """
-    import subprocess as _sp
-    bin_path = _os.path.join(_lib_dir, 'plane_warp')
-    proc = _sp.run([bin_path, str(r), str(s), '--decode-np'],
-                   input=syn.tobytes(), capture_output=True, timeout=timeout)
-    return np.frombuffer(proc.stdout, np.uint8).reshape(r, s)
+    """Subprocess-based decode — alias for solve()."""
+    return _sub_decode(syn, r, s)
 
 
 def S_of(E, r, s):

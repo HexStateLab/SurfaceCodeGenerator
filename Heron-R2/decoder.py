@@ -170,76 +170,71 @@ def gauss_elim(A_b):
     return E, True
 
 
-def build_nullspace_H(r, s, k):
-    """Build nullspace basis of H_k.
+def find_chains(r, s, k):
+    """Find all chains in the shear-k system.
     
-    Nullspace = {E | V_k = 0} where V_k(i,j) = E(i,j) + E(i+2, j+2k).
-    V_k = 0 means E(i+2, j+2k) = E(i,j) for all i,j — E is constant
-    along chains (i,j) → (i+2, j+2k) → (i+4, j+4k) → ...
-    
-    For k=0: chains are column-wise (same j, every 2 rows).
-      16 independent chains (2 per column × s columns).
-    For k=1 on 6×8: chains cycle every 12 steps (LCM(6/2, 8/2)=12).
-      48/12 = 4 independent chains.
-    
-    Returns list of (r, s) basis vectors, one per chain.
+    Each chain traces (i,j) → (i+2, j+2k) → (i+4, j+4k) → ...
+    until it cycles. Returns list of chains, each chain is a list
+    of (i,j) positions in traversal order.
     """
-    basis = []
     visited = np.zeros((r, s), dtype=bool)
-    for start_i in range(r):
-        for start_j in range(s):
-            if visited[start_i, start_j]:
+    chains = []
+    for si in range(r):
+        for sj in range(s):
+            if visited[si, sj]:
                 continue
-            # Trace out the chain
-            chain_positions = []
-            i, j = start_i, start_j
+            chain = []
+            i, j = si, sj
             while not visited[i, j]:
                 visited[i, j] = True
-                chain_positions.append((i, j))
+                chain.append((i, j))
                 i = (i + 2) % r
                 j = (j + 2 * k) % s
-            n = np.zeros((r, s), dtype=np.uint8)
-            for ci, cj in chain_positions:
-                n[ci, cj] = 1
-            basis.append(n)
-    return basis
-
-
-def min_weight_shear(E_in, r, s, k):
-    """Find minimum-weight equivalent of E_in in the nullspace of H_k.
-    
-    The nullspace has dim 4 (16 elements). Enumerate all to find
-    the minimum-weight correction that preserves V = H_k · E.
-    """
-    basis = build_nullspace_H(r, s, k)
-    best = E_in.copy()
-    best_wt = best.sum()
-    for mask in range(1 << len(basis)):
-        cur = E_in.copy()
-        for i in range(len(basis)):
-            if mask & (1 << i):
-                cur ^= basis[i]
-        wt = cur.sum()
-        if wt < best_wt:
-            best_wt = wt
-            best = cur.copy()
-    return best
+            if len(chain) > 0:
+                chains.append(chain)
+    return chains
 
 
 def solve_shear(V, r, s, k):
-    """Solve V_k = H_k · E for E via Gaussian elimination.
+    """Solve V_k = H_k · E for E via chain-wise O(N) elimination.
     
-    V: (r, s) array of pair measurements in shear-k frame.
-    k: shear parameter.
-    Returns (r, s) correction array, or zeros if inconsistent.
+    V_k(i,j) = E(i,j) + E(i+2, j+2k).
+    
+    Within each chain: V[element_t] = E[element_t] + E[element_{t+1}].
+    This is solved by setting E[0] = 0 and propagating: E[t+1] = E[t] ′ V[t].
+    Then find the global nullspace flip (add 1 to all elements of the chain)
+    that minimizes the correction weight.
+    
+    Returns (r, s) correction array.
     """
-    N = r * s
-    H = build_H_shear(r, s, k)
-    aug = np.hstack([H, V.reshape(-1, 1)])
-    E, ok = gauss_elim(aug)
-    if ok and E is not None:
-        return min_weight_shear(E.reshape(r, s), r, s, k)
-    return np.zeros((r, s), dtype=np.uint8)
+    chains = find_chains(r, s, k)
+    E = np.zeros((r, s), dtype=np.uint8)
+
+    for chain in chains:
+        L = len(chain)
+        # Solve with E[chain[0]] = 0 → propagate
+        vals = np.zeros(L, dtype=np.uint8)
+        for t in range(L):
+            ci, cj = chain[t]
+            ni, nj = chain[(t + 1) % L]
+            vals[(t + 1) % L] = vals[t] ^ V[ci, cj]
+
+        # Check consistency: the cycle must close
+        if vals[0] != 0:
+            # Inconsistent cycle — this happens with noisy measurements
+            # Ignore this chain's contribution
+            continue
+
+        # Find min-weight nullspace flip
+        wt0 = vals.sum()
+        wt1 = (L - vals.sum())  # flip: 1 - vals
+        if wt1 < wt0:
+            vals ^= 1  # flip entire chain
+
+        for t, (ci, cj) in enumerate(chain):
+            E[ci, cj] = vals[t]
+
+    return E
 
 
 def decode_shear(syndromes, r, s, k):

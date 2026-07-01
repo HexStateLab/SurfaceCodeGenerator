@@ -42,44 +42,32 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     For r=6, s=8: sector size 3×4, measure p=0,1; compute p=2.
     """
     from pw_qiskit import heavy_hex_flag_layout
-    data_map, _, _, _ = heavy_hex_flag_layout(r, s)
+    data_map, anc_maps, _, _ = heavy_hex_flag_layout(r, s)
 
     n_data = r * s
     hr, hs = r // 2, s // 2
+    n_anc_phys = 2 * r * s
     n_anc = 4 * (hr - 1) * hs
 
-    # Compact ancilla mapping: only ancillas used in QEC rounds.
-    # The optimized circuit measures V(i,j) = Z_i Z_{i+2,j} via a single ancilla
-    # at (i,j,0) for each stabilizer (i=0..r-3, j=0..s-1).
-    # Other ancilla positions (i,j,1) and rows i=r-2,r-1 are unused — not allocated.
-    anc_maps = {}
-    cursor = n_data
-    used_anc_pairs = []
-    for px in range(2):
-        for py in range(2):
-            for p in range(hr - 1):
-                for q in range(hs):
-                    i = 2 * p + px
-                    j = 2 * q + py
-                    anc_maps[(i, j, 0)] = cursor
-                    used_anc_pairs.append((i, j))
-                    cursor += 1
-
-    n_anc_phys = cursor - n_data  # total ancilla qubits allocated (= n_anc)
-
-    n_extra = (1 if ghz else 0) + (1 if ghz_measure else 0) + (2 if bell_measure else 0)
+    n_extra = (1 if bell else 0) + (1 if bell_measure else 0) + (1 if ghz else 0) + (1 if ghz_measure else 0)
+    extra_qubits = []
+    if bell: extra_qubits.append(("bell", 1))
+    if bell_measure: extra_qubits.append(("bell_m", 1))
+    if ghz: extra_qubits.append(("ghz", 1))
+    if ghz_measure: extra_qubits.append(("ghz_m", 1))
     extra_idx = {}
     extra_cursor = n_data + n_anc_phys
+    if bell:
+        extra_idx["bell"] = extra_cursor
+        extra_cursor += 1
+    if bell_measure:
+        extra_idx["bell_m"] = extra_cursor
+        extra_cursor += 1
     if ghz:
         extra_idx["ghz"] = extra_cursor
         extra_cursor += 1
     if ghz_measure:
         extra_idx["ghz_m"] = extra_cursor
-        extra_cursor += 1
-    if bell_measure:
-        extra_idx["bell_m1"] = extra_cursor
-        extra_cursor += 1
-        extra_idx["bell_m2"] = extra_cursor
         extra_cursor += 1
     total = n_data + n_anc_phys + n_extra
 
@@ -105,22 +93,29 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             qc.cx(g_idx, data_map[i][s - 1])
         qc.h(g_idx)
         qc.measure(g_idx, extra_cr["ghz"][0])
-    else:
-        # Transversal Bell prep: |+⟩ on col 0 → CNOT to col 2 → |Φ⁺⟩_L
-        # Uses 6 CX directly on data qubits (degree 1 per CX, 6 CZ on heavy-hex).
-        # Deterministic |Φ⁺⟩ — no bell_out needed (no bell ancilla allocated).
-        if bell and not bell_after_qec:
-            for ii in range(r):
-                qc.h(data_map[ii][0])
-            for ii in range(r):
-                qc.cx(data_map[ii][0], data_map[ii][2])
+    elif bell and not bell_after_qec:
+        b_prep_idx = extra_idx["bell"]
+        qc.h(b_prep_idx)
+        if periodic:
+            for i in range(r):
+                qc.cx(b_prep_idx, data_map[i][0])
+            for j in range(s):
+                qc.cx(b_prep_idx, data_map[0][j])
+        else:
+            for i in range(r):
+                qc.cx(b_prep_idx, data_map[i][0])
+            for i in range(r):
+                qc.cx(b_prep_idx, data_map[i][2])
+        qc.h(b_prep_idx)
+        qc.measure(b_prep_idx, extra_cr["bell"][0])
 
+    else:
         # |+⟩⊗N preparation for X-stabilizer basis (satisfies X_i X_j = +1)
         if stabilizer_basis == 'X':
             for ii in range(r):
                 for jj in range(s):
                     qc.h(data_map[ii][jj])
-        if not bell and "1" in logical_state:
+        if "1" in logical_state:
             flip = qc.z if stabilizer_basis == 'X' else qc.x
             if periodic:
                 if logical_state[1] == "1":
@@ -181,47 +176,39 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 for jj in range(s):
                     qc.x(data_map[ii][jj])
 
-    # Bell creation after QEC (fresh Bell state from QEC-cleaned |00⟩).
-    # Uses transversal CNOT on data qubits (no ancilla).
+    # Bell creation after QEC (fresh Bell state from QEC-cleaned |00⟩)
     if bell_after_qec:
-        for ii in range(r):
-            qc.h(data_map[ii][0])
-        for ii in range(r):
-            qc.cx(data_map[ii][0], data_map[ii][2])
-
-    # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state.
-    # open BC (split): col 0 → X_L1 and col 2 → X_L₂ on separate ancillas, XOR'd in software.
-    #   Each chain is 6 CX instead of 12, halving error per ancilla.
-    #   Syndrome is unaffected because V(i,j) uses two qubits from the same column,
-    #   and both get the same projection → XOR cancels.
-    #   ✓ Works with any number of QEC rounds.
-    # periodic BC (single ancilla): all 12 CX on one ancilla (matching original approach).
-    #   ⚠ Only works with 0 QEC rounds (rounds=0 or rounds=1 with free_final_round).
-    #     X_L1 = row 0 anticommutes with V(0,j) for j≠0, so the Bell state is
-    #     outside the code space. QEC rounds project it back, destroying entanglement.
-    if bell_measure:
-        bm1_idx = extra_idx["bell_m1"]
-        bm2_idx = extra_idx["bell_m2"]
+        b_idx = extra_idx["bell"]
+        qc.h(b_idx)
         if periodic:
-            qc.h(bm1_idx)
             for i in range(r):
-                qc.cx(bm1_idx, data_map[i][0])
+                qc.cx(b_idx, data_map[i][0])
             for j in range(s):
-                qc.cx(bm1_idx, data_map[0][j])
-            qc.h(bm1_idx)
-            qc.measure(bm1_idx, extra_cr["bell_m1"][0])
-            qc.measure(bm2_idx, extra_cr["bell_m2"][0])
+                qc.cx(b_idx, data_map[0][j])
         else:
-            qc.h(bm1_idx)
-            qc.h(bm2_idx)
             for i in range(r):
-                qc.cx(bm1_idx, data_map[i][0])
+                qc.cx(b_idx, data_map[i][0])
             for i in range(r):
-                qc.cx(bm2_idx, data_map[i][2])
-            qc.h(bm1_idx)
-            qc.h(bm2_idx)
-            qc.measure(bm1_idx, extra_cr["bell_m1"][0])
-            qc.measure(bm2_idx, extra_cr["bell_m2"][0])
+                qc.cx(b_idx, data_map[i][2])
+        qc.h(b_idx)
+        qc.measure(b_idx, extra_cr["bell"][0])
+
+    # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state
+    if bell_measure:
+        bm_idx = extra_idx["bell_m"]
+        qc.h(bm_idx)
+        if periodic:
+            for i in range(r):
+                qc.cx(bm_idx, data_map[i][0])
+            for j in range(s):
+                qc.cx(bm_idx, data_map[0][j])
+        else:
+            for i in range(r):
+                qc.cx(bm_idx, data_map[i][0])
+            for i in range(r):
+                qc.cx(bm_idx, data_map[i][2])
+        qc.h(bm_idx)
+        qc.measure(bm_idx, extra_cr["bell_m"][0])
 
     # GHZ measurement after QEC: measures X⊗12 on the boundary
     if ghz_measure:

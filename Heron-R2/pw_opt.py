@@ -51,7 +51,7 @@ def _unpack_indices(r, s):
     return ii, jj
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -104,8 +104,9 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     n_anc = 4 * (hr - 1) * hs
     checks = _check_anchors(r, s)
 
-    extra_flags = [name for name, on in (("bell", bell), ("bell_m", bell_measure),
-                                         ("ghz", ghz), ("ghz_m", ghz_measure)) if on]
+    extra_flags = [name for name, on in (("bell", bell and bell_ancilla),
+                                          ("bell_m", bell_measure),
+                                          ("ghz", ghz), ("ghz_m", ghz_measure)) if on]
 
     if compact:
         def _dq(i, j):
@@ -173,7 +174,11 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     if ghz:
         _parity_measure(extra_idx["ghz"], _ghz_support(), extra_cr["ghz"][0])
     elif bell and not bell_after_qec:
-        _parity_measure(extra_idx["bell"], _logical_xx_support(), extra_cr["bell"][0])
+        if bell_ancilla:
+            _parity_measure(extra_idx["bell"], _logical_xx_support(), extra_cr["bell"][0])
+        else:
+            # Direct Bell prep: |Φ⁺⟩_L = H|0⟩ on data[0][0] = (|00⟩_L + |11⟩_L)/√2
+            qc.h(_dq(0, 0))
     else:
         # |+⟩⊗N preparation for X-stabilizer basis (satisfies X_i X_j = +1)
         if stabilizer_basis == 'X':

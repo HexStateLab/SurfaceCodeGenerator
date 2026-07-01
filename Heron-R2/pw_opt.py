@@ -51,7 +51,7 @@ def _unpack_indices(r, s):
     return ii, jj
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, parity_mode='cat', cat_detect=False, cat_spacing=2):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -84,9 +84,29 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     share_extra_ancilla=True (opt-in, default False): bell/bell_measure/
     ghz/ghz_measure share one physical extra qubit, reset between uses.
-    Saves qubits but serializes the parity chains (deeper circuit); only
-    worth it when qubit count is the binding constraint. Classical output
-    unchanged either way.
+    Only meaningful with parity_mode='single'.
+
+    parity_mode='cat' (default): Bell/GHZ parity operators X⊗n are measured
+    with an n-qubit cat state laid out as a chain along the boundary,
+    instead of one ancilla receiving n sequential CXs. The single-ancilla
+    version is a degree-n star (K_{1,n}) which cannot embed in degree-3
+    heavy hex and forces heavy SWAP routing; the cat version's interaction
+    graph is a caterpillar (path + one pendant data edge per node), which
+    is near-native. Sequence: grow the cat outward from the chain centre
+    (depth ~n/2, all path-local), one parallel CX layer onto the data
+    (controlled-X⊗n with the cat as control), uncompute, H + measure the
+    centre qubit. Identical measurement statistics to parity_mode='single'.
+    Error propagation differs: a Z fault on any of the n cat qubits flips
+    the recorded parity (vs. any point in the n-CX window for a single
+    ancilla — comparable exposure), and an X fault during (un)growth walks
+    out as a contiguous X segment on boundary data, which the Z-checks see.
+    Set cat_detect=True to also measure the n-1 non-centre cat qubits into
+    an extra register '<name>_cat' after uncompute: any 1 flags a fault
+    (usable for post-selection). Default False keeps the classical output
+    format identical to parity_mode='single'.
+
+    parity_mode='single': original behavior — one extra ancilla per
+    operator, n sequential CXs.
 
     For periodic r×s where both are even:
       - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
@@ -123,13 +143,60 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             return anc_maps[(i, j, 0)]
         base = n_data + 2 * r * s
 
-    if share_extra_ancilla and extra_flags:
-        extra_idx = {name: base for name in extra_flags}
-        n_extra = 1
+    # --- supports of the boundary parity operators, in boundary-walk order --
+    # (walk order is irrelevant to the measured operator, but makes the cat
+    # chain geometrically local: consecutive entries are grid neighbors or
+    # diagonal at the corner turns)
+    def _logical_xx_coords():
+        """Support of X_L1 · X_L2 (symmetric difference — overlap cancels)."""
+        if periodic:
+            # (0,0) is in both X_L1 (row 0) and X_L2 (col 0): X² = I, skip it.
+            return ([(i, 0) for i in range(r - 1, 0, -1)] +
+                    [(0, j) for j in range(1, s)])
+        # snake: down col 0, back up col 2
+        return ([(i, 0) for i in range(r)] +
+                [(i, 2) for i in range(r - 1, -1, -1)])
+
+    def _ghz_coords():
+        return ([(r - 1, j) for j in range(s - 1)] +
+                [(i, s - 1) for i in range(r - 2, -1, -1)])
+
+    op_coords = {}
+    if bell:
+        op_coords["bell"] = _logical_xx_coords()
+    if bell_measure:
+        op_coords["bell_m"] = _logical_xx_coords()
+    if ghz:
+        op_coords["ghz"] = _ghz_coords()
+    if ghz_measure:
+        op_coords["ghz_m"] = _ghz_coords()
+
+    if parity_mode == 'cat' and extra_flags:
+        n_extra = 0
+        extra_idx = {}
+        n_cat = max(cat_spacing * (len(c) - 1) + 1 for c in op_coords.values())
+        if compact:
+            _shared_cat = [base + k for k in range(n_cat)]
+        else:
+            # unused physical ancilla slots from the heavy-hex layout: the
+            # register has 2*r*s ancilla positions but only the (i,j,0) of
+            # the check anchors are consumed by syndrome extraction.
+            _taken = {anc_maps[(i, j, 0)] for (i, j) in checks}
+            _free = [q for q in sorted(set(anc_maps.values()))
+                     if q not in _taken]
+            _shared_cat = _free[:n_cat]
+
+        def _cat_anc(m):
+            return _shared_cat[:m]
+        total = base + (n_cat if compact else 0)
     else:
-        extra_idx = {name: base + k for k, name in enumerate(extra_flags)}
-        n_extra = len(extra_flags)
-    total = base + n_extra
+        if share_extra_ancilla and extra_flags:
+            extra_idx = {name: base for name in extra_flags}
+            n_extra = 1
+        else:
+            extra_idx = {name: base + k for k, name in enumerate(extra_flags)}
+            n_extra = len(extra_flags)
+        total = base + n_extra
 
     qec_rounds = rounds - 1 if free_final_round else rounds
 
@@ -138,42 +205,86 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     cr_data = ClassicalRegister(n_data, "data")
     cregs = [*cr_syn, cr_data]
     extra_cr = {}
+    cat_cr = {}
     for name in extra_flags:
         cr = ClassicalRegister(1, name)
         extra_cr[name] = cr
         cregs.append(cr)
+        if parity_mode == 'cat' and cat_detect and len(op_coords[name]) > 1:
+            _m = cat_spacing * (len(op_coords[name]) - 1) + 1
+            ccr = ClassicalRegister(_m - 1, f"{name}_cat")
+            cat_cr[name] = ccr
+            cregs.append(ccr)
     qc = QuantumCircuit(qr, *cregs)
 
-    # --- helper: measure a product of X operators via one ancilla -----------
-    extra_used = [False]
+    # --- helper: measure a product of X operators ---------------------------
+    _used_anc = set()
 
-    def _parity_measure(anc, qubits, cbit):
-        if share_extra_ancilla and extra_used[0]:
+    def _parity_measure(name):
+        coords = op_coords[name]
+        qubits = [_dq(i, j) for (i, j) in coords]
+        cbit = extra_cr[name][0]
+        if parity_mode == 'cat':
+            _parity_measure_cat(name, qubits, cbit)
+            return
+        anc = extra_idx[name]
+        if anc in _used_anc:
             qc.reset(anc)
-        extra_used[0] = True
+        _used_anc.add(anc)
         qc.h(anc)
         for dq_ in qubits:
             qc.cx(anc, dq_)
         qc.h(anc)
         qc.measure(anc, cbit)
 
-    def _logical_xx_support():
-        """Support of X_L1 · X_L2 (symmetric difference — overlap cancels)."""
-        if periodic:
-            # (0,0) is in both X_L1 (row 0) and X_L2 (col 0): X² = I, skip it.
-            return ([_dq(i, 0) for i in range(1, r)] +
-                    [_dq(0, j) for j in range(1, s)])
-        return ([_dq(i, 0) for i in range(r)] +
-                [_dq(i, 2) for i in range(r)])
+    def _parity_measure_cat(name, qubits, cbit):
+        """Measure X⊗n on `qubits` via a cat chain.
 
-    def _ghz_support():
-        return ([_dq(r - 1, j) for j in range(s - 1)] +
-                [_dq(i, s - 1) for i in range(r - 1)])
+        Cat state (|0…0>+|1…1>)/√2 grown outward from the chain centre,
+        one parallel CX layer onto the data (= controlled-X⊗n), exact
+        uncompute, then H + measure of the centre qubit yields the parity.
+
+        With cat_spacing=2 (default) the chain has 2n-1 qubits and only
+        every other one couples to a data qubit. Heavy hex is bipartite
+        (ancillas are never adjacent to ancillas), so a dense chain would
+        need routing on every link; the spaced chain is a native
+        corner–edge–corner path with pendant data edges.
+        """
+        n = len(qubits)
+        m = cat_spacing * (n - 1) + 1
+        a = _cat_anc(m)
+        for x in a:
+            if x in _used_anc:
+                qc.reset(x)
+            _used_anc.add(x)
+        root = m // 2
+        qc.h(a[root])
+        # grow the cat outward from the centre (path-local, depth ~m/2)
+        up = [(a[k], a[k + 1]) for k in range(root, m - 1)]
+        down = [(a[k], a[k - 1]) for k in range(root, 0, -1)]
+        for c, t in up:
+            qc.cx(c, t)
+        for c, t in down:
+            qc.cx(c, t)
+        # one parallel coupling layer: controlled-(X…X) with the cat as control
+        for k, dqb in enumerate(qubits):
+            qc.cx(a[cat_spacing * k], dqb)
+        # uncompute the cat (exact reverse)
+        for c, t in reversed(down):
+            qc.cx(c, t)
+        for c, t in reversed(up):
+            qc.cx(c, t)
+        qc.h(a[root])
+        qc.measure(a[root], cbit)
+        if name in cat_cr:
+            others = [x for k, x in enumerate(a) if k != root]
+            for b, x in enumerate(others):
+                qc.measure(x, cat_cr[name][b])
 
     if ghz:
-        _parity_measure(extra_idx["ghz"], _ghz_support(), extra_cr["ghz"][0])
+        _parity_measure("ghz")
     elif bell and not bell_after_qec:
-        _parity_measure(extra_idx["bell"], _logical_xx_support(), extra_cr["bell"][0])
+        _parity_measure("bell")
     else:
         # |+⟩⊗N preparation for X-stabilizer basis (satisfies X_i X_j = +1)
         if stabilizer_basis == 'X':
@@ -238,15 +349,15 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     # Bell creation after QEC (fresh Bell state from QEC-cleaned |00⟩)
     if bell_after_qec:
-        _parity_measure(extra_idx["bell"], _logical_xx_support(), extra_cr["bell"][0])
+        _parity_measure("bell")
 
     # Bell measurement after QEC: measures X_L1 X_L2 of the (possibly corrupted) state
     if bell_measure:
-        _parity_measure(extra_idx["bell_m"], _logical_xx_support(), extra_cr["bell_m"][0])
+        _parity_measure("bell_m")
 
     # GHZ measurement after QEC: measures X⊗12 on the boundary
     if ghz_measure:
-        _parity_measure(extra_idx["ghz_m"], _ghz_support(), extra_cr["ghz_m"][0])
+        _parity_measure("ghz_m")
 
     # X-basis rotation
     if measure_x:

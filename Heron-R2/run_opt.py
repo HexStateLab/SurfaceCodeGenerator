@@ -57,6 +57,43 @@ def all_logicals_measure(corrected_data, r, s, basis='Z', periodic=True):
 def compute_fidelity(lz1, lz2, z1, z2):
     return ((lz1 == z1) & (lz2 == z2)).mean()
 
+def parse_rotation_schedule(schedule_str, rounds, r, s):
+    """Parse rotation schedule string into list of (di, dj) tuples.
+
+    Formats:
+      None / '' / 'none' → no rotation
+      'altV' → alternate vertical: (0,0), (1,0), (0,0), (1,0), ...
+      'altH' → alternate horizontal: (0,0), (0,1), (0,0), (0,1), ...
+      'altB' → alternate both: (0,0), (1,1), (0,0), (1,1), ...
+      'cycleV' → cycle through all vertical shifts: (0,0), (1,0), ..., (r-1,0)
+      'cycleH' → cycle through all horizontal shifts: (0,0), (0,1), ..., (0,s-1)
+      'di,dj' → fixed shift every round
+      'di1,dj1,di2,dj2,...' → explicit schedule (repeated to fill rounds)
+    """
+    if not schedule_str or schedule_str.lower() == "none":
+        return None
+    s = schedule_str.lower()
+    if s == "altv":
+        return [(i % 2, 0) for i in range(rounds)]
+    if s == "alth":
+        return [(0, i % 2) for i in range(rounds)]
+    if s == "altb":
+        return [(i % 2, i % 2) for i in range(rounds)]
+    if s == "cyclev":
+        return [(i % r, 0) for i in range(rounds)]
+    if s == "cycleh":
+        return [(0, i % s) for i in range(rounds)]
+    parts = schedule_str.split(",")
+    if len(parts) == 2:
+        di, dj = int(parts[0]), int(parts[1])
+        return [(di % r, dj % s) for _ in range(rounds)]
+    if len(parts) >= 4 and len(parts) % 2 == 0:
+        schedule = [(int(parts[i]) % r, int(parts[i+1]) % s) for i in range(0, len(parts), 2)]
+        return [schedule[i % len(schedule)] for i in range(rounds)]
+    raise ValueError(f"Invalid rotation schedule: {schedule_str}. "
+                     f"Use 'altV', 'altH', 'altB', 'cycleV', 'cycleH', 'di,dj', or custom list.")
+
+
 def decode(decoder_name, all_syn, r, s):
     """Decode syndromes and return (n_shots, r, s) corrections."""
     n_shots, rounds, _, _ = all_syn.shape
@@ -96,6 +133,9 @@ def run_test(token, opts):
     free_final_round = not opts.no_free_final_round
     full_stabilizer = opts.full_stabilizer
     periodic = not opts.open
+
+    qec_rounds = max(0, rounds - 1) if free_final_round else max(0, rounds)
+    rotation_schedule = parse_rotation_schedule(opts.rotate, qec_rounds, r, s) if hasattr(opts, 'rotate') else None
 
     if free_final_round:
         readout_is_x = opts.measure_x
@@ -145,6 +185,7 @@ def run_test(token, opts):
         full_stabilizer=full_stabilizer,
         dd=opts.dd,
         periodic=periodic,
+        rotation_schedule=rotation_schedule,
     )
     if opts.partial_x:
         basis = "X_partial"
@@ -210,6 +251,7 @@ def run_test(token, opts):
         "bell_measure": bell_measure, "ghz_measure": ghz_measure, "no_reset": no_reset,
         "measure_x": opts.measure_x, "partial_x": opts.partial_x,
         "full_stabilizer": full_stabilizer, "periodic": periodic,
+        "rotation_schedule": opts.rotate if hasattr(opts, 'rotate') else None,
         "submitted": time.time(),
     }
     SAVE_FILE.write_text(json.dumps(jobs, indent=2, default=str))
@@ -230,9 +272,11 @@ def run_test(token, opts):
     if rounds == 0:
         all_syn = np.zeros((n_shots, 0, r, s), dtype=np.uint8)
     else:
+        syn_rotation_schedule = rotation_schedule  # only ancilla rounds need rotation
         all_syn = all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=no_reset,
                                     free_final_round=free_final_round, data_raw=data_raw,
-                                    full_stabilizer=full_stabilizer, periodic=periodic)
+                                    full_stabilizer=full_stabilizer, periodic=periodic,
+                                    rotation_schedule=syn_rotation_schedule)
 
     # Consistency check: compare last ancilla round vs data-readout syndrome
     if free_final_round and rounds >= 2:
@@ -271,7 +315,8 @@ def run_test(token, opts):
                   logical_state=logical_state, measure_x=opts.measure_x,
                   partial_x=opts.partial_x,
                   bell_measure=bell_measure, ghz_measure=ghz_measure, no_reset=no_reset,
-                  free_final_round=free_final_round, periodic=periodic)
+                  free_final_round=free_final_round, periodic=periodic,
+                  rotation_schedule=rotation_schedule)
     if bell_out is not None:
         kwargs["bell_out"] = bell_out
     if ghz_out is not None:
@@ -821,6 +866,13 @@ def main():
                     help='Open boundary conditions (no vertical wrapping). '
                          'X_L1=col0, X_L2=col2 — both commute with all V(i,j), '
                          'so Bell state survives multi-round QEC.')
+    ap.add_argument('--rotate', type=str, default=None, metavar='SCHEDULE',
+                    help='Stabilizer rotation schedule for time-dynamic error suppression. '
+                         'Shifts the stabilizer measurement pattern each round to "smear" '
+                         'logical operator support. Requires periodic BC (torus). '
+                         'Formats: "altV" (alternate vertical shift), "altH" (alternate '
+                         'horizontal), "cycleV" (cycle all vertical shifts), "di,dj" (fixed '
+                         'shift every round), or a comma-separated custom list like "0,0,1,0".')
     opts = ap.parse_args()
     if opts.redecode:
         decode_last_job()

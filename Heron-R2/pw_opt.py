@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, rotation_schedule=None):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -136,6 +136,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     def row2(i):
         return i + 2 if not periodic else (i + 2) % r
     for rnd in range(qec_rounds):
+        di, dj = rotation_schedule[rnd] if rotation_schedule else (0, 0)
         slot = 0
         for px in range(2):
             for py in range(2):
@@ -143,31 +144,33 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                     for q in range(hs):
                         i = 2 * p + px
                         j = 2 * q + py
+                        ir = (i + di) % r
+                        jr = (j + dj) % s
                         anc_idx = anc_maps[(i, j, 0)]
                         if rnd == 0 or not no_reset:
                             qc.reset(anc_idx)
                         if full_stabilizer:
                             if stabilizer_basis == 'X':
                                 qc.h(anc_idx)
-                                qc.cx(anc_idx, data_map[i][j])
-                                qc.cx(anc_idx, data_map[row2(i)][j])
-                                qc.cx(anc_idx, data_map[i][(j + 2) % s])
-                                qc.cx(anc_idx, data_map[row2(i)][(j + 2) % s])
+                                qc.cx(anc_idx, data_map[ir][jr])
+                                qc.cx(anc_idx, data_map[(ir + 2) % r][jr])
+                                qc.cx(anc_idx, data_map[ir][(jr + 2) % s])
+                                qc.cx(anc_idx, data_map[(ir + 2) % r][(jr + 2) % s])
                                 qc.h(anc_idx)
                             else:
-                                qc.cx(data_map[i][j], anc_idx)
-                                qc.cx(data_map[row2(i)][j], anc_idx)
-                                qc.cx(data_map[i][(j + 2) % s], anc_idx)
-                                qc.cx(data_map[row2(i)][(j + 2) % s], anc_idx)
+                                qc.cx(data_map[ir][jr], anc_idx)
+                                qc.cx(data_map[(ir + 2) % r][jr], anc_idx)
+                                qc.cx(data_map[ir][(jr + 2) % s], anc_idx)
+                                qc.cx(data_map[(ir + 2) % r][(jr + 2) % s], anc_idx)
                         else:
                             if stabilizer_basis == 'X':
                                 qc.h(anc_idx)
-                                qc.cx(anc_idx, data_map[i][j])
-                                qc.cx(anc_idx, data_map[row2(i)][j])
+                                qc.cx(anc_idx, data_map[ir][jr])
+                                qc.cx(anc_idx, data_map[(ir + 2) % r][jr])
                                 qc.h(anc_idx)
                             else:
-                                qc.cx(data_map[i][j], anc_idx)
-                                qc.cx(data_map[row2(i)][j], anc_idx)
+                                qc.cx(data_map[ir][jr], anc_idx)
+                                qc.cx(data_map[(ir + 2) % r][jr], anc_idx)
                         qc.measure(anc_idx, cr_syn[rnd][slot])
                         slot += 1
         # Dynamic decoupling: X gates on all idle data qubits between rounds
@@ -255,7 +258,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True, rotation_schedule=None):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
@@ -311,12 +314,20 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
                 V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
                 V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
 
+            # Rotate back to standard basis (reconstruction above is in measurement frame)
+            if rotation_schedule is not None:
+                di, dj = rotation_schedule[c]
+                if di or dj:
+                    V = np.roll(V, shift=(-di) % r, axis=1)
+                    V = np.roll(V, shift=(-dj) % s, axis=2)
+
             if full_stabilizer:
                 syn[:, c] = V  # measurements ARE S directly
             else:
                 syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
 
     # Free final round: compute last syndrome from data readout
+    # Data readout is always in standard basis (no rotation on readout)
     if free_final_round and data_raw is not None:
         V_last = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-2, axis=1)
         syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)

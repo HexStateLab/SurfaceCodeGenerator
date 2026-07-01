@@ -125,7 +125,9 @@ def submit(token, opts):
         dd=opts.dd,
         initial_reset=opts.initial_reset,
         share_extra_ancilla=opts.share_extra,
-        bell_measure=opts.bell_measure, measure_x=opts.measure_x)
+        bell_measure=opts.bell_measure, measure_x=opts.measure_x,
+        partial_x=opts.partial_x,
+        stabilizer_basis='X' if opts.x_stabilizer else 'Z')
 
     ops = qc.count_ops()
     basis = "X" if opts.measure_x else "Z"
@@ -292,6 +294,10 @@ def main():
                     help="H-before-readout for X-basis (0 extra CX)")
     ap.add_argument("--bell-measure", action="store_true",
                     help="Mid-circuit X Bell readout")
+    ap.add_argument("--partial-x", action="store_true",
+                    help="H on row0+col0 only (13 qubits) for X-basis readout")
+    ap.add_argument("--x-stabilizer", action="store_true",
+                    help="X⊗X stabilizers for X-error correction")
     ap.add_argument("--redecode", action="store_true",
                     help="Re-decode the last completed job (no re-submission)")
     ap.add_argument("--dry-run", action="store_true")

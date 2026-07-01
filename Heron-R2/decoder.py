@@ -117,23 +117,25 @@ def un_shear_syndrome(S, r, s, k):
     """Un-shear a 4-qubit syndrome: S'_0(i,j) = S_k(i, j + k*i mod s).
     
     The Dehn twist with shear k maps qubit (i,j) → (i, j - k*i mod s).
-    The 4-qubit syndrome in the sheared frame S_k is defined at positions
-    (i,j) where the vertical pair connects (i,j) ↔ (i+2, j+2k).
-    
+    V_k measures pairs (i,j)↔(i+2, j+2k). 
     Un-shearing recovers the standard syndrome S'_0 of the transformed
     error E'(i,j) = E(i, j + k*i mod s).
+    
+    S'_0(i,j) = S_k(i, j + k*i) requires np.roll with shift=-k*i
+    (positive np.roll shift moves right; we need S_k at index j+ki,
+    which is S_k rolled LEFT by ki).
     """
-    # S shape: (shots, r, s) or (r, s)
+    shift_factor = -k
     if S.ndim == 3:
         out = np.zeros_like(S)
         for shot in range(S.shape[0]):
             for i in range(r):
-                out[shot, i] = np.roll(S[shot, i], shift=k * i, axis=0)
+                out[shot, i] = np.roll(S[shot, i], shift=shift_factor * i, axis=0)
         return out
     else:
         out = np.zeros_like(S)
         for i in range(r):
-            out[i] = np.roll(S[i], shift=k * i, axis=0)
+            out[i] = np.roll(S[i], shift=shift_factor * i, axis=0)
         return out
 
 
@@ -141,19 +143,20 @@ def re_shear_correction(C, r, s, k):
     """Re-shear a correction: C(i,j) = C'(i, j - k*i mod s).
     
     Inverse of un_shear_syndrome. The standard decoder produces correction
-    C' in the E' frame. This function transforms it back to the original
-    error frame.
+    C' in the E' frame. E'(i,j) = E(i, j + k*i) means E(i,j) = E'(i, j - k*i).
+    So re-shear uses shift = +k*i.
     """
+    shift_factor = k
     if C.ndim == 3:
         out = np.zeros_like(C)
         for shot in range(C.shape[0]):
             for i in range(r):
-                out[shot, i] = np.roll(C[shot, i], shift=-k * i, axis=0)
+                out[shot, i] = np.roll(C[shot, i], shift=shift_factor * i, axis=0)
         return out
     else:
         out = np.zeros_like(C)
         for i in range(r):
-            out[i] = np.roll(C[i], shift=-k * i, axis=0)
+            out[i] = np.roll(C[i], shift=shift_factor * i, axis=0)
         return out
 
 

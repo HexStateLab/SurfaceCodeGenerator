@@ -6,12 +6,52 @@ V(2,q) = V(0,q) ⊕ V(1,q) computed in software.
 Saves 16 ancillas vs the standard share-pair layout (32 vs 48).
 
 For 6×8: 48 data + 32 anc = 80 qubits, 64 CX, depth ~17, 0 SWAPs.
+
+Optimizations in this revision (all output-format compatible):
+  - compact=True (default): the QuantumRegister holds exactly the qubits
+    actually used (data + measured ancillas + extras) instead of
+    n_data + 2*r*s.  For 6×8 that is ~81 qubits instead of 145, which
+    speeds up transpilation and simulation and removes idle wires.
+    Set compact=False to restore the original register layout with
+    heavy_hex_flag_layout indices.
+  - Direction-major CX scheduling: all "self" CXs are emitted before all
+    "+2 partner" CXs, so every extraction round is exactly 2 CX layers
+    deep (4 for full_stabilizer) instead of chaining through shared data
+    qubits.  All CXs within a round pairwise commute (data qubits are
+    always on one side, ancillas on the other), so the unitary is
+    unchanged — only the DAG depth improves (~2x per round).
+  - initial_reset=False (default): the round-0 ancilla resets are dropped
+    since qubits start in |0⟩; pass initial_reset=True to restore them.
+  - share_extra_ancilla (opt-in): bell / bell_measure / ghz /
+    ghz_measure can reuse a single extra qubit (reset between uses)
+    instead of allocating one each.  Classical registers are unchanged.
+  - Periodic Bell prep/measure skips the (0,0) qubit entirely: it appears
+    in both X_L1 and X_L2, so the two CXs cancel (X² = I).  Saves 2 CX
+    and 2 layers of ancilla depth per Bell operation.
+  - all_syndromes_opt and verify_pipeline are fully vectorized
+    (precomputed fancy-index unpacking, unique-syndrome decoding).
 """
 import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True):
+def _check_anchors(r, s):
+    """Check anchor coordinates (i, j) in classical-bit order (px, py, p, q)."""
+    hr, hs = r // 2, s // 2
+    return [(2 * p + px, 2 * q + py)
+            for px in range(2) for py in range(2)
+            for p in range(hr - 1) for q in range(hs)]
+
+
+def _unpack_indices(r, s):
+    """Row/col fancy-index arrays matching the classical-bit order."""
+    anchors = _check_anchors(r, s)
+    ii = np.array([a[0] for a in anchors])
+    jj = np.array([a[1] for a in anchors])
+    return ii, jj
+
+
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -33,6 +73,21 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     at the end supplies the last round's Z-stabilizer syndrome. Only valid when
     readout basis matches stabilizer basis (both Z or both X). Saves 64 CX.
 
+    compact=True: allocate only the qubits actually used (data + measured
+    ancillas + extras) and remap indices to a dense range. The returned
+    data_map reflects the remapping. Set compact=False if downstream code
+    relies on the raw heavy_hex_flag_layout indices (e.g. a trivial
+    initial_layout onto physical qubits).
+
+    initial_reset=False: skip the redundant round-0 ancilla resets
+    (qubits initialize to |0⟩ on hardware and in Aer).
+
+    share_extra_ancilla=True (opt-in, default False): bell/bell_measure/
+    ghz/ghz_measure share one physical extra qubit, reset between uses.
+    Saves qubits but serializes the parity chains (deeper circuit); only
+    worth it when qubit count is the binding constraint. Classical output
+    unchanged either way.
+
     For periodic r×s where both are even:
       - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
       - In sector coords, V(p,q) = data[p][q] ⊕ data[(p+1)%(r/2)][q]
@@ -46,30 +101,35 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     n_data = r * s
     hr, hs = r // 2, s // 2
-    n_anc_phys = 2 * r * s
     n_anc = 4 * (hr - 1) * hs
+    checks = _check_anchors(r, s)
 
-    n_extra = (1 if bell else 0) + (1 if bell_measure else 0) + (1 if ghz else 0) + (1 if ghz_measure else 0)
-    extra_qubits = []
-    if bell: extra_qubits.append(("bell", 1))
-    if bell_measure: extra_qubits.append(("bell_m", 1))
-    if ghz: extra_qubits.append(("ghz", 1))
-    if ghz_measure: extra_qubits.append(("ghz_m", 1))
-    extra_idx = {}
-    extra_cursor = n_data + n_anc_phys
-    if bell:
-        extra_idx["bell"] = extra_cursor
-        extra_cursor += 1
-    if bell_measure:
-        extra_idx["bell_m"] = extra_cursor
-        extra_cursor += 1
-    if ghz:
-        extra_idx["ghz"] = extra_cursor
-        extra_cursor += 1
-    if ghz_measure:
-        extra_idx["ghz_m"] = extra_cursor
-        extra_cursor += 1
-    total = n_data + n_anc_phys + n_extra
+    extra_flags = [name for name, on in (("bell", bell), ("bell_m", bell_measure),
+                                         ("ghz", ghz), ("ghz_m", ghz_measure)) if on]
+
+    if compact:
+        def _dq(i, j):
+            return i * s + j
+        _anc_index = {c: n_data + k for k, c in enumerate(checks)}
+
+        def _aq(i, j):
+            return _anc_index[(i, j)]
+        base = n_data + n_anc
+    else:
+        def _dq(i, j):
+            return data_map[i][j]
+
+        def _aq(i, j):
+            return anc_maps[(i, j, 0)]
+        base = n_data + 2 * r * s
+
+    if share_extra_ancilla and extra_flags:
+        extra_idx = {name: base for name in extra_flags}
+        n_extra = 1
+    else:
+        extra_idx = {name: base + k for k, name in enumerate(extra_flags)}
+        n_extra = len(extra_flags)
+    total = base + n_extra
 
     qec_rounds = rounds - 1 if free_final_round else rounds
 
@@ -78,181 +138,149 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     cr_data = ClassicalRegister(n_data, "data")
     cregs = [*cr_syn, cr_data]
     extra_cr = {}
-    for name in extra_idx:
+    for name in extra_flags:
         cr = ClassicalRegister(1, name)
         extra_cr[name] = cr
         cregs.append(cr)
     qc = QuantumCircuit(qr, *cregs)
 
-    if ghz:
-        g_idx = extra_idx["ghz"]
-        qc.h(g_idx)
-        for j in range(s - 1):
-            qc.cx(g_idx, data_map[r - 1][j])
-        for i in range(r - 1):
-            qc.cx(g_idx, data_map[i][s - 1])
-        qc.h(g_idx)
-        qc.measure(g_idx, extra_cr["ghz"][0])
-    elif bell and not bell_after_qec:
-        b_prep_idx = extra_idx["bell"]
-        qc.h(b_prep_idx)
-        if periodic:
-            for i in range(r):
-                qc.cx(b_prep_idx, data_map[i][0])
-            for j in range(s):
-                qc.cx(b_prep_idx, data_map[0][j])
-        else:
-            for i in range(r):
-                qc.cx(b_prep_idx, data_map[i][0])
-            for i in range(r):
-                qc.cx(b_prep_idx, data_map[i][2])
-        qc.h(b_prep_idx)
-        qc.measure(b_prep_idx, extra_cr["bell"][0])
+    # --- helper: measure a product of X operators via one ancilla -----------
+    extra_used = [False]
 
+    def _parity_measure(anc, qubits, cbit):
+        if share_extra_ancilla and extra_used[0]:
+            qc.reset(anc)
+        extra_used[0] = True
+        qc.h(anc)
+        for dq_ in qubits:
+            qc.cx(anc, dq_)
+        qc.h(anc)
+        qc.measure(anc, cbit)
+
+    def _logical_xx_support():
+        """Support of X_L1 · X_L2 (symmetric difference — overlap cancels)."""
+        if periodic:
+            # (0,0) is in both X_L1 (row 0) and X_L2 (col 0): X² = I, skip it.
+            return ([_dq(i, 0) for i in range(1, r)] +
+                    [_dq(0, j) for j in range(1, s)])
+        return ([_dq(i, 0) for i in range(r)] +
+                [_dq(i, 2) for i in range(r)])
+
+    def _ghz_support():
+        return ([_dq(r - 1, j) for j in range(s - 1)] +
+                [_dq(i, s - 1) for i in range(r - 1)])
+
+    if ghz:
+        _parity_measure(extra_idx["ghz"], _ghz_support(), extra_cr["ghz"][0])
+    elif bell and not bell_after_qec:
+        _parity_measure(extra_idx["bell"], _logical_xx_support(), extra_cr["bell"][0])
     else:
         # |+⟩⊗N preparation for X-stabilizer basis (satisfies X_i X_j = +1)
         if stabilizer_basis == 'X':
             for ii in range(r):
                 for jj in range(s):
-                    qc.h(data_map[ii][jj])
+                    qc.h(_dq(ii, jj))
         if "1" in logical_state:
             flip = qc.z if stabilizer_basis == 'X' else qc.x
             if periodic:
                 if logical_state[1] == "1":
                     for jj in range(s):
-                        flip(data_map[0][jj])
+                        flip(_dq(0, jj))
                 if logical_state[0] == "1":
                     for ii in range(r):
-                        flip(data_map[ii][0])
+                        flip(_dq(ii, 0))
             else:
                 if logical_state[1] == "1":
                     for ii in range(r):
-                        flip(data_map[ii][2])
+                        flip(_dq(ii, 2))
                 if logical_state[0] == "1":
                     for ii in range(r):
-                        flip(data_map[ii][0])
+                        flip(_dq(ii, 0))
 
     # QEC rounds (rounds-1 if free_final_round, else rounds)
     def row2(i):
         return i + 2 if not periodic else (i + 2) % r
+
+    anc_list = [_aq(i, j) for (i, j) in checks]
+    # Direction-major CX schedule: each offset layer touches every data qubit
+    # and every ancilla at most once, so the round is exactly len(offsets)
+    # CX layers deep. All CXs in a round pairwise commute (data qubits only
+    # ever on the control side in Z basis / target side in X basis), so the
+    # unitary matches the original per-ancilla emission order.
+    offsets = ([(0, 0), (2, 0), (0, 2), (2, 2)] if full_stabilizer
+               else [(0, 0), (2, 0)])
+
     for rnd in range(qec_rounds):
-        slot = 0
-        for px in range(2):
-            for py in range(2):
-                for p in range(hr - 1):
-                    for q in range(hs):
-                        i = 2 * p + px
-                        j = 2 * q + py
-                        anc_idx = anc_maps[(i, j, 0)]
-                        if rnd == 0 or not no_reset:
-                            qc.reset(anc_idx)
-                        if full_stabilizer:
-                            if stabilizer_basis == 'X':
-                                qc.h(anc_idx)
-                                qc.cx(anc_idx, data_map[i][j])
-                                qc.cx(anc_idx, data_map[row2(i)][j])
-                                qc.cx(anc_idx, data_map[i][(j + 2) % s])
-                                qc.cx(anc_idx, data_map[row2(i)][(j + 2) % s])
-                                qc.h(anc_idx)
-                            else:
-                                qc.cx(data_map[i][j], anc_idx)
-                                qc.cx(data_map[row2(i)][j], anc_idx)
-                                qc.cx(data_map[i][(j + 2) % s], anc_idx)
-                                qc.cx(data_map[row2(i)][(j + 2) % s], anc_idx)
-                        else:
-                            if stabilizer_basis == 'X':
-                                qc.h(anc_idx)
-                                qc.cx(anc_idx, data_map[i][j])
-                                qc.cx(anc_idx, data_map[row2(i)][j])
-                                qc.h(anc_idx)
-                            else:
-                                qc.cx(data_map[i][j], anc_idx)
-                                qc.cx(data_map[row2(i)][j], anc_idx)
-                        qc.measure(anc_idx, cr_syn[rnd][slot])
-                        slot += 1
+        if (rnd == 0 and initial_reset) or (rnd > 0 and not no_reset):
+            for a in anc_list:
+                qc.reset(a)
+        if stabilizer_basis == 'X':
+            for a in anc_list:
+                qc.h(a)
+        for (di, dj) in offsets:
+            for (i, j), a in zip(checks, anc_list):
+                ti = row2(i) if di else i
+                tj = (j + dj) % s
+                if stabilizer_basis == 'X':
+                    qc.cx(a, _dq(ti, tj))
+                else:
+                    qc.cx(_dq(ti, tj), a)
+        if stabilizer_basis == 'X':
+            for a in anc_list:
+                qc.h(a)
+        for slot, a in enumerate(anc_list):
+            qc.measure(a, cr_syn[rnd][slot])
         # Dynamic decoupling: X gates on all idle data qubits between rounds
         if dd and rnd < qec_rounds - 1:
             for ii in range(r):
                 for jj in range(s):
-                    qc.x(data_map[ii][jj])
+                    qc.x(_dq(ii, jj))
 
     # Bell creation after QEC (fresh Bell state from QEC-cleaned |00⟩)
     if bell_after_qec:
-        b_idx = extra_idx["bell"]
-        qc.h(b_idx)
-        if periodic:
-            for i in range(r):
-                qc.cx(b_idx, data_map[i][0])
-            for j in range(s):
-                qc.cx(b_idx, data_map[0][j])
-        else:
-            for i in range(r):
-                qc.cx(b_idx, data_map[i][0])
-            for i in range(r):
-                qc.cx(b_idx, data_map[i][2])
-        qc.h(b_idx)
-        qc.measure(b_idx, extra_cr["bell"][0])
+        _parity_measure(extra_idx["bell"], _logical_xx_support(), extra_cr["bell"][0])
 
-    # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state
+    # Bell measurement after QEC: measures X_L1 X_L2 of the (possibly corrupted) state
     if bell_measure:
-        bm_idx = extra_idx["bell_m"]
-        qc.h(bm_idx)
-        if periodic:
-            for i in range(r):
-                qc.cx(bm_idx, data_map[i][0])
-            for j in range(s):
-                qc.cx(bm_idx, data_map[0][j])
-        else:
-            for i in range(r):
-                qc.cx(bm_idx, data_map[i][0])
-            for i in range(r):
-                qc.cx(bm_idx, data_map[i][2])
-        qc.h(bm_idx)
-        qc.measure(bm_idx, extra_cr["bell_m"][0])
+        _parity_measure(extra_idx["bell_m"], _logical_xx_support(), extra_cr["bell_m"][0])
 
     # GHZ measurement after QEC: measures X⊗12 on the boundary
     if ghz_measure:
-        gm_idx = extra_idx["ghz_m"]
-        qc.h(gm_idx)
-        for j in range(s - 1):
-            qc.cx(gm_idx, data_map[r - 1][j])
-        for i in range(r - 1):
-            qc.cx(gm_idx, data_map[i][s - 1])
-        qc.h(gm_idx)
-        qc.measure(gm_idx, extra_cr["ghz_m"][0])
+        _parity_measure(extra_idx["ghz_m"], _ghz_support(), extra_cr["ghz_m"][0])
 
     # X-basis rotation
     if measure_x:
         for ii in range(r):
             for jj in range(s):
-                qc.h(data_map[ii][jj])
+                qc.h(_dq(ii, jj))
         qc.barrier()
     elif partial_x:
         if periodic:
             for jj in range(s):
-                qc.h(data_map[0][jj])
+                qc.h(_dq(0, jj))
             for ii in range(1, r):
-                qc.h(data_map[ii][0])
+                qc.h(_dq(ii, 0))
         else:
             for ii in range(r):
-                qc.h(data_map[ii][0])
+                qc.h(_dq(ii, 0))
             for ii in range(r):
-                qc.h(data_map[ii][2])
+                qc.h(_dq(ii, 2))
         qc.barrier()
 
     # Final data readout
     for ii in range(r):
         for jj in range(s):
-            qc.measure(data_map[ii][jj], cr_data[ii * s + jj])
+            qc.measure(_dq(ii, jj), cr_data[ii * s + jj])
 
     if periodic:
-        lq0_qubits = [data_map[0][jj] for jj in range(s)]
-        lq1_qubits = [data_map[ii][0] for ii in range(r)]
+        lq0_qubits = [_dq(0, jj) for jj in range(s)]
+        lq1_qubits = [_dq(ii, 0) for ii in range(r)]
     else:
-        lq0_qubits = [data_map[ii][0] for ii in range(r)]
-        lq1_qubits = [data_map[ii][2] for ii in range(r)]
+        lq0_qubits = [_dq(ii, 0) for ii in range(r)]
+        lq1_qubits = [_dq(ii, 2) for ii in range(r)]
 
-    return qc, data_map, lq0_qubits, lq1_qubits, n_anc
+    eff_data_map = [[_dq(ii, jj) for jj in range(s)] for ii in range(r)]
+    return qc, eff_data_map, lq0_qubits, lq1_qubits, n_anc
 
 
 def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True):
@@ -269,8 +297,10 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
     When free_final_round=True, the last round's syndrome is computed from
     data_raw (destructive readout) instead of an ancilla measurement.
     Only rounds-1 ancilla registers are expected in pub_result.
+
+    Fully vectorized: measurements are scattered into the (r, s) grid with
+    precomputed fancy indices in one shot across all rounds.
     """
-    hr, hs = r // 2, s // 2
     anc_rounds = rounds - 1 if free_final_round else rounds
 
     if anc_rounds == 0:
@@ -291,30 +321,20 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
         else:
             m_parity = m_raw
 
+        # Scatter all rounds at once: (shots, anc_rounds, n_anc) -> (shots, anc_rounds, r, s)
+        ui, uj = _unpack_indices(r, s)
+        V = np.zeros((shots, anc_rounds, r, s), dtype=np.uint8)
+        V[:, :, ui, uj] = m_parity
+
+        if periodic:
+            V[:, :, r - 2, :] = V[:, :, 0:r - 2:2, :].sum(axis=2) % 2
+            V[:, :, r - 1, :] = V[:, :, 1:r - 1:2, :].sum(axis=2) % 2
+
         syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
-        for c in range(anc_rounds):
-            m = m_parity[:, c]
-
-            # Unpack measurements into (shots, r, s) V array
-            V = np.zeros((shots, r, s), dtype=np.uint8)
-            idx = 0
-            for px in range(2):
-                for py in range(2):
-                    for p in range(hr - 1):
-                        for q in range(hs):
-                            i = 2 * p + px
-                            j = 2 * q + py
-                            V[:, i, j] = m[:, idx]
-                            idx += 1
-
-            if periodic:
-                V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
-                V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
-
-            if full_stabilizer:
-                syn[:, c] = V  # measurements ARE S directly
-            else:
-                syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
+        if full_stabilizer:
+            syn[:, :anc_rounds] = V  # measurements ARE S directly
+        else:
+            syn[:, :anc_rounds] = V ^ np.roll(V, shift=-2, axis=3)
 
     # Free final round: compute last syndrome from data readout
     if free_final_round and data_raw is not None:
@@ -424,7 +444,12 @@ def verify_optimized():
 
 
 def verify_pipeline(no_reset=False):
-    """End-to-end: circuit → simulate → syndrome extraction → decode."""
+    """End-to-end: circuit → simulate → syndrome extraction → decode.
+
+    Vectorized: bitstrings are parsed once per unique outcome, syndromes
+    are scattered with fancy indexing, and the decoder runs only on unique
+    syndrome patterns; results are expanded back with counts as weights.
+    """
     from qiskit_aer import AerSimulator
     from qiskit_aer.noise import NoiseModel, depolarizing_error
     from waxis_decode import WaxisDecoder
@@ -447,46 +472,41 @@ def verify_pipeline(no_reset=False):
     print(f"  Sample output: '{sample[0]}' (count={sample[1]})")
     print(f"  Num classical registers: {len(sample[0].split())}")
 
-    syn_list = []
-    data_list = []
-    for bitstring, cnt in counts.items():
-        parts = bitstring.split()
-        data_bits = parts[0][::-1]    # Qiskit get_counts: clbit 0 is rightmost
-        syn_bits = parts[1][::-1] if len(parts) >= 2 else ""
-        for _ in range(cnt):
-            V = np.zeros((r, s), dtype=np.uint8)
-            idx = 0
-            for px in range(2):
-                for py in range(2):
-                    for p in range(r//2 - 1):
-                        for q in range(s//2):
-                            i = 2 * p + px
-                            j = 2 * q + py
-                            V[i, j] = int(syn_bits[idx])
-                            idx += 1
-            V[4, :] = V[0:4:2, :].sum(axis=0) % 2
-            V[5, :] = V[1:5:2, :].sum(axis=0) % 2
-            syn_list.append(V ^ np.roll(V, shift=-2, axis=1))
-            data = np.zeros((r, s), dtype=np.uint8)
-            for ii in range(r):
-                for jj in range(s):
-                    data[ii, jj] = int(data_bits[ii * s + jj])
-            data_list.append(data)
+    def _bits(strings):
+        """(n, L) uint8 array from equal-length bitstrings, LSB-first."""
+        arr = np.frombuffer("".join(strings).encode(), dtype=np.uint8)
+        return (arr.reshape(len(strings), -1) - ord("0"))[:, ::-1].astype(np.uint8)
 
-    syn_hits = np.array(syn_list)
-    data_raw = np.array(data_list)
-    n = len(syn_hits)
-    print(f"  Total shots decoded: {n}")
+    items = list(counts.items())
+    cnts = np.array([c for _, c in items], dtype=np.int64)
+    parts = [b.split() for b, _ in items]
+    data_u = _bits([p[0] for p in parts]).reshape(-1, r, s)
+    syn_bits = _bits([p[1] for p in parts]) if len(parts[0]) >= 2 else None
 
+    ui, uj = _unpack_indices(r, s)
+    V = np.zeros((len(items), r, s), dtype=np.uint8)
+    if syn_bits is not None:
+        V[:, ui, uj] = syn_bits[:, :len(ui)]
+    V[:, r - 2, :] = V[:, 0:r - 2:2, :].sum(axis=1) % 2
+    V[:, r - 1, :] = V[:, 1:r - 1:2, :].sum(axis=1) % 2
+    syn_u = V ^ np.roll(V, shift=-2, axis=2)
+
+    n = int(cnts.sum())
+    print(f"  Total shots decoded: {n} ({len(items)} unique outcomes)")
+
+    # Decode each *unique syndrome* once, then broadcast back.
     dec = WaxisDecoder(r, s)
-    corrs = np.zeros((n, 1, r, s), dtype=np.uint8)
-    for i in range(n):
-        corrs[i] = dec.decode(syn_hits[i].reshape(1, r, s))
+    uniq_syn, inv = np.unique(syn_u.reshape(len(items), -1), axis=0, return_inverse=True)
+    corr_u = np.zeros((len(uniq_syn), r, s), dtype=np.uint8)
+    for k, v in enumerate(uniq_syn.reshape(-1, r, s)):
+        corr_u[k] = dec.decode(v.reshape(1, r, s))[0]
+    corrs = corr_u[inv]
 
-    corrected = data_raw ^ corrs[:, 0]
+    corrected = data_u ^ corrs
     lz1 = corrected[:, 0, :].sum(axis=1) % 2
     lz2 = corrected[:, :, 0].sum(axis=1) % 2
-    fidelity = ((lz1 == 0) & (lz2 == 0)).mean()
+    ok = (lz1 == 0) & (lz2 == 0)
+    fidelity = (ok * cnts).sum() / n
     print(f"  |00⟩ fidelity with 2% CX noise: {fidelity:.3f}")
     print("✓ Pipeline verified")
 

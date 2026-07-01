@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, rotation_schedule=None, direction_schedule=None, shear_schedule=None):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -135,12 +135,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     # QEC rounds (rounds-1 if free_final_round, else rounds)
     def row2(i):
         return i + 2 if not periodic else (i + 2) % r
-    def col2(j):
-        return j + 2 if not periodic else (j + 2) % s
     for rnd in range(qec_rounds):
-        di, dj = rotation_schedule[rnd] if rotation_schedule else (0, 0)
-        direction = direction_schedule[rnd] if direction_schedule else 'V'
-        shear = shear_schedule[rnd] if shear_schedule else 0
         slot = 0
         for px in range(2):
             for py in range(2):
@@ -148,41 +143,31 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                     for q in range(hs):
                         i = 2 * p + px
                         j = 2 * q + py
-                        ir = (i + di) % r
-                        jr = (j + dj) % s
                         anc_idx = anc_maps[(i, j, 0)]
                         if rnd == 0 or not no_reset:
                             qc.reset(anc_idx)
-                        # Second-qubit column offset from shear (Dehn twist)
-                        js = (jr + 2 * shear) % s
                         if full_stabilizer:
                             if stabilizer_basis == 'X':
                                 qc.h(anc_idx)
-                                qc.cx(anc_idx, data_map[ir][jr])
-                                qc.cx(anc_idx, data_map[(ir + 2) % r][jr])
-                                qc.cx(anc_idx, data_map[ir][(jr + 2) % s])
-                                qc.cx(anc_idx, data_map[(ir + 2) % r][(js + 2) % s])
+                                qc.cx(anc_idx, data_map[i][j])
+                                qc.cx(anc_idx, data_map[row2(i)][j])
+                                qc.cx(anc_idx, data_map[i][(j + 2) % s])
+                                qc.cx(anc_idx, data_map[row2(i)][(j + 2) % s])
                                 qc.h(anc_idx)
                             else:
-                                qc.cx(data_map[ir][jr], anc_idx)
-                                qc.cx(data_map[(ir + 2) % r][jr], anc_idx)
-                                qc.cx(data_map[ir][(jr + 2) % s], anc_idx)
-                                qc.cx(data_map[(ir + 2) % r][(js + 2) % s], anc_idx)
+                                qc.cx(data_map[i][j], anc_idx)
+                                qc.cx(data_map[row2(i)][j], anc_idx)
+                                qc.cx(data_map[i][(j + 2) % s], anc_idx)
+                                qc.cx(data_map[row2(i)][(j + 2) % s], anc_idx)
                         else:
                             if stabilizer_basis == 'X':
                                 qc.h(anc_idx)
-                                qc.cx(anc_idx, data_map[ir][jr])
-                                if direction == 'H':
-                                    qc.cx(anc_idx, data_map[ir][col2(jr)])
-                                else:
-                                    qc.cx(anc_idx, data_map[(ir + 2) % r][js])
+                                qc.cx(anc_idx, data_map[i][j])
+                                qc.cx(anc_idx, data_map[row2(i)][j])
                                 qc.h(anc_idx)
                             else:
-                                qc.cx(data_map[ir][jr], anc_idx)
-                                if direction == 'H':
-                                    qc.cx(data_map[ir][col2(jr)], anc_idx)
-                                else:
-                                    qc.cx(data_map[(ir + 2) % r][js], anc_idx)
+                                qc.cx(data_map[i][j], anc_idx)
+                                qc.cx(data_map[row2(i)][j], anc_idx)
                         qc.measure(anc_idx, cr_syn[rnd][slot])
                         slot += 1
         # Dynamic decoupling: X gates on all idle data qubits between rounds
@@ -270,16 +255,13 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True, rotation_schedule=None, shear_schedule=None):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
-    Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j+2k]
-    (with shear k applied to vertical pairs). For k=0, this reduces
-    to the standard vertical pair V(i,j) = E(i,j) ⊕ E(i+2,j).
-
-    The 4-qubit syndrome S_k(i,j) = V(i,j) ⊕ V(i, j+2) is computed
-    in the shear-k frame. When shear_k != 0, S_k is automatically
-    un-sheared back to the standard frame S'_0.
+    Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
+    for i=0..r-3 (both even and odd, all columns j).
+    The last two rows' V are computed via linear combination (periodic)
+    or left as zero (open boundaries).
 
     When no_reset=True, ancillas persist between rounds: m_r = m_{r-1} ⊕ P_r.
     The actual parity P_r = m_r ⊕ m_{r-1} (with m_{-1} = 0).
@@ -329,31 +311,12 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
                 V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
                 V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
 
-            # Rotate back to standard basis (reconstruction above is in measurement frame)
-            if rotation_schedule is not None:
-                di, dj = rotation_schedule[c]
-                if di or dj:
-                    V = np.roll(V, shift=(-di) % r, axis=1)
-                    V = np.roll(V, shift=(-dj) % s, axis=2)
-
             if full_stabilizer:
-                S_k = V  # measurements ARE S directly
+                syn[:, c] = V  # measurements ARE S directly
             else:
-                S_k = V ^ np.roll(V, shift=-2, axis=2)
-
-            # Un-shear the syndrome back to standard frame
-            k = shear_schedule[c] if shear_schedule else 0
-            if k != 0:
-                out = np.zeros_like(S_k)
-                for shot in range(S_k.shape[0]):
-                    for i in range(r):
-                        out[shot, i] = np.roll(S_k[shot, i], shift=k * i, axis=0)
-                syn[:, c] = out
-            else:
-                syn[:, c] = S_k
+                syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
 
     # Free final round: compute last syndrome from data readout
-    # Data readout is always in standard basis (no rotation on readout)
     if free_final_round and data_raw is not None:
         V_last = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-2, axis=1)
         syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)

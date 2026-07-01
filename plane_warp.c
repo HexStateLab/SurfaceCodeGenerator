@@ -35,6 +35,10 @@ int g_escape_enabled = 1;
 // strict no-op on clean syndromes (the exhaustive weight-k tests are
 // unaffected); it only acts when the syndrome itself is corrupted.
 int g_singleshot = 1;
+// 4-rotation flag: when set, any --decode-* mode wraps in 4 rotations
+// and outputs all 4 corrections concatenated (4*n bytes).
+int g_rot = 0;
+
 // Correction-weight cap (in flips). 0 = disabled (no ceiling). When set, the
 // decoder ABSTAINS — returns the empty correction — on any shot whose best
 // correction exceeds the cap. Rationale: on a code whose typical error is
@@ -1062,6 +1066,47 @@ int is_stabilizer(int r, int s, uint8_t *diff) {
     return 1;
 }
 
+// ---- 4D rotation helpers (XY translation + ZW parity mixing) ----
+// 6 invertible 2x2 GF(2) matrices for the ZW parity rotation
+static const int ZW_MAT[6][4] = {
+    {1,0,0,1},  // 0: identity
+    {0,1,1,0},  // 1: swap X↔Z
+    {1,1,0,1},  // 2: shear Z→Z+W
+    {1,0,1,1},  // 3: shear W→Z+W
+    {0,1,1,1},  // 4: swap+shear1
+    {1,1,1,0},  // 5: swap+shear2
+};
+
+// Apply forward 4D rotation to syndrome: out[rot(i,j)] = syn[i][j]
+static void rot_4d_fwd(int r, int s, uint8_t *syn, uint8_t *out, int dx, int dy, int mi) {
+    int m00=ZW_MAT[mi][0], m01=ZW_MAT[mi][1], m10=ZW_MAT[mi][2], m11=ZW_MAT[mi][3];
+    int n=r*s; memset(out,0,n);
+    for(int qi=0; qi<r; qi++) for(int qj=0; qj<s; qj++) {
+        int it = (qi + dx) % r;
+        int jt = (qj + dy) % s;
+        int si2 = (m00 * (it & 1) ^ m01 * (jt & 1)) & 1;
+        int sj2 = (m10 * (it & 1) ^ m11 * (jt & 1)) & 1;
+        int ni = (it & ~1) + si2;
+        int nj = (jt & ~1) + sj2;
+        out[ni * s + nj] = syn[qi * s + qj];
+    }
+}
+
+// Apply inverse 4D rotation: out[i][j] = corr[rot(i,j)]
+static void rot_4d_inv(int r, int s, uint8_t *corr, uint8_t *out, int dx, int dy, int mi) {
+    int m00=ZW_MAT[mi][0], m01=ZW_MAT[mi][1], m10=ZW_MAT[mi][2], m11=ZW_MAT[mi][3];
+    int n=r*s; memset(out,0,n);
+    for(int qi=0; qi<r; qi++) for(int qj=0; qj<s; qj++) {
+        int it = (qi + dx) % r;
+        int jt = (qj + dy) % s;
+        int si2 = (m00 * (it & 1) ^ m01 * (jt & 1)) & 1;
+        int sj2 = (m10 * (it & 1) ^ m11 * (jt & 1)) & 1;
+        int ni = (it & ~1) + si2;
+        int nj = (jt & ~1) + sj2;
+        out[qi * s + qj] = corr[ni * s + nj];
+    }
+}
+
 // Full CSS decode: X-errors via HZ (a), Z-errors via HX (b = g shifted by (2,2))
 // Z-syndrome is the same plus-shape pattern as X but shifted — reuse solve_plane.
 int decode_Z(int r, int s, uint8_t *err_z, uint8_t *dec_z) {
@@ -1591,6 +1636,7 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--fast")) g_fast=1;
         else if(!strcmp(argv[i],"--selftest")) selftest=1;
         else if(!strcmp(argv[i],"--scaling")) { scaling=1; if(i+1<argc && argv[i+1][0]!='-') scaling_trials=atoi(argv[++i]); }
+        else if(!strcmp(argv[i],"--rot")) g_rot=1;
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
         else if(!strcmp(argv[i],"--cap")) g_weight_cap=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--cap-auto")) g_cap_auto_rate=atof(argv[++i]);
@@ -1598,17 +1644,37 @@ int main(int argc, char **argv) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            memcpy(syn, raw_syn, n);
-            memset(total_dec, 0, n);
-            for(int pass=0;pass<10;pass++) {
-                preprocess_syndrome(r,s,syn);
-            solve_plane(r,s,syn,dec);
-                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
-                uint8_t guess_syn[MAX_N];
-                syndrome_of(r,s,total_dec,guess_syn);
-                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+            if(g_rot) {
+                int rots[4][3]={{0,0,0},{50,50,1},{0,50,2},{33,33,3}};
+                uint8_t out[4][MAX_N], syn_r[MAX_N];
+                for(int ri=0;ri<4;ri++) {
+                    rot_4d_fwd(r,s,raw_syn,syn_r,rots[ri][0],rots[ri][1],rots[ri][2]);
+                    memcpy(syn, syn_r, n);
+                    memset(total_dec, 0, n);
+                    for(int pass=0;pass<10;pass++) {
+                        preprocess_syndrome(r,s,syn);
+                        solve_plane(r,s,syn,dec);
+                        for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                        uint8_t guess_syn[MAX_N];
+                        syndrome_of(r,s,total_dec,guess_syn);
+                        for(int q=0;q<n;q++) syn[q]=syn_r[q]^guess_syn[q];
+                    }
+                    rot_4d_inv(r,s,total_dec,out[ri],rots[ri][0],rots[ri][1],rots[ri][2]);
+                }
+                fwrite(out,1,n*4,stdout); fflush(stdout);
+            } else {
+                memcpy(syn, raw_syn, n);
+                memset(total_dec, 0, n);
+                for(int pass=0;pass<10;pass++) {
+                    preprocess_syndrome(r,s,syn);
+                    solve_plane(r,s,syn,dec);
+                    for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                    uint8_t guess_syn[MAX_N];
+                    syndrome_of(r,s,total_dec,guess_syn);
+                    for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+                }
+                fwrite(total_dec,1,n,stdout); fflush(stdout);
             }
-            fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-alg")) {
@@ -1625,44 +1691,140 @@ int main(int argc, char **argv) {
             uint8_t syn[MAX_N], dec[MAX_N];
             int n=r*s;
             if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            solve_plane(r,s,syn,dec);
-            fwrite(dec,1,n,stdout); fflush(stdout);
+            if(g_rot) {
+                int rots[4][3]={{0,0,0},{50,50,1},{0,50,2},{33,33,3}};
+                uint8_t syn_r[MAX_N], out[4][MAX_N];
+                for(int ri=0;ri<4;ri++) {
+                    rot_4d_fwd(r,s,syn,syn_r,rots[ri][0],rots[ri][1],rots[ri][2]);
+                    solve_plane(r,s,syn_r,dec);
+                    rot_4d_inv(r,s,dec,out[ri],rots[ri][0],rots[ri][1],rots[ri][2]);
+                }
+                fwrite(out,1,n*4,stdout); fflush(stdout);
+            } else {
+                solve_plane(r,s,syn,dec);
+                fwrite(dec,1,n,stdout); fflush(stdout);
+            }
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-rot")) {
+            // Rotated decode: apply optimal 4D rotation before decoding,
+            // then unrotate the correction.  Best fixed rotation at w=3000
+            // is rot(33,33,m3) = dx=33 dy=33 mi=3 (shear W), which shifts
+            // the black hole off the antipode.  Gives ~76% vs ~72% identity.
+            int n=r*s;
+            uint8_t syn[MAX_N], dec[MAX_N], syn_rot[MAX_N];
+            if(fread(syn,1,n,stdin)!=(size_t)n){fprintf(stderr,"short read\n");return 1;}
+            int dx=33, dy=33, mi=3;  // best fixed rotation
+            rot_4d_fwd(r,s,syn,syn_rot,dx,dy,mi);
+            solve_plane(r,s,syn_rot,dec);
+            rot_4d_inv(r,s,dec,syn,dx,dy,mi);
+            fwrite(syn,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-rot-all")) {
+            // All-4 decode: runs all 4 best rotations and picks the most
+            // common correction (clustered by exact match).  At w=3000:
+            // union upper bound = 84% (vs 72% identity), but selection
+            // heuristic gives ~76% same as best-single.
+            int n=r*s;
+            uint8_t raw_syn[MAX_N];
+            if(fread(raw_syn,1,n,stdin)!=(size_t)n){fprintf(stderr,"short read\n");return 1;}
+            int rots[4][3]={{0,0,0},{50,50,1},{0,50,2},{33,33,3}};
+            uint8_t corr[4][MAX_N], syn_rot[MAX_N], dec_rot[MAX_N];
+            for(int ri=0;ri<4;ri++) {
+                rot_4d_fwd(r,s,raw_syn,syn_rot,rots[ri][0],rots[ri][1],rots[ri][2]);
+                solve_plane(r,s,syn_rot,dec_rot);
+                rot_4d_inv(r,s,dec_rot,corr[ri],rots[ri][0],rots[ri][1],rots[ri][2]);
+            }
+            // Cluster by exact match (same bytes → same cluster)
+            int cl_of[4]={0,1,2,3};
+            for(int i=0;i<4;i++) for(int j=i+1;j<4;j++) {
+                int same=1;
+                for(int q=0;q<n;q++) if(corr[i][q]!=corr[j][q]){same=0;break;}
+                if(same&&cl_of[j]!=cl_of[i]) {
+                    int old=cl_of[j],nw=cl_of[i];
+                    for(int k=0;k<4;k++) if(cl_of[k]==old) cl_of[k]=nw;
+                }
+            }
+            int csz[4]={0},best_cl=0,best_sz=0;
+            for(int i=0;i<4;i++){csz[cl_of[i]]++;}
+            for(int i=0;i<4;i++) if(csz[i]>best_sz){best_sz=csz[i];best_cl=i;}
+            int best_i=0, best_w=n+1;
+            for(int i=0;i<4;i++) if(cl_of[i]==best_cl) {
+                int w=0; for(int q=0;q<n;q++) w+=corr[i][q];
+                if(w<best_w){best_w=w;best_i=i;}
+            }
+            fwrite(corr[best_i],1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-cn")) {
-            // CNOT circuit: even rounds = CZ Z-check, odd = CNOT X-check.
-            // Last round (round 4 of 5) is Z-check, same as --decode.
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            memcpy(syn, raw_syn, n);
-            memset(total_dec, 0, n);
-            for(int pass=0;pass<10;pass++) {
-                preprocess_syndrome(r,s,syn);
-                solve_plane(r,s,syn,dec);
-                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
-                uint8_t guess_syn[MAX_N];
-                syndrome_of(r,s,total_dec,guess_syn);
-                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+            if(g_rot) {
+                int rots[4][3]={{0,0,0},{50,50,1},{0,50,2},{33,33,3}};
+                uint8_t out[4][MAX_N], syn_r[MAX_N];
+                for(int ri=0;ri<4;ri++) {
+                    rot_4d_fwd(r,s,raw_syn,syn_r,rots[ri][0],rots[ri][1],rots[ri][2]);
+                    memcpy(syn, syn_r, n);
+                    memset(total_dec,0,n);
+                    for(int pass=0;pass<10;pass++) {
+                        preprocess_syndrome(r,s,syn);
+                        solve_plane(r,s,syn,dec);
+                        for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                        uint8_t gs[MAX_N]; syndrome_of(r,s,total_dec,gs);
+                        for(int q=0;q<n;q++) syn[q]=syn_r[q]^gs[q];
+                    }
+                    rot_4d_inv(r,s,total_dec,out[ri],rots[ri][0],rots[ri][1],rots[ri][2]);
+                }
+                fwrite(out,1,n*4,stdout); fflush(stdout);
+            } else {
+                memcpy(syn, raw_syn, n);
+                memset(total_dec,0,n);
+                for(int pass=0;pass<10;pass++) {
+                    preprocess_syndrome(r,s,syn);
+                    solve_plane(r,s,syn,dec);
+                    for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                    uint8_t gs[MAX_N]; syndrome_of(r,s,total_dec,gs);
+                    for(int q=0;q<n;q++) syn[q]=raw_syn[q]^gs[q];
+                }
+                fwrite(total_dec,1,n,stdout); fflush(stdout);
             }
-            fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-pp")) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            memcpy(syn, raw_syn, n);
-            memset(total_dec, 0, n);
-            for(int pass=0;pass<5;pass++) {
-                preprocess_syndrome(r,s,syn);
-                solve_plane(r,s,syn,dec);
-                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
-                uint8_t guess_syn[MAX_N];
-                syndrome_of(r,s,total_dec,guess_syn);
-                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
+            if(g_rot) {
+                int rots[4][3]={{0,0,0},{50,50,1},{0,50,2},{33,33,3}};
+                uint8_t out[4][MAX_N], syn_r[MAX_N];
+                for(int ri=0;ri<4;ri++) {
+                    rot_4d_fwd(r,s,raw_syn,syn_r,rots[ri][0],rots[ri][1],rots[ri][2]);
+                    memcpy(syn, syn_r, n);
+                    memset(total_dec,0,n);
+                    for(int pass=0;pass<5;pass++) {
+                        preprocess_syndrome(r,s,syn);
+                        solve_plane(r,s,syn,dec);
+                        for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                        uint8_t gs[MAX_N]; syndrome_of(r,s,total_dec,gs);
+                        for(int q=0;q<n;q++) syn[q]=syn_r[q]^gs[q];
+                    }
+                    rot_4d_inv(r,s,total_dec,out[ri],rots[ri][0],rots[ri][1],rots[ri][2]);
+                }
+                fwrite(out,1,n*4,stdout); fflush(stdout);
+            } else {
+                memcpy(syn, raw_syn, n);
+                memset(total_dec,0,n);
+                for(int pass=0;pass<5;pass++) {
+                    preprocess_syndrome(r,s,syn);
+                    solve_plane(r,s,syn,dec);
+                    for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                    uint8_t gs[MAX_N]; syndrome_of(r,s,total_dec,gs);
+                    for(int q=0;q<n;q++) syn[q]=raw_syn[q]^gs[q];
+                }
+                fwrite(total_dec,1,n,stdout); fflush(stdout);
             }
-            fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-3d")) {
@@ -1953,90 +2115,34 @@ int main(int argc, char **argv) {
         }
     } else if(weight>0) {
         uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N], syn_rot[MAX_N];
-        printf("Weight-%d, %d trials per rotation\n",weight,trials);
-        // Baseline (no rotation)
-        { int ok=0;
-          for(int t=0;t<trials;t++) {
-              gen_iid(n,err,weight);
-              syndrome_of(r,s,err,syn);
-              solve_plane_5d(r,s,syn,dec);
-              uint8_t diff[MAX_N];
-              for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
-              if(is_stabilizer(r,s,diff)) { ok++; }
-          }
-          printf("  baseline:         %d/%d (%.1f%%)\n",ok,trials,100.0*ok/trials);
-        }
-        // Fine-grain scan around best 4D rotation from prior sweep.
-        // Best was mat1 (swap) at (25,0) = 73.3%.  Scan dx ∈ [0,99], dy=0.
-        // This tests every possible X-translation parity + shift for mat1.
-        {   int m00=0,m01=1,m10=1,m11=0; // mat1 = swap
-            printf("  Fine scan: mat1 (swap), dy=0, dx=0..99\n");
-            for(int dx=0;dx<r;dx++) {
-                int ok=0;
-                for(int t=0;t<trials;t++) {
-                    gen_iid(n,err,weight);
-                    syndrome_of(r,s,err,syn);
-                    memset(syn_rot,0,n);
-                    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-                        int it=(qi+dx)%r, jt=qj;
-                        int si2=(m00*(it&1) ^ m01*(jt&1))&1;
-                        int sj2=(m10*(it&1) ^ m11*(jt&1))&1;
-                        syn_rot[((it&~1)+si2)*s+((jt&~1)+sj2)] = syn[qi*s+qj];
-                    }
-                    solve_plane_5d(r,s,syn_rot,dec);
-                    uint8_t dec_out[MAX_N]; memset(dec_out,0,n);
-                    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-                        int it=(qi+dx)%r, jt=qj;
-                        int si2=(m00*(it&1) ^ m01*(jt&1))&1;
-                        int sj2=(m10*(it&1) ^ m11*(jt&1))&1;
-                        dec_out[qi*s+qj]=dec[((it&~1)+si2)*s+((jt&~1)+sj2)];
-                    }
-                    uint8_t diff[MAX_N];
-                    for(int q=0;q<n;q++) diff[q]=err[q]^dec_out[q];
-                    if(is_stabilizer(r,s,diff)) ok++;
-                }
-                printf("  dx=%3d: %d/%d (%.1f%%)\n",dx,ok,trials,100.0*ok/trials);
-                if(100.0*ok/trials >= 90.0) {
-                    printf(">>> 90%%+ at dx=%d mat1 dy=0\n",dx);
-                    goto found90;
-                }
+        printf("Weight-%d, %d trials\n  === 4D-rotation decode pipeline ===\n",weight,trials);
+        // Single combined loop: identity + 4 rotations, all with solve_plane
+        int rots[4][3]={{0,0,0},{50,50,1},{0,50,2},{33,33,3}};
+        int per_rot[4]={0}, any_ok=0;
+        for(int t=0;t<trials;t++) {
+            gen_iid(n,err,weight);
+            syndrome_of(r,s,err,syn);
+            int any=0;
+            for(int ri=0;ri<4;ri++) {
+                rot_4d_fwd(r,s,syn,syn_rot,rots[ri][0],rots[ri][1],rots[ri][2]);
+                solve_plane(r,s,syn_rot,dec);
+                rot_4d_inv(r,s,dec,syn_rot,rots[ri][0],rots[ri][1],rots[ri][2]);
+                uint8_t diff[MAX_N];
+                for(int q=0;q<n;q++) diff[q]=err[q]^syn_rot[q];
+                if(is_stabilizer(r,s,diff)) { per_rot[ri]++; any=1; }
             }
+            if(any) any_ok++;
         }
-        // Also scan around (33,33) with mat2
-        {   int m00=1,m01=1,m10=0,m11=1; // mat2 = shear Z→Z+W
-            printf("  Fine scan: mat2 (shear), dx=dy=28..38\n");
-            for(int d=28;d<=38;d++) {
-                int ok=0;
-                for(int t=0;t<trials;t++) {
-                    gen_iid(n,err,weight);
-                    syndrome_of(r,s,err,syn);
-                    memset(syn_rot,0,n);
-                    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-                        int it=(qi+d)%r, jt=(qj+d)%s;
-                        int si2=(m00*(it&1) ^ m01*(jt&1))&1;
-                        int sj2=(m10*(it&1) ^ m11*(jt&1))&1;
-                        syn_rot[((it&~1)+si2)*s+((jt&~1)+sj2)] = syn[qi*s+qj];
-                    }
-                    solve_plane_5d(r,s,syn_rot,dec);
-                    uint8_t dec_out[MAX_N]; memset(dec_out,0,n);
-                    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-                        int it=(qi+d)%r, jt=(qj+d)%s;
-                        int si2=(m00*(it&1) ^ m01*(jt&1))&1;
-                        int sj2=(m10*(it&1) ^ m11*(jt&1))&1;
-                        dec_out[qi*s+qj]=dec[((it&~1)+si2)*s+((jt&~1)+sj2)];
-                    }
-                    uint8_t diff[MAX_N];
-                    for(int q=0;q<n;q++) diff[q]=err[q]^dec_out[q];
-                    if(is_stabilizer(r,s,diff)) ok++;
-                }
-                printf("  diag=%3d: %d/%d (%.1f%%)\n",d,ok,trials,100.0*ok/trials);
-                if(100.0*ok/trials >= 90.0) {
-                    printf(">>> 90%%+ at diag=%d mat2\n",d);
-                    goto found90;
-                }
-            }
-        }
-        found90: ;
+        printf("  ┌─────────────────────┬──────────┐\n");
+        printf("  │ rot                 │  rate    │\n");
+        printf("  ├─────────────────────┼──────────┤\n");
+        printf("  │ identity            │ %5.1f%%  │\n", 100.0*per_rot[0]/trials);
+        printf("  │ rot(50,50,m1)       │ %5.1f%%  │\n", 100.0*per_rot[1]/trials);
+        printf("  │ rot(0,50,m2)        │ %5.1f%%  │\n", 100.0*per_rot[2]/trials);
+        printf("  │ rot(33,33,m3)       │ %5.1f%%  │\n", 100.0*per_rot[3]/trials);
+        printf("  ├─────────────────────┼──────────┤\n");
+        printf("  │ ANY of 4 (union)    │ %5.1f%%  │\n", 100.0*any_ok/trials);
+        printf("  └─────────────────────┴──────────┘\n");
 
     }
     return 0;

@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, rotation_schedule=None):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, rotation_schedule=None, direction_schedule=None):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -135,8 +135,11 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     # QEC rounds (rounds-1 if free_final_round, else rounds)
     def row2(i):
         return i + 2 if not periodic else (i + 2) % r
+    def col2(j):
+        return j + 2 if not periodic else (j + 2) % s
     for rnd in range(qec_rounds):
         di, dj = rotation_schedule[rnd] if rotation_schedule else (0, 0)
+        direction = direction_schedule[rnd] if direction_schedule else 'V'
         slot = 0
         for px in range(2):
             for py in range(2):
@@ -166,11 +169,17 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                             if stabilizer_basis == 'X':
                                 qc.h(anc_idx)
                                 qc.cx(anc_idx, data_map[ir][jr])
-                                qc.cx(anc_idx, data_map[(ir + 2) % r][jr])
+                                if direction == 'H':
+                                    qc.cx(anc_idx, data_map[ir][col2(jr)])
+                                else:
+                                    qc.cx(anc_idx, data_map[(ir + 2) % r][jr])
                                 qc.h(anc_idx)
                             else:
                                 qc.cx(data_map[ir][jr], anc_idx)
-                                qc.cx(data_map[(ir + 2) % r][jr], anc_idx)
+                                if direction == 'H':
+                                    qc.cx(data_map[ir][col2(jr)], anc_idx)
+                                else:
+                                    qc.cx(data_map[(ir + 2) % r][jr], anc_idx)
                         qc.measure(anc_idx, cr_syn[rnd][slot])
                         slot += 1
         # Dynamic decoupling: X gates on all idle data qubits between rounds

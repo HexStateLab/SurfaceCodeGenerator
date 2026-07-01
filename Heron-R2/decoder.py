@@ -120,6 +120,77 @@ def tesseract_decode_ffinal(syndromes, r, s):
     return solve(syn, r, s)
 
 
+def solve_combined(V_vert, V_horiz, r, s):
+    """Solve for error E given BOTH V_vert and V_horiz 2-qubit syndromes.
+
+    Builds the combined 2N×N linear system over GF(2) and solves via
+    Gaussian elimination. Returns minimum-weight correction.
+    
+    V_vert(i,j) = E(i,j) + E(i+2,j)  (vertical pair measurements)
+    V_horiz(i,j) = E(i,j) + E(i,j+2) (horizontal pair measurements)
+
+    Combined rank = 44/48 for 6×8 torus (vs 24/48 for 4-qubit S alone).
+    """
+    N = r * s
+    nn = N  # number of variables
+
+    # Build combined matrix H: 2N × N
+    H = np.zeros((2 * N, nn), dtype=np.uint8)
+    for qi in range(r):
+        for qj in range(s):
+            col = qi * s + qj
+            # V_vert row
+            H[qi * s + qj, col] = 1
+            H[((qi + 2) % r) * s + qj, col] = 1
+            # V_horiz row (offset by N)
+            H[N + qi * s + qj, col] = 1
+            H[N + qi * s + (qj + 2) % s, col] = 1
+
+    # Build syndrome vector
+    s_vec = np.concatenate([V_vert.reshape(-1), V_horiz.reshape(-1)])
+
+    # Gaussian elimination over GF(2)
+    aug = np.hstack([H, s_vec.reshape(-1, 1)])  # 2N × (N+1)
+    n_rows, n_cols = aug.shape
+    pivot_row = 0
+    pivot_cols = []
+    for col in range(n_cols - 1):
+        row = -1
+        for r2 in range(pivot_row, n_rows):
+            if aug[r2, col]:
+                row = r2
+                break
+        if row < 0:
+            continue
+        if row != pivot_row:
+            aug[[row, pivot_row]] = aug[[pivot_row, row]]
+        pivot_cols.append(col)
+        for r2 in range(n_rows):
+            if r2 != pivot_row and aug[r2, col]:
+                aug[r2] ^= aug[pivot_row]
+        pivot_row += 1
+
+    # Check consistency
+    consistent = True
+    for r2 in range(pivot_row, n_rows):
+        if aug[r2, -1] and not aug[r2, :-1].any():
+            consistent = False
+            break
+
+    if not consistent:
+        # Fallback: use V_vert only with standard decoder
+        syn = V_vert ^ np.roll(V_vert, shift=-2, axis=1)
+        prep(syn, r, s)
+        return solve(syn, r, s)
+
+    # Extract solution
+    E = np.zeros(nn, dtype=np.uint8)
+    for pi, col in enumerate(pivot_cols):
+        E[col] = aug[pi, -1]
+
+    return min_weight_kernel_fast(E.reshape(r, s), r, s)
+
+
 def tesseract_decode(syndromes, r, s):
     """AND-vote + viability + solve decoder."""
     rr, hr, hs = syndromes.shape[0], r // 2, s // 2

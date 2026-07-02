@@ -58,7 +58,18 @@ def _unpack_indices(r, s):
     return ii, jj
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True):
+def _bell_support_coords(r, s, periodic):
+    """Support of X_L1 · X_L2 (symmetric difference — the (0,0) overlap cancels)."""
+    if periodic:
+        return [(i, 0) for i in range(1, r)] + [(0, j) for j in range(1, s)]
+    return [(i, 0) for i in range(r)] + [(i, 2) for i in range(r)]
+
+
+def _ghz_support_coords(r, s):
+    return [(r - 1, j) for j in range(s - 1)] + [(i, s - 1) for i in range(r - 1)]
+
+
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -121,6 +132,22 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
       - Compute V(r/2-1, q) = sum of all measured V(p,q) for p=0..r/2-2
 
     For r=6, s=8: sector size 3×4, measure p=0,1; compute p=2.
+
+    parity_tree=None: optional plan from synthesize_parity_layout(backend,...).
+    When given, the ancilla parity measurements (bell / bell_measure / ghz /
+    ghz_measure — one op family per plan) are emitted as a cat state grown
+    over a tree of physical qubits synthesized directly from the backend
+    coupling map, instead of the single-ancilla degree-n star (which cannot
+    embed on degree-3 heavy hex and forces ~300+ CZ of routing). Transpile
+    with initial_layout=parity_tree['initial_layout'] and the whole circuit —
+    QEC block and gadget — maps with zero SWAPs; the transpiled 2q count
+    equals the logical CX count. Requires compact=True. Classical registers
+    are unchanged (still one bit per parity op), so all_syndromes_opt and
+    downstream analysis need no changes. Trade-off: more (but strictly
+    nearest-neighbor, shallow, parallel) CXs ~ 2·|tree| + n instead of n
+    long-routed ones; a Z fault on any tree qubit flips the recorded parity
+    bit, an X fault during (un)growth walks out as a contiguous segment the
+    checks can see.
     """
     from pw_qiskit import heavy_hex_flag_layout
     data_map, anc_maps, _, _ = heavy_hex_flag_layout(r, s)
@@ -150,12 +177,28 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             return anc_maps[(i, j, 0)]
         base = n_data + 2 * r * s
 
-    if share_extra_ancilla and extra_flags:
+    if parity_tree is not None and extra_flags:
+        assert compact, ("parity_tree requires compact=True: logical indices "
+                         "must match the synthesized initial_layout")
+        for name in extra_flags:
+            _coords = (_ghz_support_coords(r, s) if name.startswith("ghz")
+                       else _bell_support_coords(r, s, periodic))
+            assert [tuple(c) for c in parity_tree["support"]] == \
+                   [tuple(c) for c in _coords], (
+                f"parity_tree was synthesized for op family "
+                f"'{parity_tree['op']}' with a different support than '{name}'"
+                f" — synthesize with the matching op/periodic settings")
+        extra_idx = {name: None for name in extra_flags}
+        n_extra = len(parity_tree["tree_nodes"])
+        _tree_base = base
+    elif share_extra_ancilla and extra_flags:
         extra_idx = {name: base for name in extra_flags}
         n_extra = 1
+        _tree_base = None
     else:
         extra_idx = {name: base + k for k, name in enumerate(extra_flags)}
         n_extra = len(extra_flags)
+        _tree_base = None
     total = base + n_extra
 
     qec_rounds = rounds - 1 if free_final_round else rounds
@@ -182,10 +225,45 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         cregs.append(cr)
     qc = QuantumCircuit(qr, *cregs)
 
-    # --- helper: measure a product of X operators via one ancilla -----------
+    # --- helpers: measure a product of X operators ---------------------------
     extra_used = [False]
+    _tree_used = [False]
+
+    def _parity_measure_tree(qubits, cbit):
+        """X⊗n parity via a cat state grown over the synthesized device tree.
+
+        The tree is a literal subgraph of the backend coupling map (found by
+        synthesize_parity_layout), so with initial_layout =
+        parity_tree['initial_layout'] every CX below is between physically
+        adjacent qubits: zero SWAPs by construction. Sequence: H on the root,
+        BFS growth of the cat over the tree, one coupling layer onto the data
+        (controlled-X⊗n with the cat as control — each support qubit receives
+        exactly one CX from its adjacent tree node), exact uncompute, H +
+        measure of the root gives the parity. Identical statistics to the
+        single-ancilla gadget.
+        """
+        nodes = [_tree_base + t for t in range(len(parity_tree["tree_nodes"]))]
+        order = parity_tree["bfs_order"]
+        parent = parity_tree["tree_parent"]
+        root = order[0]
+        if _tree_used[0]:
+            for x in nodes:
+                qc.reset(x)
+        _tree_used[0] = True
+        qc.h(nodes[root])
+        for t in order[1:]:
+            qc.cx(nodes[parent[t]], nodes[t])
+        for k, dq_ in enumerate(qubits):
+            qc.cx(nodes[parity_tree["leaf_of"][k]], dq_)
+        for t in reversed(order[1:]):
+            qc.cx(nodes[parent[t]], nodes[t])
+        qc.h(nodes[root])
+        qc.measure(nodes[root], cbit)
 
     def _parity_measure(anc, qubits, cbit):
+        if parity_tree is not None:
+            _parity_measure_tree(qubits, cbit)
+            return
         if share_extra_ancilla and extra_used[0]:
             qc.reset(anc)
         extra_used[0] = True
@@ -197,16 +275,10 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     def _logical_xx_support():
         """Support of X_L1 · X_L2 (symmetric difference — overlap cancels)."""
-        if periodic:
-            # (0,0) is in both X_L1 (row 0) and X_L2 (col 0): X² = I, skip it.
-            return ([_dq(i, 0) for i in range(1, r)] +
-                    [_dq(0, j) for j in range(1, s)])
-        return ([_dq(i, 0) for i in range(r)] +
-                [_dq(i, 2) for i in range(r)])
+        return [_dq(i, j) for (i, j) in _bell_support_coords(r, s, periodic)]
 
     def _ghz_support():
-        return ([_dq(r - 1, j) for j in range(s - 1)] +
-                [_dq(i, s - 1) for i in range(r - 1)])
+        return [_dq(i, j) for (i, j) in _ghz_support_coords(r, s)]
 
     if ghz:
         _parity_measure(extra_idx["ghz"], _ghz_support(), extra_cr["ghz"][0])
@@ -598,6 +670,244 @@ def verify_pipeline(no_reset=False):
     fidelity = (ok * cnts).sum() / n
     print(f"  |00⟩ fidelity with 2% CX noise: {fidelity:.3f}")
     print("✓ Pipeline verified")
+
+
+def _steiner_connect(G, free, terminals):
+    """Greedy Steiner: connect `terminals` through vertices in `free`.
+
+    Repeatedly BFS from the growing tree through free vertices to the
+    nearest unconnected terminal and absorb the path. Returns the set of
+    tree vertices (a connected, cycle-consistent subgraph of G containing
+    all terminals) or None if the free region is disconnected.
+    """
+    import collections
+    terminals = list(dict.fromkeys(terminals))
+    tree = {terminals[0]}
+    remaining = set(terminals[1:])
+    while remaining:
+        par = {v: None for v in tree}
+        q = collections.deque(tree)
+        hit = None
+        while q and hit is None:
+            v = q.popleft()
+            for w in G[v]:
+                if w in par or w not in free:
+                    continue
+                par[w] = v
+                if w in remaining:
+                    hit = w
+                    break
+                q.append(w)
+        if hit is None:
+            return None
+        v = hit
+        path = []
+        while v not in tree:
+            path.append(v)
+            v = par[v]
+        tree.update(path)
+        remaining.discard(hit)
+    return tree
+
+
+def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
+                             vf2_time=180, seeds=(3, 1, 7, 42, 123),
+                             verbose=True):
+    """Synthesize a zero-SWAP layout plan for the ancilla parity measurement.
+
+    Why: the single-ancilla X⊗n gadget is a degree-n star — unembeddable on
+    degree-3 heavy hex, so the transpiler routes it (~300+ CZ for n=12 on
+    Heron). Fixed alternatives fail structurally: heavy hex has GIRTH 12,
+    and any prescribed backbone that attaches to two data qubits of the same
+    check-path closes a 10-cycle. The only shape guaranteed to embed is one
+    read off the device itself: a cat state grown over a TREE that is a
+    literal subgraph of the coupling map.
+
+    Method: (1) VF2-embed the QEC block plus one pendant 'leaf' qubit per
+    support data qubit (pendants add no cycles, so this pattern is
+    girth-safe); (2) connect the leaf positions through remaining free
+    physical qubits with a greedy Steiner tree; (3) return the tree
+    structure and the full initial_layout.
+
+    Usage:
+        plan = synthesize_parity_layout(backend, 6, 8, op="bell",
+                                        periodic=True)
+        qc, dm, lq0, lq1, n_anc = build_circuit(
+            6, 8, rounds, bell=True, bell_ancilla=True, bell_measure=True,
+            periodic=True, compact=True, parity_tree=plan, ...)
+        pm = generate_preset_pass_manager(
+            backend=backend, optimization_level=3,
+            initial_layout=plan["initial_layout"], seed_transpiler=42)
+        qc_t = pm.run(qc)   # transpiled 2q count == logical CX count
+
+    op='bell' serves bell and bell_measure; op='ghz' serves ghz/ghz_measure
+    (one op family per plan — their supports differ). The plan is
+    JSON-serializable; synthesize once per backend and cache it.
+
+    Notes: valid for the weight-2 (share-pair) extraction graph. The
+    full_stabilizer=True graph has degree-4 check ancillas and does not
+    embed on heavy hex at all — its layout is routed by the transpiler,
+    and this plan does not apply there.
+
+    Returns the plan dict, or None if no embedding/tree was found (try more
+    seeds or a longer vf2_time).
+    """
+    import collections
+    from qiskit import QuantumCircuit
+    from qiskit.transpiler.passes import VF2Layout
+    from qiskit.converters import circuit_to_dag
+
+    coords = (_ghz_support_coords(r, s) if op == "ghz"
+              else _bell_support_coords(r, s, periodic))
+    n_data, hr, hs = r * s, r // 2, s // 2
+    n_anc = 4 * (hr - 1) * hs
+    checks = _check_anchors(r, s)
+    anc_index = {c: n_data + k for k, c in enumerate(checks)}
+    base = n_data + n_anc
+    n_sup = len(coords)
+
+    def row2(i):
+        return i + 2 if not periodic else (i + 2) % r
+
+    # interaction-graph pattern: QEC CX edges + one pendant leaf per support
+    patt = QuantumCircuit(base + n_sup)
+    for (i, j) in checks:
+        a = anc_index[(i, j)]
+        patt.cx(i * s + j, a)
+        patt.cx(row2(i) * s + j, a)
+    for k, (i, j) in enumerate(coords):
+        patt.cx(base + k, i * s + j)
+    dag = circuit_to_dag(patt)
+
+    cm = backend.coupling_map if hasattr(backend, "coupling_map") else backend
+    G = collections.defaultdict(set)
+    for a, c in cm.get_edges():
+        G[a].add(c)
+        G[c].add(a)
+
+    for seed in seeds:
+        v = VF2Layout(coupling_map=cm, seed=seed, call_limit=None,
+                      max_trials=-1, time_limit=vf2_time)
+        v.run(dag)
+        lay = v.property_set.get("layout")
+        if lay is None:
+            if verbose:
+                print(f"  seed {seed}: no QEC+leaves embedding "
+                      f"({v.property_set.get('VF2Layout_stop_reason')})")
+            continue
+        phys = [lay[patt.qubits[i]] for i in range(patt.num_qubits)]
+        used = set(phys[:base])
+        leaves = phys[base:]
+        free = (set(G) - used)
+        tree_set = _steiner_connect(G, free, leaves)
+        if tree_set is None:
+            if verbose:
+                print(f"  seed {seed}: embedding found but leaves not "
+                      f"connectable through free qubits; retrying")
+            continue
+
+        tnodes = sorted(tree_set)
+        tidx = {p: t for t, p in enumerate(tnodes)}
+        adj = {t: [tidx[w] for w in G[p] if w in tree_set]
+               for p, t in tidx.items()}
+
+        def bfs(root):
+            parent = [-1] * len(tnodes)
+            order = [root]
+            seen = {root}
+            depth = {root: 0}
+            for t in order:
+                for w in adj[t]:
+                    if w not in seen:
+                        seen.add(w)
+                        parent[w] = t
+                        depth[w] = depth[t] + 1
+                        order.append(w)
+            return parent, order, max(depth.values())
+
+        # root at the tree's approximate center to minimize cat depth
+        best = None
+        for cand in range(len(tnodes)):
+            parent, order, ecc = bfs(cand)
+            if best is None or ecc < best[3]:
+                best = (cand, parent, order, ecc)
+        root, parent, order, ecc = best
+
+        plan = {
+            "r": r, "s": s, "periodic": periodic, "op": op,
+            "support": [list(c) for c in coords],
+            "tree_nodes": tnodes,
+            "tree_parent": parent,
+            "bfs_order": order,
+            "leaf_of": [tidx[p] for p in leaves],
+            "initial_layout": phys[:base] + tnodes,
+            "n_qubits": base + len(tnodes),
+            "seed": seed,
+        }
+        if verbose:
+            n_cx = 2 * (len(tnodes) - 1) + n_sup
+            print(f"  seed {seed}: plan found — tree of {len(tnodes)} qubits, "
+                  f"depth {ecc}, gadget CX = {n_cx} (all nearest-neighbor), "
+                  f"total {plan['n_qubits']} qubits")
+        return plan
+    return None
+
+
+def verify_tree_parity():
+    """Self-check for the tree parity gadget (run on your side).
+
+    (1) synthesize on FakeFez; (2) transpile star vs tree Bell prep+measure
+    and compare 2q gate counts — the tree circuit's transpiled 2q count must
+    EQUAL its logical CX count (zero routing); (3) ideal-simulator statistics:
+    prep and measure parities must agree shot-for-shot at rounds=0 in both
+    modes, and the |+⟩^N state must give deterministic +1.
+    """
+    import numpy as np
+    from qiskit_ibm_runtime.fake_provider import FakeFez
+    from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+    backend = FakeFez()
+    r, s = 6, 8
+    print("synthesizing (periodic Bell support) ...")
+    plan = synthesize_parity_layout(backend, r, s, op="bell", periodic=True)
+    assert plan is not None, "no plan found — increase vf2_time/seeds"
+
+    kw = dict(logical_state="00", bell=True, bell_ancilla=True,
+              bell_measure=True, periodic=True, compact=True, no_reset=True)
+    qc_star, *_ = build_circuit(r, s, 1, **kw)
+    qc_tree, *_ = build_circuit(r, s, 1, parity_tree=plan, **kw)
+
+    pm_star = generate_preset_pass_manager(backend=backend,
+                                           optimization_level=3,
+                                           seed_transpiler=42)
+    pm_tree = generate_preset_pass_manager(
+        backend=backend, optimization_level=3, seed_transpiler=42,
+        initial_layout=plan["initial_layout"])
+    for label, qc, pm in (("star", qc_star, pm_star),
+                          ("tree", qc_tree, pm_tree)):
+        t = pm.run(qc)
+        two_q = sum(v for k, v in t.count_ops().items()
+                    if k in ("cz", "ecr", "cx", "swap"))
+        print(f"  {label}: logical CX={qc.count_ops().get('cx', 0):>4}  "
+              f"transpiled 2q={two_q:>4}  depth={t.depth():>4}  "
+              f"2q-depth={t.depth(lambda i: len(i.qubits) == 2):>3}")
+        if label == "tree":
+            assert two_q == qc.count_ops().get("cx", 0), \
+                "tree gadget routed — plan/layout mismatch"
+    print("  ✓ tree gadget transpiles with ZERO routing overhead")
+
+    from qiskit_aer.primitives import SamplerV2
+    sampler = SamplerV2(options={"backend_options": {"seed_simulator": 11}})
+    for label, extra in (("star", {}), ("tree", dict(parity_tree=plan))):
+        qc, *_ = build_circuit(r, s, 0, **kw, **extra)
+        pub = sampler.run([qc], shots=400).result()[0]
+        b = pub.data.bell.to_bool_array(order="little")[:, 0]
+        bm = pub.data.bell_m.to_bool_array(order="little")[:, 0]
+        agree = (b == bm).mean()
+        print(f"  {label}: rounds=0 P(prep=measure)={agree:.3f}  "
+              f"P(prep=1)={b.mean():.2f}")
+        assert agree == 1.0
+    print("  ✓ tree statistics match the single-ancilla gadget")
 
 
 if __name__ == "__main__":

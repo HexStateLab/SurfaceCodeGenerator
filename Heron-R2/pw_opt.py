@@ -189,7 +189,8 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 f"'{parity_tree['op']}' with a different support than '{name}'"
                 f" — synthesize with the matching op/periodic settings")
         extra_idx = {name: None for name in extra_flags}
-        n_extra = len(parity_tree["tree_nodes"])
+        n_extra = parity_tree.get("n_fresh",
+                                  len(parity_tree["tree_nodes"]))
         _tree_base = base
     elif share_extra_ancilla and extra_flags:
         extra_idx = {name: base for name in extra_flags}
@@ -228,6 +229,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     # --- helpers: measure a product of X operators ---------------------------
     extra_used = [False]
     _tree_used = [False]
+    _after_rounds = [False]
 
     def _parity_measure_tree(qubits, cbit):
         """X⊗n parity via a cat state grown over the synthesized device tree.
@@ -242,13 +244,25 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         measure of the root gives the parity. Identical statistics to the
         single-ancilla gadget.
         """
-        nodes = [_tree_base + t for t in range(len(parity_tree["tree_nodes"]))]
+        if "tree_logical" in parity_tree:
+            nodes = list(parity_tree["tree_logical"])
+        else:
+            nodes = [_tree_base + t
+                     for t in range(len(parity_tree["tree_nodes"]))]
+        is_anc = parity_tree.get(
+            "node_is_anc", [False] * len(nodes))
         order = parity_tree["bfs_order"]
         parent = parity_tree["tree_parent"]
         root = order[0]
         if _tree_used[0]:
             for x in nodes:
                 qc.reset(x)
+        elif _after_rounds[0]:
+            # check-ancilla tree nodes hold their last syndrome value after
+            # the rounds — reset before reusing them as cat qubits
+            for x, a in zip(nodes, is_anc):
+                if a:
+                    qc.reset(x)
         _tree_used[0] = True
         qc.h(nodes[root])
         for t in order[1:]:
@@ -350,6 +364,8 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             for ii in range(r):
                 for jj in range(s):
                     qc.x(_dq(ii, jj))
+
+    _after_rounds[0] = True
 
     # Bell creation after QEC (fresh Bell state from QEC-cleaned |00⟩)
     if bell_after_qec:
@@ -796,14 +812,25 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
                       f"({v.property_set.get('VF2Layout_stop_reason')})")
             continue
         phys = [lay[patt.qubits[i]] for i in range(patt.num_qubits)]
-        used = set(phys[:base])
         leaves = phys[base:]
-        free = (set(G) - used)
-        tree_set = _steiner_connect(G, free, leaves)
+        data_phys = set(phys[:n_data])
+        anc_phys = set(phys[n_data:base])
+        # strict pass: tree only through unused qubits. Relaxed pass: also
+        # through the QEC check ancillas — they are untouched |0> at prep
+        # time and the cat uncomputes them back to |0>; for a post-round
+        # gadget the builder resets them first. Data qubits are never used.
+        tree_set = None
+        for allow_anc in (False, True):
+            free = set(G) - data_phys - (set() if allow_anc else anc_phys) \
+                   - (set(phys[:base]) - anc_phys - data_phys)
+            tree_set = _steiner_connect(G, free, leaves)
+            if tree_set is not None:
+                uses_anc = allow_anc and bool(tree_set & anc_phys)
+                break
         if tree_set is None:
             if verbose:
                 print(f"  seed {seed}: embedding found but leaves not "
-                      f"connectable through free qubits; retrying")
+                      f"connectable even through check ancillas; retrying")
             continue
 
         tnodes = sorted(tree_set)
@@ -833,6 +860,9 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
                 best = (cand, parent, order, ecc)
         root, parent, order, ecc = best
 
+        phys_to_logical = {p: idx for idx, p in enumerate(phys[:base])}
+        fresh = [p for p in tnodes if p not in phys_to_logical]
+        fresh_logical = {p: base + k for k, p in enumerate(fresh)}
         plan = {
             "r": r, "s": s, "periodic": periodic, "op": op,
             "support": [list(c) for c in coords],
@@ -840,13 +870,19 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
             "tree_parent": parent,
             "bfs_order": order,
             "leaf_of": [tidx[p] for p in leaves],
-            "initial_layout": phys[:base] + tnodes,
-            "n_qubits": base + len(tnodes),
+            "tree_logical": [phys_to_logical.get(p, fresh_logical.get(p))
+                             for p in tnodes],
+            "node_is_anc": [p in anc_phys for p in tnodes],
+            "n_fresh": len(fresh),
+            "uses_check_ancillas": uses_anc,
+            "initial_layout": phys[:base] + fresh,
+            "n_qubits": base + len(fresh),
             "seed": seed,
         }
         if verbose:
             n_cx = 2 * (len(tnodes) - 1) + n_sup
-            print(f"  seed {seed}: plan found — tree of {len(tnodes)} qubits, "
+            print(f"  seed {seed}: plan found — tree of {len(tnodes)} qubits "
+                  f"({sum(plan['node_is_anc'])} shared with check ancillas), "
                   f"depth {ecc}, gadget CX = {n_cx} (all nearest-neighbor), "
                   f"total {plan['n_qubits']} qubits")
         return plan
